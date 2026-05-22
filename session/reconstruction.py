@@ -28,6 +28,7 @@ from .context_window import apply_context_budget
 from .models import (
     AssemblyDivergenceReport,
     ActiveWorkflow,
+    ConflictingPair,
     CONTEXT_ASSEMBLY_VERSION,
     ContextActivationPolicy,
     RuntimeSnapshot,
@@ -211,6 +212,59 @@ def _load_runtime_snapshots(
     return snapshots
 
 
+def resolve_assembly_contradictions(
+    db_path: str,
+    assembled_ids: List[int],
+) -> List[ConflictingPair]:
+    """
+    Query active contradicts links where BOTH sides are in assembled_ids.
+
+    Returns ConflictingPair objects sorted by link_id ascending. Pure read —
+    no writes. Returns empty list when assembled_ids is empty or no
+    intra-assembly contradictions exist.
+
+    Only links with status='active' are included. Retracted links are not
+    surfaced even if they connected events in this assembly.
+    """
+    if not assembled_ids:
+        return []
+
+    id_set = set(assembled_ids)
+    placeholders = ','.join('?' * len(assembled_ids))
+
+    conn = _mem_connect(db_path)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT id, source_id, target_id, created_by, reason,
+                   link_confidence, created_at
+            FROM memory_links
+            WHERE relationship = 'contradicts'
+              AND status = 'active'
+              AND source_id IN ({placeholders})
+              AND target_id IN ({placeholders})
+            ORDER BY id ASC
+            """,
+            assembled_ids + assembled_ids,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    return [
+        ConflictingPair(
+            link_id=row['id'],
+            source_id=row['source_id'],
+            target_id=row['target_id'],
+            created_by=row['created_by'],
+            reason=row['reason'],
+            link_confidence=row['link_confidence'],
+            link_created_at=row['created_at'],
+        )
+        for row in rows
+        if row['source_id'] in id_set and row['target_id'] in id_set
+    ]
+
+
 def reconstruct(
     memory_db_path: str,
     policy: Optional[ContextActivationPolicy] = None,
@@ -269,7 +323,27 @@ def reconstruct(
         runtime_snapshots=runtime_snapshots,
     )
 
-    # 5. Assemble SessionContext
+    # 5. Resolve contradiction pairs for the budgeted event set.
+    # Runs after budgeting so char accounting is not affected.
+    included_ids = budgeted.all_included_ids()
+    contradiction_pairs = resolve_assembly_contradictions(memory_db_path, included_ids)
+
+    # Build annotation map: memory_id → sorted list of contradicting memory_ids in this assembly
+    contradiction_map: Dict[int, List[int]] = {}
+    for pair in contradiction_pairs:
+        contradiction_map.setdefault(pair.source_id, []).append(pair.target_id)
+        contradiction_map.setdefault(pair.target_id, []).append(pair.source_id)
+
+    for section in (
+        budgeted.governance_context,
+        budgeted.unresolved_items,
+        budgeted.active_investigations,
+        budgeted.relevant_memory,
+    ):
+        for item in section:
+            item.contradiction_ids = sorted(contradiction_map.get(item.memory_id, []))
+
+    # 6. Assemble SessionContext
     context = SessionContext(
         session_id=session_id,
         created_at=created_at,
@@ -286,6 +360,7 @@ def reconstruct(
         char_budget=budgeted.char_budget,
         chars_used=budgeted.chars_used,
         truncated=budgeted.truncated,
+        contradiction_pairs=contradiction_pairs,
         assembly_version=CONTEXT_ASSEMBLY_VERSION,
     )
 
@@ -323,6 +398,7 @@ def reconstruct_from_dict(
             is_expanded=d['is_expanded'],
             tag_overlap=d['tag_overlap'],
             activation_rank=(),   # rank not needed for replay display
+            contradiction_ids=d.get('contradiction_ids', []),
         )
 
     def _wf(d: dict) -> ActiveWorkflow:
@@ -367,6 +443,10 @@ def reconstruct_from_dict(
         char_budget=context_dict['char_budget'],
         chars_used=context_dict['chars_used'],
         truncated=context_dict['truncated'],
+        contradiction_pairs=[
+            ConflictingPair.from_dict(p)
+            for p in context_dict.get('contradiction_pairs', [])
+        ],
         assembly_version=context_dict.get('assembly_version', 'unknown'),
     )
 
@@ -541,7 +621,18 @@ def verify_assembly_against_current_db(
         if snap_conf != curr_conf:
             rescored.append(mid)
 
-    diverged = bool(added or removed or rescored)
+    # Contradiction divergence: compare stored contradiction link_ids against current
+    stored_link_ids = {
+        p['link_id']
+        for p in stored_snapshot.get('contradiction_pairs', [])
+    }
+    current_pairs = resolve_assembly_contradictions(db_path, list(current_ids))
+    current_link_ids = {p.link_id for p in current_pairs}
+
+    contradictions_added = sorted(current_link_ids - stored_link_ids)
+    contradictions_retracted = sorted(stored_link_ids - current_link_ids)
+
+    diverged = bool(added or removed or rescored or contradictions_added or contradictions_retracted)
 
     return AssemblyDivergenceReport(
         assembly_id=assembly_id,
@@ -550,4 +641,6 @@ def verify_assembly_against_current_db(
         events_added_since_assembly=added,
         events_removed_since_assembly=removed,
         events_rescored_since_assembly=rescored,
+        contradictions_added_since_assembly=contradictions_added,
+        contradictions_retracted_since_assembly=contradictions_retracted,
     )

@@ -470,5 +470,5 @@ class TestBackwardCompat:
         assert policy.include_unresolved is True
         assert not hasattr(policy, 'include_governance')
 
-    def test_context_assembly_version_is_1_0_0(self):
-        assert CONTEXT_ASSEMBLY_VERSION == '1.0.0'
+    def test_context_assembly_version_is_1_1_0(self):
+        assert CONTEXT_ASSEMBLY_VERSION == '1.1.0'

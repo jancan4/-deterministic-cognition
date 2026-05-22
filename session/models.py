@@ -16,9 +16,52 @@ from typing import Dict, List, Optional, Tuple
 # Assembly constants
 # ---------------------------------------------------------------------------
 
-CONTEXT_ASSEMBLY_VERSION = '1.0.0'
+CONTEXT_ASSEMBLY_VERSION = '1.1.0'
 CHAR_BUDGET_DEFAULT = 12000
 ENTRY_BUDGET_DEFAULT = 60
+
+
+# ---------------------------------------------------------------------------
+# Contradiction pair
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ConflictingPair:
+    """
+    A snapshot of one active contradicts link where both sides are present
+    in the current assembly. Immutable provenance — captured at assembly time
+    so replay shows contradictions as they were known, even after retraction.
+    """
+    link_id: int
+    source_id: int
+    target_id: int
+    created_by: Optional[str]
+    reason: Optional[str]
+    link_confidence: Optional[int]
+    link_created_at: str
+
+    def to_dict(self) -> dict:
+        return {
+            'link_id': self.link_id,
+            'source_id': self.source_id,
+            'target_id': self.target_id,
+            'created_by': self.created_by,
+            'reason': self.reason,
+            'link_confidence': self.link_confidence,
+            'link_created_at': self.link_created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'ConflictingPair':
+        return cls(
+            link_id=d['link_id'],
+            source_id=d['source_id'],
+            target_id=d['target_id'],
+            created_by=d.get('created_by'),
+            reason=d.get('reason'),
+            link_confidence=d.get('link_confidence'),
+            link_created_at=d['link_created_at'],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -118,9 +161,10 @@ class ActivatedMemory:
     related_ids: List[int]
     created_at: str
     updated_at: str
-    is_expanded: bool          # True if included via related-expansion
-    tag_overlap: int           # tags in common with query tags
-    activation_rank: Tuple     # composite sort key; lower = higher priority
+    is_expanded: bool                                  # True if included via related-expansion
+    tag_overlap: int                                   # tags in common with query tags
+    activation_rank: Tuple                             # composite sort key; lower = higher priority
+    contradiction_ids: List[int] = field(default_factory=list)  # memory_ids of contradicting events in this assembly
 
     def to_dict(self) -> dict:
         return {
@@ -138,6 +182,7 @@ class ActivatedMemory:
             'updated_at': self.updated_at,
             'is_expanded': self.is_expanded,
             'tag_overlap': self.tag_overlap,
+            'contradiction_ids': list(self.contradiction_ids),
         }
 
     def render(self) -> str:
@@ -153,6 +198,9 @@ class ActivatedMemory:
             parts.append(f"  Tags    : {', '.join(self.tags)}")
         if self.related_ids:
             parts.append(f"  Related : {self.related_ids}")
+        if self.contradiction_ids:
+            refs = ', '.join(f'[mem:{mid}]' for mid in self.contradiction_ids)
+            parts.append(f"  Conflicts: {refs}")
         if self.is_expanded:
             parts.append("  [related-expanded]")
         return '\n'.join(parts)
@@ -282,6 +330,11 @@ class SessionContext:
     chars_used: int
     truncated: bool          # True if budget was exhausted
 
+    # Contradiction state — pairs of events in this assembly connected by an active contradicts link.
+    # Populated after budgeting; empty list means no contradictions within this window.
+    # Default empty for backward compat with pre-v1.1.0 replay paths.
+    contradiction_pairs: List[ConflictingPair] = field(default_factory=list)
+
     # Assembly provenance — default 'unknown' for backward compat with pre-v7 snapshots
     assembly_version: str = 'unknown'
 
@@ -303,6 +356,7 @@ class SessionContext:
             'char_budget': self.char_budget,
             'chars_used': self.chars_used,
             'truncated': self.truncated,
+            'contradiction_pairs': [p.to_dict() for p in self.contradiction_pairs],
         }
 
 
@@ -317,9 +371,11 @@ class AssemblyDivergenceReport:
     assembly_id: int
     assembly_hash: str
     diverged: bool
-    events_added_since_assembly: List[int]    # memory_ids present now but not at assembly
-    events_removed_since_assembly: List[int]  # memory_ids at assembly but not present now
-    events_rescored_since_assembly: List[int] # memory_ids in both but with changed metadata
+    events_added_since_assembly: List[int]             # memory_ids present now but not at assembly
+    events_removed_since_assembly: List[int]           # memory_ids at assembly but not present now
+    events_rescored_since_assembly: List[int]          # memory_ids in both but with changed confidence
+    contradictions_added_since_assembly: List[int]     # link_ids of new active contradicts links between assembled events
+    contradictions_retracted_since_assembly: List[int] # link_ids in stored snapshot no longer active
 
 
 @dataclass
@@ -350,6 +406,17 @@ class SessionReconstruction:
             + ("  [TRUNCATED]" if ctx.truncated else "")
         )
         sections.append(header)
+
+        if ctx.contradiction_pairs:
+            pair_texts = []
+            for pair in ctx.contradiction_pairs:
+                pair_texts.append(
+                    f"[link:{pair.link_id}] [mem:{pair.source_id}] ↔ [mem:{pair.target_id}]"
+                    f" | confidence={pair.link_confidence}"
+                    f" | by={pair.created_by}"
+                    f" | {pair.reason}"
+                )
+            sections.append(_render_section('CONFLICTING MEMORIES', pair_texts))
 
         if ctx.governance_context:
             sections.append(_render_section(
