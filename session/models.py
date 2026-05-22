@@ -1,0 +1,365 @@
+"""
+Session reconstruction data models.
+
+A session is a deterministic reconstruction of relevant cognition state from
+persisted memory, workflow lineage, and runtime snapshots. These models
+capture the structured output of reconstruction without embedding any DB or
+I/O logic.
+
+Canonical truth remains the lineage and persisted memory events. Session
+models are ephemeral: same inputs always produce the same session.
+"""
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Activation policy
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ContextActivationPolicy:
+    """
+    Governs what gets activated and in what priority order for a session.
+
+    All fields have safe defaults so callers can override only what they need.
+
+    Activation priorities (highest to lowest):
+      1. Governance context (governance_rule, architecture_decision)
+      2. Unresolved items (status = 'unresolved' or 'proposed')
+      3. Workflow-linked memory (tags overlap with active workflow IDs/types)
+      4. High-confidence active memory sorted by doctrine priority
+      5. Expanded related items
+
+    No embeddings. No semantic search. All scoring is deterministic.
+    """
+    # Memory retrieval
+    tags: List[str] = field(default_factory=list)
+    min_confidence: int = 1
+    include_unresolved: bool = True
+    include_governance: bool = True
+    include_adaptations: bool = True
+    expand_related: bool = True
+
+    # Workflow retrieval
+    include_active_workflows: bool = True
+    workflow_db_path: Optional[str] = None   # if None, workflow section is skipped
+    max_workflows: int = 10
+
+    # Runtime retrieval
+    include_runtime_state: bool = True
+    runtime_db_path: Optional[str] = None    # if None, runtime section is skipped
+    max_runtime_events: int = 5
+
+    # Memory limits before budgeting
+    max_memory_candidates: int = 50
+
+    # Context window
+    max_chars: int = 12000
+    max_entries: int = 60
+
+    def to_dict(self) -> dict:
+        return {
+            'tags': list(self.tags),
+            'min_confidence': self.min_confidence,
+            'include_unresolved': self.include_unresolved,
+            'include_governance': self.include_governance,
+            'include_adaptations': self.include_adaptations,
+            'expand_related': self.expand_related,
+            'include_active_workflows': self.include_active_workflows,
+            'workflow_db_path': self.workflow_db_path,
+            'max_workflows': self.max_workflows,
+            'include_runtime_state': self.include_runtime_state,
+            'runtime_db_path': self.runtime_db_path,
+            'max_runtime_events': self.max_runtime_events,
+            'max_memory_candidates': self.max_memory_candidates,
+            'max_chars': self.max_chars,
+            'max_entries': self.max_entries,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Activated memory
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ActivatedMemory:
+    """
+    A memory event selected for inclusion in the session context.
+
+    activation_rank is the composite sort key used to determine inclusion
+    order during context budgeting. Lower = higher priority.
+    """
+    memory_id: int
+    event_type: str
+    title: str
+    summary: str
+    evidence: Optional[str]
+    confidence: int
+    status: str
+    tags: List[str]
+    source: str
+    related_ids: List[int]
+    created_at: str
+    updated_at: str
+    is_expanded: bool          # True if included via related-expansion
+    tag_overlap: int           # tags in common with query tags
+    activation_rank: Tuple     # composite sort key; lower = higher priority
+
+    def to_dict(self) -> dict:
+        return {
+            'memory_id': self.memory_id,
+            'event_type': self.event_type,
+            'title': self.title,
+            'summary': self.summary,
+            'evidence': self.evidence,
+            'confidence': self.confidence,
+            'status': self.status,
+            'tags': list(self.tags),
+            'source': self.source,
+            'related_ids': list(self.related_ids),
+            'created_at': self.created_at,
+            'updated_at': self.updated_at,
+            'is_expanded': self.is_expanded,
+            'tag_overlap': self.tag_overlap,
+        }
+
+    def render(self) -> str:
+        parts = [
+            f"[mem:{self.memory_id}] {self.event_type.upper()} "
+            f"| confidence={self.confidence} | status={self.status}",
+            f"  Title   : {self.title}",
+            f"  Summary : {self.summary}",
+        ]
+        if self.evidence:
+            parts.append(f"  Evidence: {self.evidence}")
+        if self.tags:
+            parts.append(f"  Tags    : {', '.join(self.tags)}")
+        if self.related_ids:
+            parts.append(f"  Related : {self.related_ids}")
+        if self.is_expanded:
+            parts.append("  [related-expanded]")
+        return '\n'.join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Active workflow
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ActiveWorkflow:
+    """
+    A non-terminal workflow execution surfaced in the session context.
+
+    Derived from WorkflowExecution via workflow.storage. Not independently
+    persisted — reconstructed on each session activation.
+    """
+    execution_id: str
+    workflow_id: str
+    plan_id: str
+    state: str
+    active_stage_index: int
+    completed_node_ids: List[str]
+    failed_node_ids: List[str]
+    node_attempts: Dict[str, int]
+    total_lineage_events: int
+    updated_at: str
+
+    def to_dict(self) -> dict:
+        return {
+            'execution_id': self.execution_id,
+            'workflow_id': self.workflow_id,
+            'plan_id': self.plan_id,
+            'state': self.state,
+            'active_stage_index': self.active_stage_index,
+            'completed_node_ids': list(self.completed_node_ids),
+            'failed_node_ids': list(self.failed_node_ids),
+            'node_attempts': dict(self.node_attempts),
+            'total_lineage_events': self.total_lineage_events,
+            'updated_at': self.updated_at,
+        }
+
+    def render(self) -> str:
+        parts = [
+            f"[wf:{self.execution_id[:16]}] {self.workflow_id} | state={self.state}",
+            f"  plan_id         : {self.plan_id[:16]}",
+            f"  active_stage    : {self.active_stage_index}",
+            f"  completed_nodes : {self.completed_node_ids}",
+            f"  failed_nodes    : {self.failed_node_ids}",
+            f"  lineage_events  : {self.total_lineage_events}",
+            f"  updated_at      : {self.updated_at}",
+        ]
+        if self.node_attempts:
+            parts.append(f"  node_attempts   : {self.node_attempts}")
+        return '\n'.join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Runtime snapshot
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RuntimeSnapshot:
+    """
+    A point-in-time view of a runtime process surfaced in the session context.
+    """
+    runtime_id: int
+    name: str
+    state: str
+    current_iteration: int
+    updated_at: str
+    recent_transitions: List[Dict]   # last N lineage events as dicts
+
+    def to_dict(self) -> dict:
+        return {
+            'runtime_id': self.runtime_id,
+            'name': self.name,
+            'state': self.state,
+            'current_iteration': self.current_iteration,
+            'updated_at': self.updated_at,
+            'recent_transitions': list(self.recent_transitions),
+        }
+
+    def render(self) -> str:
+        parts = [
+            f"[rt:{self.runtime_id}] {self.name} | state={self.state}",
+            f"  iteration  : {self.current_iteration}",
+            f"  updated_at : {self.updated_at}",
+        ]
+        for t in self.recent_transitions:
+            parts.append(
+                f"  → {t.get('old_state', '?')} → {t['new_state']}  "
+                f"({t.get('reason', '')})"
+            )
+        return '\n'.join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Session context and reconstruction
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SessionContext:
+    """
+    The assembled, budget-constrained context for one session.
+
+    Carries the raw structured data for inspection and replay. Use
+    SessionReconstruction.render() for the human-readable text form.
+    """
+    session_id: str
+    created_at: str
+    policy: ContextActivationPolicy
+
+    # Structured sections — each may be empty if the source was unavailable
+    governance_context: List[ActivatedMemory]
+    unresolved_items: List[ActivatedMemory]
+    active_workflows: List[ActiveWorkflow]
+    execution_lineage: List[ActiveWorkflow]  # terminal or recently-updated
+    relevant_memory: List[ActivatedMemory]
+    active_investigations: List[ActivatedMemory]  # open_question + hypothesis
+    runtime_snapshots: List[RuntimeSnapshot]
+
+    # Budget accounting
+    total_candidates: int    # all items evaluated before budgeting
+    included_entries: int    # items included after budgeting
+    char_budget: int
+    chars_used: int
+    truncated: bool          # True if budget was exhausted
+
+    def to_dict(self) -> dict:
+        return {
+            'session_id': self.session_id,
+            'created_at': self.created_at,
+            'policy': self.policy.to_dict(),
+            'governance_context': [m.to_dict() for m in self.governance_context],
+            'unresolved_items': [m.to_dict() for m in self.unresolved_items],
+            'active_workflows': [w.to_dict() for w in self.active_workflows],
+            'execution_lineage': [w.to_dict() for w in self.execution_lineage],
+            'relevant_memory': [m.to_dict() for m in self.relevant_memory],
+            'active_investigations': [m.to_dict() for m in self.active_investigations],
+            'runtime_snapshots': [r.to_dict() for r in self.runtime_snapshots],
+            'total_candidates': self.total_candidates,
+            'included_entries': self.included_entries,
+            'char_budget': self.char_budget,
+            'chars_used': self.chars_used,
+            'truncated': self.truncated,
+        }
+
+
+@dataclass
+class SessionReconstruction:
+    """
+    The complete reconstructed session: structured context + rendered text.
+
+    Deterministic: given the same memory_db state, workflow_db state, and
+    activation policy, reconstruct() always produces the same session.
+
+    Replayable: SessionContext.to_dict() captures everything needed to
+    reproduce or audit the reconstruction without re-querying the databases.
+    """
+    context: SessionContext
+
+    def render(self) -> str:
+        """Render the session as human-readable text with labelled sections."""
+        sections = []
+        ctx = self.context
+
+        header = (
+            f"SESSION RECONSTRUCTION\n"
+            f"session_id : {ctx.session_id}\n"
+            f"created_at : {ctx.created_at}\n"
+            f"budget     : {ctx.chars_used}/{ctx.char_budget} chars  "
+            f"({ctx.included_entries} entries)"
+            + ("  [TRUNCATED]" if ctx.truncated else "")
+        )
+        sections.append(header)
+
+        if ctx.governance_context:
+            sections.append(_render_section(
+                'ACTIVE GOVERNANCE CONTEXT',
+                [m.render() for m in ctx.governance_context],
+            ))
+
+        if ctx.active_workflows:
+            sections.append(_render_section(
+                'ACTIVE WORKFLOWS',
+                [w.render() for w in ctx.active_workflows],
+            ))
+
+        if ctx.execution_lineage:
+            sections.append(_render_section(
+                'RECENT EXECUTION LINEAGE',
+                [w.render() for w in ctx.execution_lineage],
+            ))
+
+        if ctx.unresolved_items:
+            sections.append(_render_section(
+                'UNRESOLVED ITEMS',
+                [m.render() for m in ctx.unresolved_items],
+            ))
+
+        if ctx.relevant_memory:
+            sections.append(_render_section(
+                'RELEVANT MEMORY',
+                [m.render() for m in ctx.relevant_memory],
+            ))
+
+        if ctx.active_investigations:
+            sections.append(_render_section(
+                'ACTIVE INVESTIGATIONS',
+                [m.render() for m in ctx.active_investigations],
+            ))
+
+        if ctx.runtime_snapshots:
+            sections.append(_render_section(
+                'RUNTIME STATE',
+                [r.render() for r in ctx.runtime_snapshots],
+            ))
+
+        return '\n\n'.join(sections)
+
+
+def _render_section(title: str, items: List[str]) -> str:
+    header = f"## {title}"
+    body = '\n\n'.join(items)
+    return f"{header}\n\n{body}"
