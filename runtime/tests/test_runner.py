@@ -61,6 +61,72 @@ def _add_ready_task(orch_db, title='task', n=1):
 
 
 # ---------------------------------------------------------------------------
+# Unbounded-loop guard
+# ---------------------------------------------------------------------------
+
+def test_run_raises_if_no_bound_and_allow_unbounded_false(tmp_path):
+    rt_db = _rt_db(tmp_path)
+    orch_db = _orch_db(tmp_path)
+    rt = _runtime(rt_db, orch_db, _cfg(max_iterations=None))
+    with pytest.raises(ValueError, match='allow_unbounded'):
+        run_iterations(rt_db, rt.id, orch_db,
+                       RuntimeConfig(actor='a', max_iterations=None, allow_unbounded=False))
+
+
+def test_run_raises_mentions_should_stop_in_message(tmp_path):
+    rt_db = _rt_db(tmp_path)
+    orch_db = _orch_db(tmp_path)
+    rt = _runtime(rt_db, orch_db, _cfg(max_iterations=None))
+    with pytest.raises(ValueError, match='should_stop'):
+        run_iterations(rt_db, rt.id, orch_db,
+                       RuntimeConfig(actor='a', max_iterations=None))
+
+
+def test_run_unbounded_allowed_with_flag(tmp_path):
+    """allow_unbounded=True + should_stop terminates cleanly after one iteration."""
+    rt_db = _rt_db(tmp_path)
+    orch_db = _orch_db(tmp_path)
+    rt = _runtime(rt_db, orch_db, _cfg(max_iterations=None))
+    calls = {'n': 0}
+
+    def stop_after_one():
+        calls['n'] += 1
+        return calls['n'] > 1
+
+    result = run_iterations(
+        rt_db, rt.id, orch_db,
+        RuntimeConfig(actor='a', max_iterations=None, allow_unbounded=True),
+        should_stop=stop_after_one,
+    )
+    assert result.iterations_completed == 1
+    assert result.final_state == 'paused'
+
+
+def test_run_max_iterations_provided_still_works(tmp_path):
+    """max_iterations set — no allow_unbounded needed, guard does not fire."""
+    rt_db = _rt_db(tmp_path)
+    orch_db = _orch_db(tmp_path)
+    rt = _runtime(rt_db, orch_db)
+    result = run_iterations(rt_db, rt.id, orch_db, _cfg(max_iterations=2))
+    assert result.iterations_completed == 2
+    assert result.final_state == 'paused'
+
+
+def test_run_should_stop_provided_no_max_iterations(tmp_path):
+    """should_stop set — no allow_unbounded or max_iterations needed."""
+    rt_db = _rt_db(tmp_path)
+    orch_db = _orch_db(tmp_path)
+    rt = _runtime(rt_db, orch_db, _cfg(max_iterations=None))
+    result = run_iterations(
+        rt_db, rt.id, orch_db,
+        RuntimeConfig(actor='a', max_iterations=None),
+        should_stop=lambda: True,
+    )
+    assert result.iterations_completed == 0
+    assert result.final_state == 'paused'
+
+
+# ---------------------------------------------------------------------------
 # Basic run — no tasks
 # ---------------------------------------------------------------------------
 

@@ -93,11 +93,40 @@ No code path reaches `stopped` without an explicit call to `stop_runtime` or
 
 ---
 
+## Bounded Execution Guarantee
+
+Every call to `run_iterations` must be bounded by at least one of:
+
+| Bound | How |
+|---|---|
+| `config.max_iterations` | Integer cap on iterations. Loop exits after `max_iterations` iterations. |
+| `should_stop` callable | External signal checked at the top of each iteration. Loop exits when it returns `True`. |
+| `config.allow_unbounded=True` | Explicit opt-in for server-mode operation. The caller acknowledges the loop will run until interrupted. |
+
+If `max_iterations` is `None`, `should_stop` is `None`, and `allow_unbounded` is `False`
+(the default), `run_iterations` raises `ValueError` immediately — before any state
+transition is written. The error message names all three options so the caller can choose
+the appropriate bound.
+
+This is a pre-condition check, not a runtime limit. It fires at the call site, not at
+iteration N. Accidental unbounded loops are caught at startup, not during a weekend
+on-call rotation.
+
+**Server-mode use case:** A long-running runtime that relies entirely on a
+`should_stop` callback (for example, a SIGTERM handler) should set
+`allow_unbounded=True` and omit `max_iterations`. The `allow_unbounded` flag is
+explicit acknowledgment, not a silent default.
+
+---
+
 ## Iteration Loop
 
 Each call to `run_iterations` executes the following sequence:
 
 ```
+# Pre-condition: max_iterations is set, or should_stop is provided, or allow_unbounded=True.
+# Raises ValueError immediately if none of the above are true.
+
 while iteration < max_iterations and not should_stop():
     iteration += 1
     transition → polling
@@ -206,8 +235,9 @@ These constraints are permanent. They survive every future extension.
 
 1. The runtime has no autonomous authority. It executes ready tasks as declared in the
    orchestration layer. It does not create tasks or modify task types.
-2. `max_iterations` must always be set in production. A `None` value is permitted for
-   one-shot scripts where `should_stop` is the primary stop signal.
+2. Every `run_iterations` call must be bounded: `max_iterations` set, `should_stop`
+   provided, or `config.allow_unbounded=True` explicitly. The default is to reject
+   unbounded execution with a `ValueError` before any state transition is written.
 3. Runtime state transitions are immutable in `runtime_lineage`. No delete or update
    is defined on lineage rows.
 4. The runtime never bypasses orchestration validation. Task transitions go through

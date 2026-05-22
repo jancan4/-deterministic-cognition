@@ -63,6 +63,10 @@ class RuntimeConfig:
     poll_interval_s: float = 0.0
     max_retries: int = 3
     checkpoint_every: int = 1
+    # Explicit opt-in required to run without a max_iterations bound or
+    # should_stop callback. False by default so accidental unbounded loops
+    # are caught at call time rather than running indefinitely.
+    allow_unbounded: bool = False
 
     def __post_init__(self) -> None:
         if self.checkpoint_every < 1:
@@ -77,6 +81,7 @@ class RuntimeConfig:
             'poll_interval_s': self.poll_interval_s,
             'max_retries': self.max_retries,
             'checkpoint_every': self.checkpoint_every,
+            'allow_unbounded': self.allow_unbounded,
         }
 
     @classmethod
@@ -87,6 +92,7 @@ class RuntimeConfig:
             poll_interval_s=d.get('poll_interval_s', 0.0),
             max_retries=d.get('max_retries', 3),
             checkpoint_every=d.get('checkpoint_every', 1),
+            allow_unbounded=d.get('allow_unbounded', False),
         )
 
 

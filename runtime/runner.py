@@ -5,7 +5,10 @@ Executes bounded iteration loops against the task orchestration layer, recording
 every state transition in runtime_lineage and saving checkpoints on schedule.
 
 Design constraints:
-- max_iterations bounds every run; the runner never loops truly indefinitely.
+- By default, every run must be bounded by at least one of: max_iterations or a
+  should_stop callback. A run with neither raises ValueError unless
+  config.allow_unbounded=True is explicitly set. Silent infinite loops are
+  rejected at call time, not discovered at 3 AM.
 - should_stop is a caller-supplied callable checked at the top of each iteration.
 - KeyboardInterrupt is caught, the runtime transitions to 'interrupted', and a
   checkpoint is saved before the exception propagates.
@@ -37,8 +40,20 @@ def run_iterations(
     Run up to config.max_iterations iterations of the poll → execute → checkpoint cycle.
 
     Returns a RunResult describing why the run stopped and how much work was done.
+
+    Raises ValueError if both max_iterations and should_stop are absent and
+    config.allow_unbounded is False — the default. Set config.allow_unbounded=True
+    only for server-mode operation where an external signal drives termination.
+
     Raises NotFoundError if runtime_id does not exist.
     """
+    if config.max_iterations is None and should_stop is None and not config.allow_unbounded:
+        raise ValueError(
+            "unbounded runtime requires allow_unbounded=True or a should_stop callback: "
+            "set config.max_iterations, supply a should_stop callable, or set "
+            "config.allow_unbounded=True to acknowledge the loop will run indefinitely"
+        )
+
     rt = get_runtime(state_db, runtime_id)
 
     # Allow resuming from paused by re-entering idle first.
