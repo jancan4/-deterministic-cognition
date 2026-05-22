@@ -1,22 +1,36 @@
 """
-SQLite persistence layer for workflow executions.
+SQLite persistence layer for workflow executions, definitions, and plans.
 
 Schema is append-only for lineage events; workflow_executions is upsertable
 mutable state (cache). Snapshots are optimization-only — lineage is canonical.
+Workflow definitions and plans are immutable once persisted (collision detection
+on divergent content raises rather than silently overwriting).
 
-Schema version 1.
+Schema version history:
+  v1 — initial schema
+  v2 — metadata_json column on workflow_execution_events
+  v3 — workflow_definitions and workflow_plans tables (idempotency + replay)
 """
 import json
 import sqlite3
 from typing import List, Optional
 
+from .models import WorkflowDefinition, WorkflowExecutionPlan
 from .state import WorkflowExecution, WorkflowExecutionLineageEvent
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
+
+
+class WorkflowDefinitionError(Exception):
+    """Raised when a workflow definition collision is detected on save."""
+
+
+class WorkflowPlanError(Exception):
+    """Raised when a workflow plan collision is detected on save."""
 
 
 def init_db(db_path: str) -> None:
-    """Create workflow persistence tables if they do not exist."""
+    """Create workflow persistence tables if they do not exist. Idempotent."""
     conn = sqlite3.connect(db_path)
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('PRAGMA foreign_keys=ON')
@@ -61,9 +75,38 @@ def init_db(db_path: str) -> None:
             created_at     TEXT NOT NULL,
             FOREIGN KEY (execution_id) REFERENCES workflow_executions(execution_id)
         );
+
+        CREATE TABLE IF NOT EXISTS workflow_definitions (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_id     TEXT NOT NULL,
+            version         INTEGER NOT NULL,
+            name            TEXT NOT NULL,
+            topology_hash   TEXT NOT NULL,
+            definition_json TEXT NOT NULL,
+            created_at      TEXT NOT NULL,
+            UNIQUE(workflow_id, version)
+        );
+
+        CREATE TABLE IF NOT EXISTS workflow_plans (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id         TEXT NOT NULL UNIQUE,
+            workflow_id     TEXT NOT NULL,
+            version         INTEGER NOT NULL,
+            planner_version TEXT NOT NULL,
+            plan_json       TEXT NOT NULL,
+            created_at      TEXT NOT NULL,
+            FOREIGN KEY (workflow_id, version)
+                REFERENCES workflow_definitions(workflow_id, version)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_workflow_plans_planner_version
+            ON workflow_plans(planner_version);
     """)
-    if not conn.execute('SELECT version FROM workflow_schema_version').fetchone():
+    row = conn.execute('SELECT version FROM workflow_schema_version').fetchone()
+    if row is None:
         conn.execute('INSERT INTO workflow_schema_version (version) VALUES (?)', (_SCHEMA_VERSION,))
+    elif row[0] < _SCHEMA_VERSION:
+        conn.execute('UPDATE workflow_schema_version SET version = ?', (_SCHEMA_VERSION,))
     conn.commit()
     conn.close()
 
@@ -312,3 +355,198 @@ def load_latest_snapshot(
 
     execution = WorkflowExecution.from_dict(json.loads(row['snapshot_json']))
     return execution, row['last_event_id']
+
+
+# ---------------------------------------------------------------------------
+# workflow_definitions CRUD
+# ---------------------------------------------------------------------------
+
+def save_workflow_definition(db_path: str, definition: WorkflowDefinition) -> None:
+    """
+    Persist a workflow definition. Idempotent on (workflow_id, version).
+
+    Raises WorkflowDefinitionError if the same (workflow_id, version) already
+    exists with a divergent topology_hash — this guards against silent content
+    corruption and forces explicit version bumping.
+    """
+    definition_json = json.dumps(definition.to_dict(), sort_keys=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA foreign_keys=ON')
+    try:
+        existing = conn.execute(
+            'SELECT topology_hash FROM workflow_definitions'
+            ' WHERE workflow_id = ? AND version = ?',
+            (definition.workflow_id, definition.version),
+        ).fetchone()
+        if existing is not None:
+            if existing['topology_hash'] != definition.topology_hash:
+                raise WorkflowDefinitionError(
+                    f"Topology hash collision for workflow '{definition.workflow_id}' "
+                    f"v{definition.version}: stored={existing['topology_hash']!r}, "
+                    f"new={definition.topology_hash!r}"
+                )
+            return  # idempotent — same content already persisted
+        conn.execute(
+            """
+            INSERT INTO workflow_definitions
+                (workflow_id, version, name, topology_hash, definition_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                definition.workflow_id,
+                definition.version,
+                definition.name,
+                definition.topology_hash,
+                definition_json,
+                definition.created_at,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_workflow_definition(
+    db_path: str,
+    workflow_id: str,
+    version: int,
+) -> Optional[WorkflowDefinition]:
+    """Load a persisted workflow definition by (workflow_id, version). None if absent."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+        row = conn.execute(
+            'SELECT definition_json FROM workflow_definitions'
+            ' WHERE workflow_id = ? AND version = ?',
+            (workflow_id, version),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return WorkflowDefinition.from_dict(json.loads(row['definition_json']))
+
+
+# ---------------------------------------------------------------------------
+# workflow_plans CRUD
+# ---------------------------------------------------------------------------
+
+def save_workflow_plan(db_path: str, plan: WorkflowExecutionPlan) -> None:
+    """
+    Persist a workflow execution plan. Idempotent on plan_id.
+
+    Raises WorkflowPlanError if the same plan_id already exists with divergent
+    plan_json — guards against silent content corruption.
+
+    The corresponding workflow_definition row must already exist (FK constraint).
+    """
+    plan_json = json.dumps(plan.to_dict(), sort_keys=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA foreign_keys=ON')
+    try:
+        existing = conn.execute(
+            'SELECT plan_json FROM workflow_plans WHERE plan_id = ?',
+            (plan.plan_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing['plan_json'] != plan_json:
+                raise WorkflowPlanError(
+                    f"Plan content collision for plan_id '{plan.plan_id}': "
+                    f"stored and new plan_json differ"
+                )
+            return  # idempotent
+        conn.execute(
+            """
+            INSERT INTO workflow_plans
+                (plan_id, workflow_id, version, planner_version, plan_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                plan.plan_id,
+                plan.workflow_id,
+                plan.version,
+                plan.planner_version,
+                plan_json,
+                plan.generated_at,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_workflow_plan(
+    db_path: str,
+    plan_id: str,
+) -> Optional[WorkflowExecutionPlan]:
+    """Load a persisted workflow execution plan by plan_id. None if absent."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+        row = conn.execute(
+            'SELECT plan_json FROM workflow_plans WHERE plan_id = ?',
+            (plan_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return WorkflowExecutionPlan.from_dict(json.loads(row['plan_json']))
+
+
+def load_plan_for_execution(
+    db_path: str,
+    execution_id: str,
+) -> Optional[WorkflowExecutionPlan]:
+    """
+    Load the workflow execution plan for a given execution.
+
+    Two-step: load plan_id from workflow_executions, then load plan from
+    workflow_plans. Returns None if either the execution or the plan row is
+    absent (graceful degradation for pre-v3 executions).
+    """
+    execution = load_execution(db_path, execution_id)
+    if execution is None:
+        return None
+    return load_workflow_plan(db_path, execution.plan_id)
+
+
+def load_definition_for_execution(
+    db_path: str,
+    execution_id: str,
+) -> Optional[WorkflowDefinition]:
+    """
+    Load the workflow definition for a given execution.
+
+    Three-step join: execution → plan (for version) → definition.
+    Returns None at any missing link — graceful degradation for pre-v3 executions.
+    """
+    execution = load_execution(db_path, execution_id)
+    if execution is None:
+        return None
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')
+    try:
+        plan_row = conn.execute(
+            'SELECT workflow_id, version FROM workflow_plans WHERE plan_id = ?',
+            (execution.plan_id,),
+        ).fetchone()
+        if plan_row is None:
+            return None
+        def_row = conn.execute(
+            'SELECT definition_json FROM workflow_definitions'
+            ' WHERE workflow_id = ? AND version = ?',
+            (plan_row['workflow_id'], plan_row['version']),
+        ).fetchone()
+    finally:
+        conn.close()
+    if def_row is None:
+        return None
+    return WorkflowDefinition.from_dict(json.loads(def_row['definition_json']))

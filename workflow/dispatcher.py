@@ -85,7 +85,28 @@ def make_semantic_handler(
     ``execute_task()`` to transition the orchestration task to ``failed``.
     """
     def handler(task: Task) -> dict:
-        task_payload_json = task.metadata.get('task_payload_json', '{}')
+        task_payload_json = task.metadata.get('task_payload_json')
+
+        # Fallback: load payload from persisted definition when absent from metadata.
+        # Absent means the node was submitted with a default-empty payload, or the
+        # metadata was stripped. Persisted definition is canonical when there is a
+        # conflict between it and task metadata.
+        if not task_payload_json and workflow_db_path:
+            node_id = task.metadata.get('workflow_node_id')
+            execution_id = task.metadata.get('workflow_execution_id')
+            if node_id and execution_id:
+                try:
+                    from workflow.storage import load_definition_for_execution
+                    defn = load_definition_for_execution(workflow_db_path, execution_id)
+                    if defn is not None:
+                        node_map = {n.node_id: n for n in defn.nodes}
+                        node = node_map.get(node_id)
+                        if node is not None:
+                            task_payload_json = node.task_payload_json
+                except Exception:
+                    pass
+
+        task_payload_json = task_payload_json or '{}'
 
         sem_result = execute_semantic_node(
             task_payload_json=task_payload_json,

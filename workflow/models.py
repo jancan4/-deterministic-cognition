@@ -170,6 +170,7 @@ class ExecutionStage:
 class WorkflowExecutionPlan:
     workflow_id: str
     plan_id: str
+    version: int
     stages: List[ExecutionStage]
     dependency_snapshot: Dict[str, List[str]]
     generated_at: str
@@ -179,6 +180,7 @@ class WorkflowExecutionPlan:
         return {
             'workflow_id': self.workflow_id,
             'plan_id': self.plan_id,
+            'version': self.version,
             'stages': [s.to_dict() for s in self.stages],
             'dependency_snapshot': {
                 k: sorted(v)
@@ -193,6 +195,7 @@ class WorkflowExecutionPlan:
         return cls(
             workflow_id=d['workflow_id'],
             plan_id=d['plan_id'],
+            version=d.get('version', 0),
             stages=[ExecutionStage.from_dict(s) for s in d.get('stages', [])],
             dependency_snapshot=dict(d.get('dependency_snapshot', {})),
             generated_at=d['generated_at'],

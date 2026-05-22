@@ -175,7 +175,7 @@ def test_execution_stage_roundtrip():
 
 def test_execution_plan_to_dict_sorts_dependency_snapshot_keys():
     plan = WorkflowExecutionPlan(
-        workflow_id='wf', plan_id='pid',
+        workflow_id='wf', plan_id='pid', version=1,
         stages=[ExecutionStage(0, ['a'])],
         dependency_snapshot={'z': [], 'a': []},
         generated_at='2026-01-01T00:00:00Z',
@@ -187,7 +187,7 @@ def test_execution_plan_to_dict_sorts_dependency_snapshot_keys():
 
 def test_execution_plan_to_dict_sorts_snapshot_dep_lists():
     plan = WorkflowExecutionPlan(
-        workflow_id='wf', plan_id='pid',
+        workflow_id='wf', plan_id='pid', version=1,
         stages=[ExecutionStage(0, ['c'])],
         dependency_snapshot={'c': ['b', 'a']},
         generated_at='2026-01-01T00:00:00Z',
@@ -198,7 +198,7 @@ def test_execution_plan_to_dict_sorts_snapshot_dep_lists():
 
 def test_execution_plan_roundtrip():
     plan = WorkflowExecutionPlan(
-        workflow_id='wf', plan_id='abc',
+        workflow_id='wf', plan_id='abc', version=1,
         stages=[ExecutionStage(0, ['a']), ExecutionStage(1, ['b'])],
         dependency_snapshot={'a': [], 'b': ['a']},
         generated_at='2026-01-01T00:00:00Z',

@@ -4,14 +4,25 @@ import pytest
 from workflow.executor import initialize_execution, record_node_completed, start_execution
 from workflow.models import RetryPolicy, WorkflowNode
 from workflow.persistence import (
+    WorkflowDefinitionError,
+    WorkflowPlanError,
     append_execution_events,
     persist_execution,
+    persist_workflow,
+    persist_workflow_definition,
+    persist_workflow_plan,
     replay_execution_from_snapshot,
     replay_execution_from_storage,
     take_snapshot,
 )
 from workflow.service import define_workflow, plan_workflow
-from workflow.storage import init_db, load_execution, load_execution_events
+from workflow.storage import (
+    init_db,
+    load_definition_for_execution,
+    load_execution,
+    load_execution_events,
+    load_plan_for_execution,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -436,3 +447,170 @@ def test_c2_init_event_metadata_contains_identity(tmp_path):
     init_evt = next(e for e in events if e.new_state == 'initialized')
     assert init_evt.metadata.get('workflow_id') == 'wf'
     assert init_evt.metadata.get('plan_id') == plan.plan_id
+
+
+# ---------------------------------------------------------------------------
+# persist_workflow_definition / persist_workflow_plan / persist_workflow
+# ---------------------------------------------------------------------------
+
+def test_persist_workflow_definition_saves_and_loads(tmp_path):
+    db = _db(tmp_path)
+    wf, plan = _make_wf_and_plan(_node('fetch'))
+    persist_workflow_definition(db, wf)
+
+    from workflow.storage import load_workflow_definition
+    loaded = load_workflow_definition(db, wf.workflow_id, wf.version)
+    assert loaded is not None
+    assert loaded.workflow_id == wf.workflow_id
+    assert loaded.topology_hash == wf.topology_hash
+
+
+def test_persist_workflow_definition_is_idempotent(tmp_path):
+    db = _db(tmp_path)
+    wf, _ = _make_wf_and_plan(_node('fetch'))
+    persist_workflow_definition(db, wf)
+    persist_workflow_definition(db, wf)  # must not raise
+
+
+def test_persist_workflow_definition_divergent_hash_raises(tmp_path):
+    db = _db(tmp_path)
+    wf, _ = _make_wf_and_plan(_node('fetch'))
+    persist_workflow_definition(db, wf)
+
+    from dataclasses import replace
+    divergent = replace(wf, topology_hash='00' * 32)
+    with pytest.raises(WorkflowDefinitionError):
+        persist_workflow_definition(db, divergent)
+
+
+def test_persist_workflow_plan_saves_and_loads(tmp_path):
+    db = _db(tmp_path)
+    wf, plan = _make_wf_and_plan(_node('fetch'))
+    persist_workflow_definition(db, wf)
+    persist_workflow_plan(db, plan)
+
+    from workflow.storage import load_workflow_plan
+    loaded = load_workflow_plan(db, plan.plan_id)
+    assert loaded is not None
+    assert loaded.plan_id == plan.plan_id
+    assert loaded.planner_version == plan.planner_version
+    assert loaded.version == plan.version
+
+
+def test_persist_workflow_plan_is_idempotent(tmp_path):
+    db = _db(tmp_path)
+    wf, plan = _make_wf_and_plan(_node('fetch'))
+    persist_workflow_definition(db, wf)
+    persist_workflow_plan(db, plan)
+    persist_workflow_plan(db, plan)  # must not raise
+
+
+def test_persist_workflow_plan_divergent_content_raises(tmp_path):
+    db = _db(tmp_path)
+    wf, plan = _make_wf_and_plan(_node('fetch'))
+    persist_workflow_definition(db, wf)
+    persist_workflow_plan(db, plan)
+
+    from dataclasses import replace
+    divergent = replace(plan, planner_version='0.0.0-divergent')
+    with pytest.raises(WorkflowPlanError):
+        persist_workflow_plan(db, divergent)
+
+
+def test_persist_workflow_saves_both(tmp_path):
+    db = _db(tmp_path)
+    wf, plan = _make_wf_and_plan(_node('fetch'))
+    persist_workflow(db, wf, plan)
+
+    from workflow.storage import load_workflow_definition, load_workflow_plan
+    assert load_workflow_definition(db, wf.workflow_id, wf.version) is not None
+    assert load_workflow_plan(db, plan.plan_id) is not None
+
+
+def test_persist_workflow_is_idempotent(tmp_path):
+    db = _db(tmp_path)
+    wf, plan = _make_wf_and_plan(_node('fetch'))
+    persist_workflow(db, wf, plan)
+    persist_workflow(db, wf, plan)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# load_plan_for_execution / load_definition_for_execution
+# ---------------------------------------------------------------------------
+
+def test_load_plan_for_execution_returns_plan(tmp_path):
+    db = _db(tmp_path)
+    wf, plan = _make_wf_and_plan(_node('fetch'))
+    persist_workflow(db, wf, plan)
+
+    execution, init_event = initialize_execution(plan)
+    persist_execution(db, execution, [init_event])
+
+    loaded = load_plan_for_execution(db, execution.execution_id)
+    assert loaded is not None
+    assert loaded.plan_id == plan.plan_id
+
+
+def test_load_definition_for_execution_returns_definition(tmp_path):
+    db = _db(tmp_path)
+    wf, plan = _make_wf_and_plan(_node('fetch'))
+    persist_workflow(db, wf, plan)
+
+    execution, init_event = initialize_execution(plan)
+    persist_execution(db, execution, [init_event])
+
+    loaded = load_definition_for_execution(db, execution.execution_id)
+    assert loaded is not None
+    assert loaded.workflow_id == wf.workflow_id
+    assert loaded.topology_hash == wf.topology_hash
+
+
+def test_load_plan_for_execution_degrades_gracefully_pre_v3(tmp_path):
+    """Executions with no persisted plan return None without error."""
+    db = _db(tmp_path)
+    wf, plan = _make_wf_and_plan(_node('fetch'))
+    # Only persist the execution — not the definition or plan
+    execution, init_event = initialize_execution(plan)
+    persist_execution(db, execution, [init_event])
+
+    assert load_plan_for_execution(db, execution.execution_id) is None
+
+
+def test_load_definition_for_execution_degrades_gracefully_pre_v3(tmp_path):
+    """Executions with no persisted definition return None without error."""
+    db = _db(tmp_path)
+    wf, plan = _make_wf_and_plan(_node('fetch'))
+    execution, init_event = initialize_execution(plan)
+    persist_execution(db, execution, [init_event])
+
+    assert load_definition_for_execution(db, execution.execution_id) is None
+
+
+# ---------------------------------------------------------------------------
+# plan_workflow with persist_to
+# ---------------------------------------------------------------------------
+
+def test_plan_workflow_persist_to_saves_definition_and_plan(tmp_path):
+    db = _db(tmp_path)
+    wf = define_workflow('wf', 'Test', [_node('fetch')])
+    _, plan, _ = plan_workflow(wf, persist_to=db)
+
+    from workflow.storage import load_workflow_definition, load_workflow_plan
+    assert load_workflow_definition(db, 'wf', 1) is not None
+    assert load_workflow_plan(db, plan.plan_id) is not None
+
+
+def test_plan_workflow_persist_to_is_idempotent(tmp_path):
+    db = _db(tmp_path)
+    wf = define_workflow('wf', 'Test', [_node('fetch')])
+    plan_workflow(wf, persist_to=db)
+    plan_workflow(wf, persist_to=db)  # must not raise
+
+
+def test_plan_workflow_without_persist_to_does_not_write(tmp_path):
+    db = _db(tmp_path)
+    wf = define_workflow('wf', 'Test', [_node('fetch')])
+    plan_workflow(wf)  # no persist_to
+
+    from workflow.storage import load_workflow_definition
+    assert load_workflow_definition(db, 'wf', 1) is None

@@ -148,22 +148,25 @@ def cmd_run_once(args: argparse.Namespace) -> int:
     """
     Submit one round of ready nodes to the orchestration layer.
 
-    This is a minimal coordination step: replay state from lineage, call
-    step_execution once, persist resulting events. Does not loop.
+    Replays each non-terminal execution from lineage, loads the persisted plan
+    and definition, then calls step_execution to submit ready nodes. Does not
+    loop — the caller drives the execution loop by calling run-once repeatedly.
     """
-    orch_db = args.orch_db or args.db
+    orch_db = getattr(args, 'orch_db', None) or args.db
     init_db(args.db)
 
     try:
         from workflow.coordination import step_execution
         from workflow.persistence import persist_execution
-        from workflow.storage import load_execution, load_execution_events
-        from workflow.replay import replay_execution
-        from workflow.service import WorkflowService
+        from workflow.storage import (
+            load_definition_for_execution,
+            load_plan_for_execution,
+        )
     except ImportError as exc:
         print(f"run-once requires coordination layer: {exc}", file=sys.stderr)
         return 1
 
+    actor = getattr(args, 'actor', 'cli-run-once')
     ids = find_non_terminal_execution_ids(args.db)
     if not ids:
         print("No non-terminal executions. Nothing to do.")
@@ -176,11 +179,20 @@ def cmd_run_once(args: argparse.Namespace) -> int:
             print(f"  {eid[:16]}  SKIP (replay failed)")
             continue
         exec_ = result.execution
-        stored = load_execution(args.db, eid)
-        if stored is None:
-            print(f"  {eid[:16]}  SKIP (no stored row for plan lookup)")
+
+        plan = load_plan_for_execution(args.db, eid)
+        definition = load_definition_for_execution(args.db, eid)
+
+        if plan is None or definition is None:
+            print(f"  {eid[:16]}  state={exec_.state}  SKIP (no persisted plan/definition)")
             continue
-        print(f"  {eid[:16]}  state={exec_.state}  (no plan available for submission)")
+
+        _, submitted, events = step_execution(orch_db, exec_, plan, definition, actor)
+        if events:
+            persist_execution(args.db, exec_, events)
+        n = len(submitted)
+        submitted_total += n
+        print(f"  {eid[:16]}  state={exec_.state}  submitted={n}")
 
     print(f"\nrun-once complete. {submitted_total} node(s) submitted.")
     return 0

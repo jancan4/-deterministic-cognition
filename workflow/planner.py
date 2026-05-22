@@ -100,6 +100,7 @@ def build_execution_plan(
     return WorkflowExecutionPlan(
         workflow_id=definition.workflow_id,
         plan_id=_plan_id(definition.workflow_id, definition.version, PLANNER_VERSION),
+        version=definition.version,
         stages=stages,
         dependency_snapshot=dependency_snapshot,
         generated_at=_now(),

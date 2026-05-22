@@ -75,6 +75,7 @@ def define_workflow(
 
 def plan_workflow(
     definition: WorkflowDefinition,
+    persist_to: Optional[str] = None,
 ) -> Tuple[ValidationResult, Optional[WorkflowExecutionPlan], WorkflowLineageEvent]:
     """
     Validate and plan a workflow definition.
@@ -82,6 +83,10 @@ def plan_workflow(
     Returns (validation_result, execution_plan, lineage_event).
     execution_plan is None when validation fails; lineage_event is always
     produced so every planning attempt has an immutable audit record.
+
+    When persist_to is a DB path and validation succeeds, the definition and
+    plan are persisted atomically before returning. Uses idempotent saves with
+    collision detection — safe to call repeatedly with the same definition.
     """
     validation_result = validate_workflow(definition)
     lineage = build_workflow_lineage(definition, validation_result)
@@ -90,4 +95,11 @@ def plan_workflow(
         return validation_result, None, lineage
 
     plan = build_execution_plan(definition, validation_result)
+
+    if persist_to is not None:
+        from .persistence import persist_workflow
+        from .storage import init_db
+        init_db(persist_to)
+        persist_workflow(persist_to, definition, plan)
+
     return validation_result, plan, lineage

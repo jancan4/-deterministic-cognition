@@ -9,6 +9,9 @@ Persistence contract:
 - save_execution writes (or upserts) the mutable state row.
 - append_execution_events appends lineage events atomically.
 - persist_execution saves both the state row and all events in one call.
+- persist_workflow_definition saves a definition; idempotent with collision detection.
+- persist_workflow_plan saves a plan; idempotent with collision detection.
+- persist_workflow saves definition + plan atomically (definition first per FK).
 - replay_execution_from_storage replays from all stored events (full replay).
 - replay_execution_from_snapshot replays from the latest snapshot + delta events.
 
@@ -17,15 +20,24 @@ replay from lineage is authoritative.
 """
 from typing import List, Optional, Tuple
 
+from .models import WorkflowDefinition, WorkflowExecutionPlan
 from .replay import ReplayResult, replay_execution, replay_from_snapshot
 from .state import WorkflowExecution, WorkflowExecutionLineageEvent
 from .storage import (
+    WorkflowDefinitionError,
+    WorkflowPlanError,
     append_execution_events as _append_events,
+    load_definition_for_execution,
     load_execution,
     load_execution_events,
     load_latest_snapshot,
+    load_plan_for_execution,
+    load_workflow_definition,
+    load_workflow_plan,
     persist_snapshot,
     save_execution,
+    save_workflow_definition,
+    save_workflow_plan,
 )
 
 
@@ -62,6 +74,44 @@ def persist_execution(
         # Post-init: events first preserves lineage-as-truth under crash.
         _append_events(db_path, events)
         save_execution(db_path, execution)
+
+
+def persist_workflow_definition(
+    db_path: str,
+    definition: WorkflowDefinition,
+) -> None:
+    """
+    Persist a workflow definition. Idempotent on (workflow_id, version).
+    Raises WorkflowDefinitionError on topology_hash collision.
+    """
+    save_workflow_definition(db_path, definition)
+
+
+def persist_workflow_plan(
+    db_path: str,
+    plan: WorkflowExecutionPlan,
+) -> None:
+    """
+    Persist a workflow execution plan. Idempotent on plan_id.
+    Raises WorkflowPlanError on plan content collision.
+    The corresponding definition row must already exist.
+    """
+    save_workflow_plan(db_path, plan)
+
+
+def persist_workflow(
+    db_path: str,
+    definition: WorkflowDefinition,
+    plan: WorkflowExecutionPlan,
+) -> None:
+    """
+    Persist definition and plan together.
+
+    Definition is written first to satisfy the FK constraint on workflow_plans.
+    Both saves are individually idempotent; collision detection applies to each.
+    """
+    save_workflow_definition(db_path, definition)
+    save_workflow_plan(db_path, plan)
 
 
 def append_execution_events(
