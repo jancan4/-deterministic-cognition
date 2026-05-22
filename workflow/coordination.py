@@ -123,6 +123,11 @@ def submit_ready_nodes(
             continue
         node = node_map[node_id]
         metadata = build_task_metadata(execution.execution_id, node_id)
+        # Embed task payload so handlers can retrieve it without a definition store.
+        # Skipped when the payload is the default empty object — nothing useful to embed.
+        _payload = node.task_payload_json or '{}'
+        if _payload.strip() not in ('{}', ''):
+            metadata['task_payload_json'] = _payload
 
         task = create_task(
             orchestration_db,

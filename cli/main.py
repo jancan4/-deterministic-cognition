@@ -22,11 +22,15 @@ Commands:
   semantic-workflow run      Execute one semantic_extraction workflow node.
   semantic-workflow lineage  Show semantic lineage for a workflow execution.
   semantic-workflow list-pending  List unresolved semantic memory events.
+  dispatch run-once          Poll and execute one batch of semantic_extraction tasks.
+  dispatch loop              Run bounded poll→execute loop for semantic_extraction tasks.
+  dispatch status            List semantic_extraction tasks grouped by state.
 
 Lineage is always canonical. The mutable state row is always a cache.
 Session context export is read-only. No memory is mutated.
 Semantic promotion writes memory_events with status=unresolved; approval and
 rejection must go through memory-review and are recorded in memory_revisions.
+Dispatcher never approves or activates memory — commit=True creates unresolved only.
 """
 import argparse
 import json
@@ -845,6 +849,87 @@ def build_parser() -> argparse.ArgumentParser:
         help='Maximum number of results (default: 100)',
     )
 
+    # dispatch -----------------------------------------------------------------
+    dp_p = sub.add_parser(
+        'dispatch',
+        help='Execute semantic_extraction tasks from the orchestration queue',
+    )
+    dp_p.set_defaults(command='dispatch')
+    dp_sub = dp_p.add_subparsers(dest='dispatch_subcommand')
+    dp_sub.required = True
+
+    dp_run_once = dp_sub.add_parser(
+        'run-once',
+        help=(
+            'Poll ready semantic_extraction tasks and execute one batch. Exits after '
+            'processing all currently-ready tasks.'
+        ),
+    )
+    dp_run_once.add_argument(
+        '--orch-db', default='orchestration.db', dest='orch_db',
+        help='Orchestration database path (default: orchestration.db)',
+    )
+    dp_run_once.add_argument(
+        '--memory-db', required=True, dest='memory_db',
+        help='Memory/semantic ledger database path',
+    )
+    dp_run_once.add_argument(
+        '--workflow-db', default=None, dest='workflow_db',
+        help='Workflow lineage database path (optional; appends node_completed events)',
+    )
+    dp_run_once.add_argument(
+        '--actor', default='semantic-dispatcher', dest='actor',
+        help='Actor identifier for lineage records (default: semantic-dispatcher)',
+    )
+
+    dp_loop = dp_sub.add_parser(
+        'loop',
+        help='Run a bounded poll→execute loop for semantic_extraction tasks.',
+    )
+    dp_loop.add_argument(
+        '--orch-db', default='orchestration.db', dest='orch_db',
+        help='Orchestration database path (default: orchestration.db)',
+    )
+    dp_loop.add_argument(
+        '--memory-db', required=True, dest='memory_db',
+        help='Memory/semantic ledger database path',
+    )
+    dp_loop.add_argument(
+        '--workflow-db', default=None, dest='workflow_db',
+        help='Workflow lineage database path (optional)',
+    )
+    dp_loop.add_argument(
+        '--state-db', default='runtime.db', dest='state_db',
+        help='Runtime state database path (default: runtime.db)',
+    )
+    dp_loop.add_argument(
+        '--max-iterations', default=10, type=int, dest='max_iterations',
+        help='Maximum poll iterations (default: 10)',
+    )
+    dp_loop.add_argument(
+        '--actor', default='semantic-dispatcher', dest='actor',
+        help='Actor identifier (default: semantic-dispatcher)',
+    )
+
+    dp_status = dp_sub.add_parser(
+        'status',
+        help='List semantic_extraction tasks filtered by state.',
+    )
+    dp_status.add_argument(
+        '--orch-db', default='orchestration.db', dest='orch_db',
+        help='Orchestration database path (default: orchestration.db)',
+    )
+    dp_status.add_argument(
+        '--state', default=None, dest='state',
+        choices=['pending', 'ready', 'running', 'blocked',
+                 'completed', 'failed', 'cancelled', 'superseded'],
+        help='Filter by task state (default: all states)',
+    )
+    dp_status.add_argument(
+        '--limit', default=50, type=int,
+        help='Maximum results per state (default: 50)',
+    )
+
     return parser
 
 
@@ -1502,6 +1587,163 @@ def _cmd_sw_list_pending(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dispatch(args: argparse.Namespace) -> int:
+    """dispatch subcommand dispatcher."""
+    subcommand = args.dispatch_subcommand
+    if subcommand == 'run-once':
+        return _cmd_dispatch_run_once(args)
+    elif subcommand == 'loop':
+        return _cmd_dispatch_loop(args)
+    elif subcommand == 'status':
+        return _cmd_dispatch_status(args)
+    print(f"ERROR: unknown dispatch subcommand: {subcommand!r}", file=sys.stderr)
+    return 1
+
+
+def _cmd_dispatch_run_once(args: argparse.Namespace) -> int:
+    """
+    Poll ready semantic_extraction tasks and execute one batch.
+
+    Reads task_payload_json from each task's metadata (embedded by
+    submit_ready_nodes), calls execute_semantic_node() via the registry,
+    and records outcomes as task state transitions. Exits after processing
+    all currently-ready tasks — does not loop.
+
+    Dispatcher never approves or activates memory. commit=True in a task
+    payload promotes candidates only to status='unresolved'.
+    """
+    from orchestration.service import init_db as orch_init_db
+    from runtime.service import execute_task, poll_ready_tasks
+    from workflow.dispatcher import build_semantic_registry
+
+    orch_db = args.orch_db
+    mem_db = args.memory_db
+    wf_db = getattr(args, 'workflow_db', None)
+    actor = getattr(args, 'actor', 'semantic-dispatcher')
+
+    orch_init_db(orch_db)
+    registry = build_semantic_registry(mem_db, workflow_db_path=wf_db, actor=actor)
+
+    ready_tasks = [t for t in poll_ready_tasks(orch_db)
+                   if t.task_type == 'semantic_extraction']
+
+    if not ready_tasks:
+        print("No ready semantic_extraction tasks.")
+        return 0
+
+    completed = 0
+    failed = 0
+    for task in ready_tasks:
+        final = execute_task(orch_db, task.id, actor, registry=registry)
+        if final.state == 'completed':
+            completed += 1
+            print(f"  task {task.id}  completed  ({task.title})")
+        else:
+            failed += 1
+            print(f"  task {task.id}  {final.state}  ({task.title})")
+
+    print(f"\ndispatch run-once: {completed} completed, {failed} failed "
+          f"(of {len(ready_tasks)} ready tasks).")
+    return 0 if failed == 0 else 1
+
+
+def _cmd_dispatch_loop(args: argparse.Namespace) -> int:
+    """
+    Run a bounded poll→execute loop for semantic_extraction tasks.
+
+    Uses the runtime runner (run_iterations) with a transient runtime
+    registered in --state-db. Stops after --max-iterations poll cycles.
+    The registered runtime is left in 'paused' state after completion.
+
+    Dispatcher never approves or activates memory.
+    """
+    from orchestration.service import init_db as orch_init_db
+    from runtime.models import RuntimeConfig
+    from runtime.runner import run_iterations
+    from runtime.state_store import init_db as rt_init_db, register_runtime
+    from workflow.dispatcher import build_semantic_registry
+
+    orch_db = args.orch_db
+    mem_db = args.memory_db
+    wf_db = getattr(args, 'workflow_db', None)
+    state_db = args.state_db
+    max_iterations = args.max_iterations
+    actor = getattr(args, 'actor', 'semantic-dispatcher')
+
+    orch_init_db(orch_db)
+    rt_init_db(state_db)
+
+    config = RuntimeConfig(
+        actor=actor,
+        max_iterations=max_iterations,
+        poll_interval_s=0.0,
+        max_retries=0,
+        checkpoint_every=max_iterations,
+        allow_unbounded=False,
+    )
+    runtime = register_runtime(state_db, 'dispatch-loop', orch_db, config)
+    registry = build_semantic_registry(mem_db, workflow_db_path=wf_db, actor=actor)
+
+    result = run_iterations(
+        state_db,
+        runtime.id,
+        orch_db,
+        config,
+        registry=registry,
+    )
+
+    print(
+        f"dispatch loop: {result.tasks_executed} task(s) executed in "
+        f"{result.iterations_completed} iteration(s). "
+        f"Stopped: {result.stopped_reason}."
+    )
+    return 0
+
+
+def _cmd_dispatch_status(args: argparse.Namespace) -> int:
+    """
+    List semantic_extraction tasks, grouped or filtered by state.
+    """
+    from orchestration.service import init_db as orch_init_db, list_tasks
+
+    orch_db = args.orch_db
+    state_filter = getattr(args, 'state', None)
+    limit = getattr(args, 'limit', 50)
+
+    orch_init_db(orch_db)
+
+    states_to_show = (
+        [state_filter] if state_filter
+        else ['pending', 'ready', 'running', 'completed', 'failed', 'cancelled']
+    )
+
+    total = 0
+    for state in states_to_show:
+        tasks = list_tasks(
+            orch_db,
+            state=state,
+            task_type='semantic_extraction',
+            limit=limit,
+        )
+        if not tasks:
+            continue
+        print(f"\n{state.upper()} ({len(tasks)}):")
+        for t in tasks:
+            node_id = t.metadata.get('workflow_node_id', '')
+            exec_id = t.metadata.get('workflow_execution_id', '')
+            exec_hint = f" exec={exec_id[:8]}" if exec_id else ''
+            node_hint = f" node={node_id}" if node_id else ''
+            print(f"  id={t.id}  {t.title}{exec_hint}{node_hint}")
+        total += len(tasks)
+
+    if total == 0:
+        state_label = f"state={state_filter!r}" if state_filter else 'any state'
+        print(f"No semantic_extraction tasks found ({state_label}).")
+    else:
+        print(f"\nTotal: {total} semantic_extraction task(s).")
+    return 0
+
+
 def cmd_export_bundle(args: argparse.Namespace) -> int:
     import json
     from continuity.exporter import export_bundle
@@ -1620,6 +1862,7 @@ def main(argv: List[str] = None) -> int:
         'semantic-candidates': cmd_semantic_candidates,
         'memory-review': cmd_memory_review,
         'semantic-workflow': cmd_semantic_workflow,
+        'dispatch': cmd_dispatch,
     }
     return dispatch[args.command](args)
 
