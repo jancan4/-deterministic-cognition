@@ -8,6 +8,10 @@ Commands:
   snapshot --execution-id ID Take a manual snapshot of one execution.
   run-once [--orch-db PATH]  Submit one round of ready nodes to the orchestration layer.
   session-context            Export a deterministic context bundle from memory.
+  ingest-file --path PATH    Extract candidate memory events from a source file.
+  sources-register --path P  Register a file in the source document registry.
+  sources-list               List registered source documents.
+  sources-show --source-id S Show a single source document record.
 
 Lineage is always canonical. The mutable state row is always a cache.
 Session context export is read-only. No memory is mutated.
@@ -494,6 +498,71 @@ def build_parser() -> argparse.ArgumentParser:
         '--commit', action='store_true', default=False, dest='commit',
         help='Commit accepted candidates to the memory database',
     )
+    if_p.add_argument(
+        '--source-type', default='unknown', dest='source_type',
+        choices=[
+            'doctrine', 'research_note', 'article', 'transcript',
+            'implementation_brief', 'architecture_doc', 'external_reference', 'unknown',
+        ],
+        help='Source document type for registry (default: unknown)',
+    )
+    if_p.add_argument(
+        '--authority-tier', default='unknown', dest='authority_tier',
+        choices=['authoritative', 'high', 'medium', 'low', 'unknown'],
+        help='Authority tier for registry (default: unknown)',
+    )
+
+    # sources-register ---------------------------------------------------
+    sr_p = sub.add_parser(
+        'sources-register',
+        help='Register a file in the source document registry',
+    )
+    sr_p.set_defaults(command='sources-register')
+    sr_p.add_argument('--path', required=True, dest='path', help='File to register')
+    sr_p.add_argument('--db', default='memory.db', dest='db', help='Registry database')
+    sr_p.add_argument(
+        '--source-type', default='unknown', dest='source_type',
+        choices=[
+            'doctrine', 'research_note', 'article', 'transcript',
+            'implementation_brief', 'architecture_doc', 'external_reference', 'unknown',
+        ],
+        help='Source document type (default: unknown)',
+    )
+    sr_p.add_argument(
+        '--authority-tier', default='unknown', dest='authority_tier',
+        choices=['authoritative', 'high', 'medium', 'low', 'unknown'],
+        help='Authority tier (default: unknown)',
+    )
+
+    # sources-list -------------------------------------------------------
+    sl_p = sub.add_parser(
+        'sources-list',
+        help='List registered source documents',
+    )
+    sl_p.set_defaults(command='sources-list')
+    sl_p.add_argument('--db', default='memory.db', dest='db', help='Registry database')
+    sl_p.add_argument(
+        '--status', default=None, dest='status',
+        choices=['active', 'superseded', 'deprecated', 'rejected', 'archived'],
+        help='Filter by status',
+    )
+    sl_p.add_argument(
+        '--source-type', default=None, dest='source_type',
+        choices=[
+            'doctrine', 'research_note', 'article', 'transcript',
+            'implementation_brief', 'architecture_doc', 'external_reference', 'unknown',
+        ],
+        help='Filter by source type',
+    )
+
+    # sources-show -------------------------------------------------------
+    ss_p = sub.add_parser(
+        'sources-show',
+        help='Show a single source document record',
+    )
+    ss_p.set_defaults(command='sources-show')
+    ss_p.add_argument('--db', default='memory.db', dest='db', help='Registry database')
+    ss_p.add_argument('--source-id', required=True, dest='source_id', help='16-char source_id')
 
     return parser
 
@@ -503,6 +572,7 @@ def cmd_ingest_file(args: argparse.Namespace) -> int:
     from ingestion.parser import parse_file
     from ingestion.chunker import chunk_document
     from ingestion.candidates import run_ingestion
+    from sources.registry import register_source
 
     try:
         doc = parse_file(args.path)
@@ -513,6 +583,16 @@ def cmd_ingest_file(args: argparse.Namespace) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
+    # Register source provenance before candidate extraction.
+    source_type = getattr(args, 'source_type', 'unknown')
+    authority_tier = getattr(args, 'authority_tier', 'unknown')
+    src_doc = register_source(
+        args.db,
+        args.path,
+        source_type=source_type,
+        authority_tier=authority_tier,
+    )
+
     chunks = chunk_document(doc)
     result = run_ingestion(
         doc, chunks,
@@ -520,7 +600,10 @@ def cmd_ingest_file(args: argparse.Namespace) -> int:
         commit=args.commit,
     )
 
-    output = json.dumps(result.to_dict(), indent=2, sort_keys=True)
+    output_dict = result.to_dict()
+    output_dict['source_registry'] = src_doc.to_dict()
+    output = json.dumps(output_dict, indent=2, sort_keys=True)
+
     if args.out:
         with open(args.out, 'w', encoding='utf-8') as fh:
             fh.write(output)
@@ -528,12 +611,64 @@ def cmd_ingest_file(args: argparse.Namespace) -> int:
             f" ({len(result.committed_ids)} committed)" if result.committed_ids else ""
         )
         print(
-            f"Ingested {result.candidate_count} candidate(s){committed_note} → {args.out}",
+            f"Ingested {result.candidate_count} candidate(s){committed_note} "
+            f"[src:{src_doc.source_id}] → {args.out}",
             file=sys.stderr,
         )
     else:
         print(output)
 
+    return 0
+
+
+def cmd_sources_register(args: argparse.Namespace) -> int:
+    import json
+    from sources.registry import register_source
+    from sources.models import SourceValidationError
+
+    try:
+        doc = register_source(
+            args.db,
+            args.path,
+            source_type=args.source_type,
+            authority_tier=args.authority_tier,
+        )
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except SourceValidationError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    print(json.dumps(doc.to_dict(), indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_sources_list(args: argparse.Namespace) -> int:
+    import json
+    from sources.registry import list_sources
+    from sources.models import SourceValidationError
+
+    try:
+        docs = list_sources(args.db, status=args.status, source_type=args.source_type)
+    except SourceValidationError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    print(json.dumps([d.to_dict() for d in docs], indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_sources_show(args: argparse.Namespace) -> int:
+    import json
+    from sources.registry import get_source_by_id
+
+    doc = get_source_by_id(args.db, args.source_id)
+    if doc is None:
+        print(f"ERROR: source_id {args.source_id!r} not found", file=sys.stderr)
+        return 1
+
+    print(json.dumps(doc.to_dict(), indent=2, sort_keys=True))
     return 0
 
 
@@ -549,6 +684,9 @@ def main(argv: List[str] = None) -> int:
         'run-once': cmd_run_once,
         'session-context': cmd_session_context,
         'ingest-file': cmd_ingest_file,
+        'sources-register': cmd_sources_register,
+        'sources-list': cmd_sources_list,
+        'sources-show': cmd_sources_show,
     }
     return dispatch[args.command](args)
 
