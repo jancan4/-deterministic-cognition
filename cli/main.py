@@ -19,6 +19,9 @@ Commands:
   memory-review list         List memory events pending operator review.
   memory-review approve      Transition a memory event to active/accepted.
   memory-review reject       Transition a memory event to rejected.
+  semantic-workflow run      Execute one semantic_extraction workflow node.
+  semantic-workflow lineage  Show semantic lineage for a workflow execution.
+  semantic-workflow list-pending  List unresolved semantic memory events.
 
 Lineage is always canonical. The mutable state row is always a cache.
 Session context export is read-only. No memory is mutated.
@@ -760,6 +763,88 @@ def build_parser() -> argparse.ArgumentParser:
         help='Validate and plan import without writing anything',
     )
 
+    # semantic-workflow --------------------------------------------------
+    sw_p = sub.add_parser(
+        'semantic-workflow',
+        help='Workflow-integrated semantic execution and lineage inspection',
+    )
+    sw_p.set_defaults(command='semantic-workflow')
+    sw_sub = sw_p.add_subparsers(dest='sw_subcommand')
+    sw_sub.required = True
+
+    sw_run = sw_sub.add_parser(
+        'run',
+        help=(
+            'Execute one semantic_extraction workflow node directly. '
+            'Optionally records node_completed with semantic lineage metadata in workflow lineage.'
+        ),
+    )
+    sw_run.add_argument(
+        '--db', default='workflow.db', dest='db',
+        help='Workflow database path for lineage recording (default: workflow.db)',
+    )
+    sw_run.add_argument(
+        '--memory-db', required=True, dest='memory_db',
+        help='Memory/semantic ledger database path',
+    )
+    sw_payload_group = sw_run.add_mutually_exclusive_group(required=True)
+    sw_payload_group.add_argument(
+        '--payload', default=None, dest='payload',
+        metavar='JSON',
+        help='Task payload JSON string (semantic task parameters)',
+    )
+    sw_payload_group.add_argument(
+        '--payload-file', default=None, dest='payload_file',
+        metavar='PATH',
+        help='Path to task payload JSON file',
+    )
+    sw_run.add_argument(
+        '--execution-id', default=None, dest='execution_id',
+        help='Workflow execution ID (optional; appends node_completed event to lineage)',
+    )
+    sw_run.add_argument(
+        '--node-id', default=None, dest='node_id',
+        help='Node ID for workflow lineage recording (required if --execution-id is set)',
+    )
+    sw_run.add_argument(
+        '--commit', action='store_true', default=False,
+        help='Promote candidates to unresolved memory (default: ledger-only)',
+    )
+    sw_run.add_argument(
+        '--actor', default='semantic-workflow', dest='actor',
+        help='Actor identifier for lineage records (default: semantic-workflow)',
+    )
+
+    sw_lineage = sw_sub.add_parser(
+        'lineage',
+        help='Show semantic lineage for all completed semantic nodes in a workflow execution',
+    )
+    sw_lineage.add_argument(
+        '--db', default='workflow.db', dest='db',
+        help='Workflow database path (default: workflow.db)',
+    )
+    sw_lineage.add_argument(
+        '--memory-db', default=None, dest='memory_db',
+        help='Memory/semantic ledger database path (optional; enriches output from ledger)',
+    )
+    sw_lineage.add_argument(
+        '--execution-id', required=True, dest='execution_id',
+        help='Workflow execution ID',
+    )
+
+    sw_pending = sw_sub.add_parser(
+        'list-pending',
+        help='List unresolved memory events with semantic provenance pending operator review',
+    )
+    sw_pending.add_argument(
+        '--db', default='memory.db', dest='db',
+        help='Memory database path (default: memory.db)',
+    )
+    sw_pending.add_argument(
+        '--limit', default=100, type=int,
+        help='Maximum number of results (default: 100)',
+    )
+
     return parser
 
 
@@ -1190,6 +1275,233 @@ def cmd_memory_review(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_semantic_workflow(args: argparse.Namespace) -> int:
+    """semantic-workflow subcommand dispatcher."""
+    subcommand = args.sw_subcommand
+
+    if subcommand == 'run':
+        return _cmd_sw_run(args)
+    elif subcommand == 'lineage':
+        return _cmd_sw_lineage(args)
+    elif subcommand == 'list-pending':
+        return _cmd_sw_list_pending(args)
+
+    print(f"ERROR: unknown semantic-workflow subcommand: {subcommand!r}", file=sys.stderr)
+    return 1
+
+
+def _cmd_sw_run(args: argparse.Namespace) -> int:
+    """
+    Execute one semantic_extraction workflow node directly (non-queue path).
+
+    Takes the task payload as a JSON string (--payload) or file (--payload-file)
+    and runs the semantic handler. If --execution-id and --node-id are provided,
+    appends a node_completed lineage event with semantic metadata to the workflow
+    execution log.
+
+    Architecture note: workflow plan and definition are not persisted to the
+    workflow DB — only execution state is. This command therefore takes the task
+    payload directly rather than loading it from stored node definitions. Full
+    workflow coordination (stage advancement, completion detection) requires the
+    coordination layer with the full plan; this command records semantic lineage
+    only.
+
+    Workflow replay semantics: this command is the *execution* path. Replay
+    reconstructs state from stored lineage events and never re-invokes adapters.
+    """
+    import json as _json
+    from datetime import datetime, timezone
+    from workflow.semantic_handler import execute_semantic_node
+    from workflow.state import (
+        EVENT_NODE_COMPLETED, WorkflowExecutionLineageEvent,
+    )
+    from workflow.storage import (
+        init_db as wf_init_db, append_execution_events,
+    )
+
+    mem_db = args.memory_db
+    actor = getattr(args, 'actor', 'semantic-workflow')
+
+    # Resolve task_payload_json from --payload or --payload-file
+    if getattr(args, 'payload', None):
+        task_payload_json = args.payload
+    elif getattr(args, 'payload_file', None):
+        try:
+            with open(args.payload_file, encoding='utf-8') as fh:
+                task_payload_json = fh.read()
+        except OSError as exc:
+            print(f"ERROR reading --payload-file: {exc}", file=sys.stderr)
+            return 1
+    else:
+        print("ERROR: --payload or --payload-file is required", file=sys.stderr)
+        return 1
+
+    # Override commit flag if --commit passed on CLI
+    if getattr(args, 'commit', False):
+        try:
+            payload_dict = _json.loads(task_payload_json)
+            payload_dict['commit'] = True
+            task_payload_json = _json.dumps(payload_dict)
+        except Exception as exc:
+            print(f"ERROR: could not apply --commit to payload: {exc}", file=sys.stderr)
+            return 1
+
+    # Execute semantic node (always writes to semantic ledger)
+    sem_result = execute_semantic_node(task_payload_json, mem_db, actor=actor)
+
+    if not sem_result.success:
+        print(f"ERROR: semantic execution failed: {sem_result.error}", file=sys.stderr)
+
+    # Optionally record in workflow execution lineage
+    execution_id = getattr(args, 'execution_id', None)
+    node_id = getattr(args, 'node_id', None)
+    if execution_id and node_id and sem_result.run_id:
+        wf_db = args.db
+        wf_init_db(wf_db)
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        evt_type = EVENT_NODE_COMPLETED if sem_result.success else 'node_failed'
+        meta = dict(sem_result.lineage_metadata)
+        lineage_evt = WorkflowExecutionLineageEvent(
+            execution_id=execution_id,
+            event_type=evt_type,
+            old_state=None,
+            new_state=None,
+            node_id=node_id,
+            stage_index=0,
+            reason=f'Semantic extraction: run_id={sem_result.run_id}',
+            created_at=now,
+            metadata=meta,
+        )
+        try:
+            append_execution_events(wf_db, [lineage_evt])
+        except Exception as exc:
+            print(
+                f"WARNING: semantic run succeeded but workflow lineage append failed: {exc}",
+                file=sys.stderr,
+            )
+
+    output = {
+        'semantic_run_id': sem_result.run_id,
+        'candidate_ids': sem_result.candidate_ids,
+        'promoted_memory_ids': sem_result.promoted_memory_ids,
+        'committed': sem_result.lineage_metadata.get('committed', False),
+        'adapter_name': sem_result.lineage_metadata.get('adapter_name'),
+        'adapter_version': sem_result.lineage_metadata.get('adapter_version'),
+        'task_type': sem_result.lineage_metadata.get('task_type'),
+        'success': sem_result.success,
+        'error': sem_result.error,
+    }
+    if execution_id:
+        output['execution_id'] = execution_id
+    if node_id:
+        output['node_id'] = node_id
+
+    print(_json.dumps(output, indent=2, sort_keys=True))
+    return 0 if sem_result.success else 1
+
+
+def _cmd_sw_lineage(args: argparse.Namespace) -> int:
+    """
+    Print semantic lineage for all completed semantic nodes in a workflow execution.
+
+    Loads workflow execution events, extracts node_completed events that carry
+    semantic_run_id in their metadata, and prints provenance detail. Optionally
+    fetches the semantic_execution_runs row from the memory DB for enriched output.
+    """
+    import json as _json
+    from workflow.storage import init_db as wf_init_db, load_execution_events
+    from workflow.state import EVENT_NODE_COMPLETED
+
+    wf_db = args.db
+    execution_id = args.execution_id
+    mem_db = getattr(args, 'memory_db', None)
+
+    wf_init_db(wf_db)
+    events = load_execution_events(wf_db, execution_id)
+    semantic_events = [
+        e for e in events
+        if e.event_type == EVENT_NODE_COMPLETED and e.metadata.get('semantic_run_id')
+    ]
+
+    if not semantic_events:
+        print(f"No semantic lineage found for execution {execution_id!r}.")
+        return 0
+
+    results = []
+    for evt in semantic_events:
+        meta = evt.metadata
+        entry = {
+            'node_id': evt.node_id,
+            'stage_index': evt.stage_index,
+            'completed_at': evt.created_at,
+            'semantic_run_id': meta.get('semantic_run_id'),
+            'candidate_ids': meta.get('candidate_ids', []),
+            'promoted_memory_ids': meta.get('promoted_memory_ids', []),
+            'adapter_name': meta.get('adapter_name'),
+            'adapter_version': meta.get('adapter_version'),
+            'task_type': meta.get('task_type'),
+            'committed': meta.get('committed', False),
+        }
+        if meta.get('model'):
+            entry['model'] = meta['model']
+
+        # Optionally enrich from semantic ledger
+        if mem_db and meta.get('semantic_run_id'):
+            try:
+                from semantic.ledger import get_run
+                run = get_run(mem_db, meta['semantic_run_id'])
+                if run:
+                    entry['ledger_status'] = run.status
+                    entry['ledger_candidate_count'] = run.candidate_count
+                    entry['ledger_promoted_count'] = run.promoted_count
+            except Exception:
+                pass
+
+        results.append(entry)
+
+    print(_json.dumps(results, indent=2, sort_keys=True))
+    return 0
+
+
+def _cmd_sw_list_pending(args: argparse.Namespace) -> int:
+    """
+    List unresolved memory events that have semantic provenance.
+
+    Filters memory events whose evidence string starts with 'semantic:',
+    indicating they were created via the semantic promotion path. Uses the
+    existing memory service listing — no new DB queries.
+    """
+    import json as _json
+    from memory import service as mem_service
+
+    db = args.db
+    limit = getattr(args, 'limit', 100)
+
+    try:
+        mem_service.init_db(db)
+        events = mem_service.list_memory_events(db, status='unresolved')
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    semantic_events = [
+        e for e in events
+        if e.evidence and e.evidence.startswith('semantic:')
+    ]
+
+    if not semantic_events:
+        print("No unresolved semantic memory events pending review.")
+        return 0
+
+    output = _json.dumps(
+        [e.to_dict() for e in semantic_events[:limit]],
+        indent=2,
+        sort_keys=True,
+    )
+    print(output)
+    return 0
+
+
 def cmd_export_bundle(args: argparse.Namespace) -> int:
     import json
     from continuity.exporter import export_bundle
@@ -1307,6 +1619,7 @@ def main(argv: List[str] = None) -> int:
         'semantic-run': cmd_semantic_run,
         'semantic-candidates': cmd_semantic_candidates,
         'memory-review': cmd_memory_review,
+        'semantic-workflow': cmd_semantic_workflow,
     }
     return dispatch[args.command](args)
 
