@@ -12,6 +12,8 @@ Commands:
   sources-register --path P  Register a file in the source document registry.
   sources-list               List registered source documents.
   sources-show --source-id S Show a single source document record.
+  ingestion-runs             List ingestion run records.
+  ingestion-run-show --run-id Show a single ingestion run record.
 
 Lineage is always canonical. The mutable state row is always a cache.
 Session context export is read-only. No memory is mutated.
@@ -564,15 +566,42 @@ def build_parser() -> argparse.ArgumentParser:
     ss_p.add_argument('--db', default='memory.db', dest='db', help='Registry database')
     ss_p.add_argument('--source-id', required=True, dest='source_id', help='16-char source_id')
 
+    # ingestion-runs -----------------------------------------------------
+    ir_p = sub.add_parser(
+        'ingestion-runs',
+        help='List ingestion run records',
+    )
+    ir_p.set_defaults(command='ingestion-runs')
+    ir_p.add_argument('--db', default='memory.db', dest='db', help='Registry database')
+    ir_p.add_argument('--source-id', default=None, dest='source_id', help='Filter by source_id')
+    ir_p.add_argument(
+        '--status', default=None, dest='status',
+        choices=['candidate_generated', 'committed', 'failed'],
+        help='Filter by run status',
+    )
+
+    # ingestion-run-show -------------------------------------------------
+    irs_p = sub.add_parser(
+        'ingestion-run-show',
+        help='Show a single ingestion run record',
+    )
+    irs_p.set_defaults(command='ingestion-run-show')
+    irs_p.add_argument('--db', default='memory.db', dest='db', help='Registry database')
+    irs_p.add_argument('--run-id', required=True, dest='run_id', help='16-char run_id')
+
     return parser
 
 
 def cmd_ingest_file(args: argparse.Namespace) -> int:
     import json
-    from ingestion.parser import parse_file
+    from ingestion.parser import parse_file, PARSER_VERSION
     from ingestion.chunker import chunk_document
     from ingestion.candidates import run_ingestion
+    from ingestion.extractor import EXTRACTOR_VERSION
+    from ingestion.runs import record_run, make_started_at
     from sources.registry import register_source
+
+    started_at = make_started_at()
 
     try:
         doc = parse_file(args.path)
@@ -593,31 +622,92 @@ def cmd_ingest_file(args: argparse.Namespace) -> int:
         authority_tier=authority_tier,
     )
 
-    chunks = chunk_document(doc)
-    result = run_ingestion(
-        doc, chunks,
-        memory_db_path=args.db if args.commit else None,
-        commit=args.commit,
+    run_status = 'candidate_generated'
+    run_metadata: dict = {}
+    result = None
+
+    try:
+        chunks = chunk_document(doc)
+        result = run_ingestion(
+            doc, chunks,
+            memory_db_path=args.db if args.commit else None,
+            commit=args.commit,
+        )
+        if args.commit and result.committed_ids:
+            run_status = 'committed'
+    except Exception as exc:
+        run_status = 'failed'
+        run_metadata['error'] = str(exc)
+        print(f"ERROR: {exc}", file=sys.stderr)
+
+    chunk_count = len(result.chunks) if result else 0
+    candidate_count = result.candidate_count if result else 0
+    committed_ids = result.committed_ids if result else []
+
+    import datetime as _dt
+    completed_at = _dt.datetime.now(_dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    run = record_run(
+        db_path=args.db,
+        source_id=src_doc.source_id,
+        source_checksum=src_doc.checksum_sha256,
+        source_version=src_doc.version,
+        parser_version=PARSER_VERSION,
+        extractor_version=EXTRACTOR_VERSION,
+        chunk_count=chunk_count,
+        candidate_count=candidate_count,
+        committed_count=len(committed_ids),
+        committed_memory_ids=committed_ids,
+        status=run_status,
+        started_at=started_at,
+        completed_at=completed_at,
+        metadata=run_metadata,
     )
+
+    if run_status == 'failed':
+        return 1
 
     output_dict = result.to_dict()
     output_dict['source_registry'] = src_doc.to_dict()
+    output_dict['ingestion_run'] = run.to_dict()
     output = json.dumps(output_dict, indent=2, sort_keys=True)
 
     if args.out:
         with open(args.out, 'w', encoding='utf-8') as fh:
             fh.write(output)
         committed_note = (
-            f" ({len(result.committed_ids)} committed)" if result.committed_ids else ""
+            f" ({len(committed_ids)} committed)" if committed_ids else ""
         )
         print(
-            f"Ingested {result.candidate_count} candidate(s){committed_note} "
-            f"[src:{src_doc.source_id}] → {args.out}",
+            f"Ingested {candidate_count} candidate(s){committed_note} "
+            f"[src:{src_doc.source_id}] [run:{run.run_id}] → {args.out}",
             file=sys.stderr,
         )
     else:
         print(output)
 
+    return 0
+
+
+def cmd_ingestion_runs(args: argparse.Namespace) -> int:
+    import json
+    from ingestion.runs import list_runs
+
+    runs = list_runs(args.db, source_id=args.source_id, status=args.status)
+    print(json.dumps([r.to_dict() for r in runs], indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_ingestion_run_show(args: argparse.Namespace) -> int:
+    import json
+    from ingestion.runs import get_run
+
+    run = get_run(args.db, args.run_id)
+    if run is None:
+        print(f"ERROR: run_id {args.run_id!r} not found", file=sys.stderr)
+        return 1
+
+    print(json.dumps(run.to_dict(), indent=2, sort_keys=True))
     return 0
 
 
@@ -687,6 +777,8 @@ def main(argv: List[str] = None) -> int:
         'sources-register': cmd_sources_register,
         'sources-list': cmd_sources_list,
         'sources-show': cmd_sources_show,
+        'ingestion-runs': cmd_ingestion_runs,
+        'ingestion-run-show': cmd_ingestion_run_show,
     }
     return dispatch[args.command](args)
 
