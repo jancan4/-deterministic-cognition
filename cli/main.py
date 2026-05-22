@@ -472,7 +472,69 @@ def build_parser() -> argparse.ArgumentParser:
         help='Output format: json or markdown (default: markdown)',
     )
 
+    # ingest-file --------------------------------------------------------
+    if_p = sub.add_parser(
+        'ingest-file',
+        help='Extract candidate memory events from a source file',
+    )
+    if_p.set_defaults(command='ingest-file')
+    if_p.add_argument(
+        '--path', required=True, dest='path',
+        help='Source file to ingest (.txt, .md, .markdown, or no extension)',
+    )
+    if_p.add_argument(
+        '--db', default='memory.db', dest='db',
+        help='Memory SQLite database (used only with --commit)',
+    )
+    if_p.add_argument(
+        '--out', default=None, dest='out',
+        help='Write candidate JSON to this file instead of stdout',
+    )
+    if_p.add_argument(
+        '--commit', action='store_true', default=False, dest='commit',
+        help='Commit accepted candidates to the memory database',
+    )
+
     return parser
+
+
+def cmd_ingest_file(args: argparse.Namespace) -> int:
+    import json
+    from ingestion.parser import parse_file
+    from ingestion.chunker import chunk_document
+    from ingestion.candidates import run_ingestion
+
+    try:
+        doc = parse_file(args.path)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    chunks = chunk_document(doc)
+    result = run_ingestion(
+        doc, chunks,
+        memory_db_path=args.db if args.commit else None,
+        commit=args.commit,
+    )
+
+    output = json.dumps(result.to_dict(), indent=2, sort_keys=True)
+    if args.out:
+        with open(args.out, 'w', encoding='utf-8') as fh:
+            fh.write(output)
+        committed_note = (
+            f" ({len(result.committed_ids)} committed)" if result.committed_ids else ""
+        )
+        print(
+            f"Ingested {result.candidate_count} candidate(s){committed_note} → {args.out}",
+            file=sys.stderr,
+        )
+    else:
+        print(output)
+
+    return 0
 
 
 def main(argv: List[str] = None) -> int:
@@ -486,6 +548,7 @@ def main(argv: List[str] = None) -> int:
         'snapshot': cmd_snapshot,
         'run-once': cmd_run_once,
         'session-context': cmd_session_context,
+        'ingest-file': cmd_ingest_file,
     }
     return dispatch[args.command](args)
 
