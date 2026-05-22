@@ -89,6 +89,9 @@ _INVALIDATABLE_FROM: FrozenSet[str] = frozenset({
     ArtifactStatus.ACTIVE,
 })
 
+# Valid source statuses for mark_active (candidate only).
+_PROMOTABLE_FROM: FrozenSet[str] = frozenset({ArtifactStatus.CANDIDATE})
+
 
 class GovernanceSchemaError(Exception):
     """Raised when a derived artifact table fails governance schema validation,
@@ -151,6 +154,43 @@ def _require_governed_table(table_name: str) -> None:
             f"Table '{table_name}' is not in the governed artifact table allowlist. "
             f"Known invalidatable tables: {sorted(_GOVERNED_ARTIFACT_TABLES)}."
         )
+
+
+def mark_active(
+    conn: sqlite3.Connection,
+    table_name: str,
+    artifact_id: int,
+) -> None:
+    """
+    Governed transition: candidate → active.
+
+    Owns only the status UPDATE. Promotion audit metadata is the caller's
+    responsibility (persist it to provenance_json or an audit column before
+    or after this call, within the same transaction).
+
+    Valid from: status='candidate' only.
+    Invalid from: active, superseded, invalidated.
+    Raises GovernanceSchemaError if table_name not in _GOVERNED_ARTIFACT_TABLES.
+    Raises GovernanceInvalidationError on invalid transition or missing row.
+    """
+    _require_governed_table(table_name)
+    row = conn.execute(
+        f'SELECT status FROM {table_name} WHERE id = ?', (artifact_id,)
+    ).fetchone()
+    if row is None:
+        raise GovernanceInvalidationError(
+            f"Artifact id={artifact_id} not found in '{table_name}'"
+        )
+    current = row[0]
+    if current not in _PROMOTABLE_FROM:
+        raise GovernanceInvalidationError(
+            f"Cannot promote artifact id={artifact_id} in '{table_name}': "
+            f"current status={current!r}. Only 'candidate' artifacts may be promoted to 'active'."
+        )
+    conn.execute(
+        f"UPDATE {table_name} SET status = ? WHERE id = ?",
+        (ArtifactStatus.ACTIVE, artifact_id),
+    )
 
 
 def mark_invalidated(

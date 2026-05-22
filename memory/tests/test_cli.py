@@ -2,6 +2,8 @@ import json
 import pytest
 from memory import service
 from memory.cli import main
+from memory.embeddings import embed_event
+from models.embedding_adapter import StubEmbeddingAdapter
 
 
 def run(args, db_path):
@@ -398,3 +400,83 @@ class TestCliReview:
         out = capsys.readouterr().out
         assert 'a hypothesis' in out
         assert 'an incident' not in out
+
+
+# ---------------------------------------------------------------------------
+# promote-embedding
+# ---------------------------------------------------------------------------
+
+def _embed(db, event, dimensions=4):
+    adapter = StubEmbeddingAdapter(dimensions=dimensions)
+    return embed_event(db, event, adapter)
+
+
+class TestCliPromoteEmbedding:
+    def test_promote_success_exits_zero(self, tmp_path, capsys):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        event = _add(db)
+        row_id = _embed(db, event)
+        run(['promote-embedding', '--id', str(row_id),
+             '--reason', 'model validated', '--operator', 'quant'], db)
+        # No SystemExit means success.
+
+    def test_promote_success_outputs_json(self, tmp_path, capsys):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        event = _add(db)
+        row_id = _embed(db, event)
+        run(['promote-embedding', '--id', str(row_id),
+             '--reason', 'ok', '--operator', 'quant'], db)
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert payload['id'] == row_id
+        assert payload['status'] == 'active'
+
+    def test_promote_output_contains_audit_in_provenance(self, tmp_path, capsys):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        event = _add(db)
+        row_id = _embed(db, event)
+        run(['promote-embedding', '--id', str(row_id),
+             '--reason', 'risk cleared', '--operator', 'risk-engine'], db)
+        payload = json.loads(capsys.readouterr().out)
+        prov = json.loads(payload['provenance_json'])
+        assert prov['promotion']['operator'] == 'risk-engine'
+        assert prov['promotion']['reason'] == 'risk cleared'
+
+    def test_promote_unknown_id_exits_nonzero(self, tmp_path, capsys):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        with pytest.raises(SystemExit) as exc_info:
+            run(['promote-embedding', '--id', '9999',
+                 '--reason', 'ok', '--operator', 'quant'], db)
+        assert exc_info.value.code != 0
+
+    def test_promote_missing_reason_exits_nonzero(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        with pytest.raises(SystemExit) as exc_info:
+            run(['promote-embedding', '--id', '1', '--operator', 'quant'], db)
+        assert exc_info.value.code != 0
+
+    def test_promote_missing_operator_exits_nonzero(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        with pytest.raises(SystemExit) as exc_info:
+            run(['promote-embedding', '--id', '1', '--reason', 'ok'], db)
+        assert exc_info.value.code != 0
+
+    def test_promote_governance_error_exits_nonzero(self, tmp_path, capsys):
+        """Promoting an already-active embedding must exit nonzero."""
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        event = _add(db)
+        row_id = _embed(db, event)
+        run(['promote-embedding', '--id', str(row_id),
+             '--reason', 'first', '--operator', 'quant'], db)
+        capsys.readouterr()  # clear output
+        with pytest.raises(SystemExit) as exc_info:
+            run(['promote-embedding', '--id', str(row_id),
+                 '--reason', 'again', '--operator', 'quant'], db)
+        assert exc_info.value.code != 0

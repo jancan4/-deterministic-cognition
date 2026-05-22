@@ -33,8 +33,11 @@ from typing import Any, List, Optional
 
 from .artifact_governance import (
     ArtifactStatus,
+    GovernanceInvalidationError,
     compute_content_hash,
+    mark_active,
     mark_invalidated,
+    mark_superseded,
 )
 from .models import MemoryEvent
 
@@ -257,6 +260,95 @@ def get_active_embedding(
         return EmbeddingRow.from_row(row) if row is not None else None
     finally:
         conn.close()
+
+
+def promote_embedding(
+    db_path: str,
+    embedding_id: int,
+    *,
+    reason: str,
+    operator: str,
+) -> 'EmbeddingRow':
+    """
+    Promote a candidate embedding to active.
+
+    Enforces the at-most-one-active invariant: any existing active rows for the
+    same memory_event_id are superseded via mark_superseded() before the candidate
+    is promoted via mark_active(). All mutations happen atomically in one connection.
+
+    Persists promotion audit metadata into provenance_json as a 'promotion' sub-key,
+    preserving all existing generation provenance fields.
+
+    Does NOT mutate memory_events. Does NOT approve memory. Does NOT trigger
+    retrieval or semantic activation.
+
+    Raises ValueError for empty reason or operator.
+    Raises GovernanceInvalidationError if the row is not in 'candidate' status,
+    or if the row does not exist.
+    """
+    if not reason or not reason.strip():
+        raise ValueError("'reason' must not be empty")
+    if not operator or not operator.strip():
+        raise ValueError("'operator' must not be empty")
+
+    now = _now_utc()
+
+    with _open(db_path) as conn:
+        # Fetch and validate candidate before any mutations.
+        row = conn.execute(
+            "SELECT * FROM event_embeddings WHERE id = ?", (embedding_id,)
+        ).fetchone()
+        if row is None:
+            raise GovernanceInvalidationError(
+                f"Embedding id={embedding_id} not found"
+            )
+        candidate = EmbeddingRow.from_row(row)
+
+        if candidate.status != ArtifactStatus.CANDIDATE:
+            raise GovernanceInvalidationError(
+                f"Cannot promote embedding id={embedding_id}: "
+                f"current status={candidate.status!r}. "
+                f"Only 'candidate' embeddings may be promoted to 'active'."
+            )
+
+        # Supersede all existing active rows for this memory_event_id.
+        active_rows = conn.execute(
+            "SELECT id FROM event_embeddings "
+            "WHERE memory_event_id = ? AND status = 'active'",
+            (candidate.memory_event_id,),
+        ).fetchall()
+        previous_active_ids = [r['id'] for r in active_rows]
+        for prev_id in previous_active_ids:
+            mark_superseded(
+                conn, 'event_embeddings', prev_id,
+                f"superseded by promotion of embedding_id={embedding_id}",
+                now,
+            )
+
+        # Promote candidate to active (governance helper owns the status UPDATE).
+        mark_active(conn, 'event_embeddings', embedding_id)
+
+        # Persist promotion audit into provenance_json, preserving generation fields.
+        existing_prov = json.loads(candidate.provenance_json)
+        existing_prov['promotion'] = {
+            'governance_action': 'promote_embedding',
+            'operator': operator,
+            'reason': reason,
+            'promoted_at': now,
+            'promoted_embedding_id': embedding_id,
+            'memory_event_id': candidate.memory_event_id,
+            'previous_active_embedding_ids': previous_active_ids,
+        }
+        updated_prov_json = json.dumps(existing_prov, sort_keys=True, ensure_ascii=True)
+        conn.execute(
+            "UPDATE event_embeddings SET provenance_json = ? WHERE id = ?",
+            (updated_prov_json, embedding_id),
+        )
+
+        refreshed = conn.execute(
+            "SELECT * FROM event_embeddings WHERE id = ?", (embedding_id,)
+        ).fetchone()
+        return EmbeddingRow.from_row(refreshed)
 
 
 def invalidate_stale_embeddings(

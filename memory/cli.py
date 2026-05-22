@@ -156,6 +156,21 @@ def cmd_export(args: argparse.Namespace) -> None:
     print(f"Exported {n} event(s) to {args.out}")
 
 
+def cmd_promote_embedding(args: argparse.Namespace) -> None:
+    from .embeddings import promote_embedding
+    from .artifact_governance import GovernanceInvalidationError, GovernanceSchemaError
+    try:
+        row = promote_embedding(
+            db_path=args.db,
+            embedding_id=args.id,
+            reason=args.reason,
+            operator=args.operator,
+        )
+    except (GovernanceInvalidationError, GovernanceSchemaError, ValueError) as exc:
+        _die(str(exc))
+    print(json.dumps(row.to_dict(), indent=2, sort_keys=True))
+
+
 def cmd_review(args: argparse.Namespace) -> None:
     try:
         events = service.review_memory(
@@ -188,6 +203,7 @@ _COMMANDS = {
     'link': cmd_link,
     'export': cmd_export,
     'review': cmd_review,
+    'promote-embedding': cmd_promote_embedding,
 }
 
 
@@ -277,6 +293,13 @@ def build_parser() -> argparse.ArgumentParser:
                        help='Filter by status (default: proposed/unresolved/active)')
     p_rev.add_argument('--type', dest='type', choices=list(VALID_EVENT_TYPES),
                        help='Filter by event type')
+
+    # promote-embedding
+    p_promo = sub.add_parser('promote-embedding', parents=[_db],
+                              help='Promote a candidate embedding to active')
+    p_promo.add_argument('--id', required=True, type=int, help='Embedding id')
+    p_promo.add_argument('--reason', required=True, help='Reason for promotion')
+    p_promo.add_argument('--operator', required=True, help='Operator identifier')
 
     return parser
 

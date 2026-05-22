@@ -1,8 +1,8 @@
-"""Tests for Phase 2B embedding substrate.
+"""Tests for Phase 2B/2C embedding substrate.
 
 Covers: schema v4, migration, governance registration, EmbeddingRow,
 embed_event idempotency and invalidation, get_embeddings, get_active_embedding,
-and governance invariants (no memory_events mutation, no continuity bundle inclusion).
+promote_embedding lifecycle and audit persistence, and governance invariants.
 """
 import json
 import sqlite3
@@ -13,6 +13,7 @@ import memory.artifact_governance as gov
 from memory import service
 from memory.artifact_governance import (
     ArtifactStatus,
+    GovernanceInvalidationError,
     GovernanceSchemaError,
     VALID_ARTIFACT_STATUSES,
     compute_content_hash,
@@ -26,6 +27,7 @@ from memory.embeddings import (
     get_active_embedding,
     get_embeddings,
     invalidate_stale_embeddings,
+    promote_embedding,
 )
 from models.embedding_adapter import StubEmbeddingAdapter
 
@@ -743,3 +745,292 @@ class TestGovernanceInvariants:
         db = _db(tmp_path)
         export = service.export_memory(db)
         assert set(export.keys()) == {'schema_version', 'memory_events', 'memory_revisions', 'memory_links'}
+
+
+# ---------------------------------------------------------------------------
+# Phase 2C: promote_embedding
+# ---------------------------------------------------------------------------
+
+class TestPromoteEmbedding:
+    def test_promote_sets_status_active(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        row_id = embed_event(db, event, _stub())
+        promote_embedding(db, row_id, reason='validated', operator='quant')
+        rows = get_embeddings(db, event.id)
+        assert rows[0].status == 'active'
+
+    def test_promote_returns_active_embedding_row(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        row_id = embed_event(db, event, _stub())
+        result = promote_embedding(db, row_id, reason='validated', operator='quant')
+        assert isinstance(result, EmbeddingRow)
+        assert result.id == row_id
+        assert result.status == 'active'
+
+    def test_promote_supersedes_prior_active_row(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        adapter_v1 = _stub()
+
+        class V2Adapter(StubEmbeddingAdapter):
+            VERSION = '2.0.0'
+            @property
+            def producer_version(self) -> str:
+                return f"{self.VERSION}:{self.MODEL_VERSION}:stub-no-model-digest"
+
+        adapter_v2 = V2Adapter(dimensions=4)
+        id1 = embed_event(db, event, adapter_v1)
+        promote_embedding(db, id1, reason='first', operator='quant')
+        id2 = embed_event(db, event, adapter_v2)
+        promote_embedding(db, id2, reason='upgraded model', operator='quant')
+
+        rows = get_embeddings(db, event.id)
+        by_id = {r.id: r for r in rows}
+        assert by_id[id1].status == 'superseded'
+        assert by_id[id2].status == 'active'
+
+    def test_promote_at_most_one_active_invariant(self, tmp_path):
+        """Promoting a candidate supersedes ALL prior active rows, not just one."""
+        db = _db(tmp_path)
+        event = _add(db)
+
+        class V2Adapter(StubEmbeddingAdapter):
+            VERSION = '2.0.0'
+            @property
+            def producer_version(self) -> str:
+                return f"{self.VERSION}:{self.MODEL_VERSION}:stub-no-model-digest"
+
+        class V3Adapter(StubEmbeddingAdapter):
+            VERSION = '3.0.0'
+            @property
+            def producer_version(self) -> str:
+                return f"{self.VERSION}:{self.MODEL_VERSION}:stub-no-model-digest"
+
+        id1 = embed_event(db, event, _stub())
+        id2 = embed_event(db, event, V2Adapter(dimensions=4))
+        id3 = embed_event(db, event, V3Adapter(dimensions=4))
+
+        # Manually force two active rows (bypassing service layer) to test the invariant.
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE event_embeddings SET status='active' WHERE id IN (?,?)", (id1, id2))
+        conn.commit()
+        conn.close()
+
+        promote_embedding(db, id3, reason='new best', operator='quant')
+
+        rows = get_embeddings(db, event.id)
+        active = [r for r in rows if r.status == 'active']
+        superseded = [r for r in rows if r.status == 'superseded']
+        assert len(active) == 1
+        assert active[0].id == id3
+        assert len(superseded) == 2
+
+    def test_promote_does_not_affect_other_events_active_rows(self, tmp_path):
+        db = _db(tmp_path)
+        event_a = _add(db, title='Event A', summary='Summary A')
+        event_b = _add(db, title='Event B', summary='Summary B')
+        id_a = embed_event(db, event_a, _stub())
+        id_b = embed_event(db, event_b, _stub())
+        promote_embedding(db, id_a, reason='ok', operator='quant')
+        promote_embedding(db, id_b, reason='ok', operator='quant')
+
+        rows_a = get_embeddings(db, event_a.id)
+        rows_b = get_embeddings(db, event_b.id)
+        assert rows_a[0].status == 'active'
+        assert rows_b[0].status == 'active'
+
+    def test_promote_rejects_already_active_row(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        row_id = embed_event(db, event, _stub())
+        promote_embedding(db, row_id, reason='first', operator='quant')
+        with pytest.raises(GovernanceInvalidationError, match="Only 'candidate'"):
+            promote_embedding(db, row_id, reason='again', operator='quant')
+
+    def test_promote_rejects_superseded_row(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+
+        class V2Adapter(StubEmbeddingAdapter):
+            VERSION = '2.0.0'
+            @property
+            def producer_version(self) -> str:
+                return f"{self.VERSION}:{self.MODEL_VERSION}:stub-no-model-digest"
+
+        id1 = embed_event(db, event, _stub())
+        id2 = embed_event(db, event, V2Adapter(dimensions=4))
+        promote_embedding(db, id1, reason='first', operator='quant')
+        promote_embedding(db, id2, reason='upgrade', operator='quant')
+        with pytest.raises(GovernanceInvalidationError, match="Only 'candidate'"):
+            promote_embedding(db, id1, reason='retry', operator='quant')
+
+    def test_promote_rejects_invalidated_row(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        row_id = embed_event(db, event, _stub())
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE event_embeddings SET status='invalidated', "
+            "invalidated_at='2026-01-01T00:00:00Z', invalidated_reason='test' WHERE id=?",
+            (row_id,)
+        )
+        conn.commit()
+        conn.close()
+        with pytest.raises(GovernanceInvalidationError, match="Only 'candidate'"):
+            promote_embedding(db, row_id, reason='try', operator='quant')
+
+    def test_promote_raises_on_unknown_id(self, tmp_path):
+        db = _db(tmp_path)
+        with pytest.raises(GovernanceInvalidationError, match="not found"):
+            promote_embedding(db, 9999, reason='ok', operator='quant')
+
+    def test_promote_rejects_empty_reason(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        row_id = embed_event(db, event, _stub())
+        with pytest.raises(ValueError, match="reason"):
+            promote_embedding(db, row_id, reason='', operator='quant')
+
+    def test_promote_rejects_whitespace_reason(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        row_id = embed_event(db, event, _stub())
+        with pytest.raises(ValueError, match="reason"):
+            promote_embedding(db, row_id, reason='   ', operator='quant')
+
+    def test_promote_rejects_empty_operator(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        row_id = embed_event(db, event, _stub())
+        with pytest.raises(ValueError, match="operator"):
+            promote_embedding(db, row_id, reason='ok', operator='')
+
+    def test_promote_does_not_mutate_memory_events(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        before = service.get_memory_event(db, event.id)
+        row_id = embed_event(db, event, _stub())
+        promote_embedding(db, row_id, reason='validated', operator='quant')
+        after = service.get_memory_event(db, event.id)
+        assert before[0].status == after[0].status
+        assert before[0].version == after[0].version
+        assert before[0].updated_at == after[0].updated_at
+
+    def test_get_active_embedding_returns_promoted_row(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        row_id = embed_event(db, event, _stub())
+        promote_embedding(db, row_id, reason='validated', operator='quant')
+        result = get_active_embedding(db, event.id)
+        assert result is not None
+        assert result.id == row_id
+        assert result.status == 'active'
+
+    def test_get_active_embedding_returns_most_recent_after_supersede(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+
+        class V2Adapter(StubEmbeddingAdapter):
+            VERSION = '2.0.0'
+            @property
+            def producer_version(self) -> str:
+                return f"{self.VERSION}:{self.MODEL_VERSION}:stub-no-model-digest"
+
+        id1 = embed_event(db, event, _stub())
+        promote_embedding(db, id1, reason='first', operator='quant')
+        id2 = embed_event(db, event, V2Adapter(dimensions=4))
+        promote_embedding(db, id2, reason='upgrade', operator='quant')
+        result = get_active_embedding(db, event.id)
+        assert result is not None
+        assert result.id == id2
+
+    # Audit metadata tests
+    def test_audit_persists_operator(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        row_id = embed_event(db, event, _stub())
+        result = promote_embedding(db, row_id, reason='validated', operator='risk-engine')
+        prov = json.loads(result.provenance_json)
+        assert prov['promotion']['operator'] == 'risk-engine'
+
+    def test_audit_persists_reason(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        row_id = embed_event(db, event, _stub())
+        result = promote_embedding(db, row_id, reason='model validated by quant', operator='quant')
+        prov = json.loads(result.provenance_json)
+        assert prov['promotion']['reason'] == 'model validated by quant'
+
+    def test_audit_persists_promoted_at(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        row_id = embed_event(db, event, _stub())
+        result = promote_embedding(db, row_id, reason='ok', operator='quant')
+        prov = json.loads(result.provenance_json)
+        assert 'promoted_at' in prov['promotion']
+        assert 'T' in prov['promotion']['promoted_at']
+
+    def test_audit_persists_previous_active_ids_empty_when_no_prior(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        row_id = embed_event(db, event, _stub())
+        result = promote_embedding(db, row_id, reason='ok', operator='quant')
+        prov = json.loads(result.provenance_json)
+        assert prov['promotion']['previous_active_embedding_ids'] == []
+
+    def test_audit_persists_previous_active_ids_with_superseded(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+
+        class V2Adapter(StubEmbeddingAdapter):
+            VERSION = '2.0.0'
+            @property
+            def producer_version(self) -> str:
+                return f"{self.VERSION}:{self.MODEL_VERSION}:stub-no-model-digest"
+
+        id1 = embed_event(db, event, _stub())
+        promote_embedding(db, id1, reason='first', operator='quant')
+        id2 = embed_event(db, event, V2Adapter(dimensions=4))
+        result = promote_embedding(db, id2, reason='upgrade', operator='quant')
+        prov = json.loads(result.provenance_json)
+        assert id1 in prov['promotion']['previous_active_embedding_ids']
+
+    def test_audit_governance_action_field(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        row_id = embed_event(db, event, _stub())
+        result = promote_embedding(db, row_id, reason='ok', operator='quant')
+        prov = json.loads(result.provenance_json)
+        assert prov['promotion']['governance_action'] == 'promote_embedding'
+
+    def test_audit_preserves_generation_provenance_fields(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        adapter = _stub()
+        row_id = embed_event(db, event, adapter)
+        result = promote_embedding(db, row_id, reason='ok', operator='quant')
+        prov = json.loads(result.provenance_json)
+        # Generation provenance must still be present after promotion.
+        assert 'adapter_name' in prov
+        assert prov['adapter_name'] == 'stub_embedding'
+        assert 'provider_name' in prov
+        assert 'dimensions' in prov
+        assert 'promotion' in prov  # audit sub-key added alongside generation fields
+
+    def test_audit_promoted_embedding_id_field(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        row_id = embed_event(db, event, _stub())
+        result = promote_embedding(db, row_id, reason='ok', operator='quant')
+        prov = json.loads(result.provenance_json)
+        assert prov['promotion']['promoted_embedding_id'] == row_id
+
+    def test_audit_memory_event_id_field(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        row_id = embed_event(db, event, _stub())
+        result = promote_embedding(db, row_id, reason='ok', operator='quant')
+        prov = json.loads(result.provenance_json)
+        assert prov['promotion']['memory_event_id'] == event.id

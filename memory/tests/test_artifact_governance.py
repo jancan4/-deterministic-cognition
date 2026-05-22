@@ -13,6 +13,7 @@ from memory.artifact_governance import (
     GovernanceSchemaError,
     VALID_ARTIFACT_STATUSES,
     compute_content_hash,
+    mark_active,
     mark_invalidated,
     mark_superseded,
     validate_artifact_table_schema,
@@ -326,4 +327,59 @@ class TestMarkSuperseded:
         conn = _governed_conn(tmp_path)
         with pytest.raises(GovernanceInvalidationError, match="not found"):
             mark_superseded(conn, 'test_governed', 9999, 'reason', '2026-01-01T00:00:00Z')
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# mark_active
+# ---------------------------------------------------------------------------
+
+class TestMarkActive:
+    def test_rejects_unknown_table(self, tmp_path):
+        conn = _governed_conn(tmp_path)
+        with pytest.raises(GovernanceSchemaError, match="not in the governed artifact table allowlist"):
+            mark_active(conn, 'retrieval_log', 1)
+        conn.close()
+
+    def test_sets_status_to_active(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gov, '_GOVERNED_ARTIFACT_TABLES', frozenset({'test_governed'}))
+        conn = _governed_conn(tmp_path)
+        row_id = _insert_row(conn, 'candidate')
+        mark_active(conn, 'test_governed', row_id)
+        conn.commit()
+        row = conn.execute(
+            "SELECT status FROM test_governed WHERE id=?", (row_id,)
+        ).fetchone()
+        assert row[0] == 'active'
+        conn.close()
+
+    def test_rejects_already_active(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gov, '_GOVERNED_ARTIFACT_TABLES', frozenset({'test_governed'}))
+        conn = _governed_conn(tmp_path)
+        row_id = _insert_row(conn, 'active')
+        with pytest.raises(GovernanceInvalidationError, match="Only 'candidate'"):
+            mark_active(conn, 'test_governed', row_id)
+        conn.close()
+
+    def test_rejects_superseded(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gov, '_GOVERNED_ARTIFACT_TABLES', frozenset({'test_governed'}))
+        conn = _governed_conn(tmp_path)
+        row_id = _insert_row(conn, 'superseded')
+        with pytest.raises(GovernanceInvalidationError, match="Only 'candidate'"):
+            mark_active(conn, 'test_governed', row_id)
+        conn.close()
+
+    def test_rejects_invalidated(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gov, '_GOVERNED_ARTIFACT_TABLES', frozenset({'test_governed'}))
+        conn = _governed_conn(tmp_path)
+        row_id = _insert_row(conn, 'invalidated')
+        with pytest.raises(GovernanceInvalidationError, match="Only 'candidate'"):
+            mark_active(conn, 'test_governed', row_id)
+        conn.close()
+
+    def test_raises_on_missing_row(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gov, '_GOVERNED_ARTIFACT_TABLES', frozenset({'test_governed'}))
+        conn = _governed_conn(tmp_path)
+        with pytest.raises(GovernanceInvalidationError, match="not found"):
+            mark_active(conn, 'test_governed', 9999)
         conn.close()
