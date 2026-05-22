@@ -216,6 +216,64 @@ def cmd_pin_embedding_model(args: argparse.Namespace) -> None:
     print(json.dumps(pin.to_dict(), indent=2, sort_keys=True))
 
 
+def cmd_retrieve(args: argparse.Namespace) -> None:
+    from .retrieval import RetrievalQuery, retrieve
+
+    query_vector = None
+    query_vector_provenance = None
+
+    if args.query_vector_json:
+        raw = args.query_vector_json.strip()
+        if raw.startswith('@'):
+            try:
+                with open(raw[1:]) as fh:
+                    raw = fh.read()
+            except OSError as exc:
+                _die(str(exc))
+        try:
+            query_vector = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            _die(f"Invalid --query-vector-json: {exc}")
+        if not isinstance(query_vector, list):
+            _die("--query-vector-json must be a JSON array of floats")
+        if args.query_vector_provenance:
+            try:
+                query_vector_provenance = json.loads(args.query_vector_provenance)
+            except json.JSONDecodeError as exc:
+                _die(f"Invalid --query-vector-provenance: {exc}")
+
+    tags: List[str] = [t.strip() for t in args.tags.split(',')] if args.tags else []
+
+    q = RetrievalQuery(
+        tags=tags,
+        limit=args.limit,
+        expand_related=not args.no_expand,
+    )
+
+    results = retrieve(
+        args.db, q,
+        query_vector=query_vector,
+        query_vector_provenance=query_vector_provenance,
+        log_retrieval=args.log_retrieval,
+        actor=args.actor,
+    )
+
+    output = [
+        {
+            'event_id': s.event.id,
+            'title': s.event.title,
+            'event_type': s.event.event_type,
+            'confidence': s.event.confidence,
+            'semantic_rank': s.semantic_rank,
+            'recency_rank': s.recency_rank,
+            'tag_overlap': s.tag_overlap,
+            'is_expanded': s.is_expanded,
+        }
+        for s in results
+    ]
+    print(json.dumps(output, indent=2))
+
+
 def cmd_get_active_pin(args: argparse.Namespace) -> None:
     from .embedding_pins import get_active_pin
     pin = get_active_pin(args.db, pin_scope=args.pin_scope)
@@ -275,6 +333,7 @@ _COMMANDS = {
     'embed-event': cmd_embed_event,
     'pin-embedding-model': cmd_pin_embedding_model,
     'get-active-pin': cmd_get_active_pin,
+    'retrieve': cmd_retrieve,
 }
 
 
@@ -399,6 +458,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_gap = sub.add_parser('get-active-pin', parents=[_db],
                             help='Show the active embedding model pin for a scope')
     p_gap.add_argument('--pin-scope', dest='pin_scope', default='global')
+
+    # retrieve
+    p_ret = sub.add_parser('retrieve', parents=[_db],
+                            help='Retrieve ranked memory events with optional semantic reranking')
+    p_ret.add_argument('--tags', help='Comma-separated tags to filter/rank by (optional)')
+    p_ret.add_argument('--limit', type=int, default=20, help='Max results to return (default: 20)')
+    p_ret.add_argument('--no-expand', dest='no_expand', action='store_true',
+                       help='Disable related-event expansion (default: expand)')
+    p_ret.add_argument('--query-vector-json', dest='query_vector_json', default=None,
+                       metavar='JSON_OR_@FILE',
+                       help='Precomputed query vector as JSON array, or @filepath to read from file')
+    p_ret.add_argument('--query-vector-provenance', dest='query_vector_provenance', default=None,
+                       metavar='JSON',
+                       help='Provenance dict for the query vector as JSON object (optional)')
+    p_ret.add_argument('--log-retrieval', dest='log_retrieval', action='store_true',
+                       help='Persist retrieval to log for auditability')
+    p_ret.add_argument('--actor', default='system',
+                       help='Actor identifier for retrieval log (default: system)')
 
     return parser
 

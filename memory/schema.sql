@@ -59,17 +59,19 @@ CREATE INDEX IF NOT EXISTS idx_links_src     ON memory_links(source_id);
 CREATE INDEX IF NOT EXISTS idx_links_tgt     ON memory_links(target_id);
 
 CREATE TABLE IF NOT EXISTS retrieval_log (
-    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-    query_hash            TEXT    NOT NULL,
-    session_id            TEXT,
-    query_json            TEXT    NOT NULL,
-    scoring_version       TEXT    NOT NULL,
-    scoring_params_json   TEXT    NOT NULL,
-    result_event_ids_json TEXT    NOT NULL,
-    result_count          INTEGER NOT NULL,
-    executed_at           TEXT    NOT NULL,
-    actor                 TEXT    NOT NULL,
-    status                TEXT    NOT NULL DEFAULT 'active'
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    query_hash               TEXT    NOT NULL,
+    session_id               TEXT,
+    query_json               TEXT    NOT NULL,
+    scoring_version          TEXT    NOT NULL,
+    scoring_params_json      TEXT    NOT NULL,
+    result_event_ids_json    TEXT    NOT NULL,
+    result_count             INTEGER NOT NULL,
+    executed_at              TEXT    NOT NULL,
+    actor                    TEXT    NOT NULL,
+    status                   TEXT    NOT NULL DEFAULT 'active',
+    semantic_mode            TEXT    NOT NULL DEFAULT 'none',
+    semantic_provenance_json TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_retrieval_log_query_hash      ON retrieval_log(query_hash);

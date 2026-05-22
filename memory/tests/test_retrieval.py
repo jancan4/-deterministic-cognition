@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 import pytest
 from memory import service
@@ -9,6 +10,8 @@ from memory.retrieval import (
     RetrievalQuery,
     ScoredEvent,
     _canonical_query_dict,
+    _cosine_similarity,
+    _compute_semantic_ranks,
     _query_hash,
     get_retrieval_log,
     list_retrieval_log,
@@ -444,7 +447,7 @@ class TestDeterminism:
         results = retrieve(db, RetrievalQuery(expand_related=False))
         key = results[0].composite_key
         assert isinstance(key, tuple)
-        assert len(key) == 6
+        assert len(key) == 7
 
 
 # ---------------------------------------------------------------------------
@@ -704,14 +707,14 @@ class TestGovernanceOnRetrieval:
 
 
 class TestMemorySchemaVersion:
-    def test_init_db_sets_schema_version_5(self, tmp_path):
+    def test_init_db_sets_schema_version_6(self, tmp_path):
         db = str(tmp_path / 'mem.db')
         service.init_db(db)
         import sqlite3
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 5
+        assert row[0] == 6
 
     def test_init_db_idempotent(self, tmp_path):
         db = str(tmp_path / 'mem.db')
@@ -721,7 +724,7 @@ class TestMemorySchemaVersion:
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 5
+        assert row[0] == 6
 
     def test_migrate_from_v2_adds_status_column(self, tmp_path):
         """Simulate a v2 DB without status column and verify migration adds it."""
@@ -773,7 +776,7 @@ class TestMemorySchemaVersion:
         version_row = conn2.execute('SELECT version FROM memory_schema_version').fetchone()
         conn2.close()
         assert 'status' in cols
-        assert version_row[0] == 5
+        assert version_row[0] == 6
 
     def test_migrate_from_v2_backfills_existing_rows(self, tmp_path):
         """Rows inserted before migration must have status='active' after migration."""
@@ -875,4 +878,565 @@ class TestMemorySchemaVersion:
         conn2 = sqlite3.connect(db)
         row = conn2.execute('SELECT version FROM memory_schema_version').fetchone()
         conn2.close()
-        assert row[0] == 5
+        assert row[0] == 6
+
+
+# ---------------------------------------------------------------------------
+# Phase 3A: Schema v6 migration
+# ---------------------------------------------------------------------------
+
+_V5_DDL = """
+    CREATE TABLE memory_schema_version (version INTEGER NOT NULL);
+    INSERT INTO memory_schema_version VALUES (5);
+    CREATE TABLE memory_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_type TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL,
+        evidence TEXT, source TEXT NOT NULL, confidence INTEGER NOT NULL,
+        status TEXT NOT NULL, tags_json TEXT NOT NULL DEFAULT '[]',
+        related_ids_json TEXT NOT NULL DEFAULT '[]',
+        created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE TABLE memory_revisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, memory_id INTEGER NOT NULL,
+        old_value_json TEXT NOT NULL, new_value_json TEXT NOT NULL,
+        reason TEXT NOT NULL, created_at TEXT NOT NULL, created_by TEXT NOT NULL
+    );
+    CREATE TABLE memory_links (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER NOT NULL,
+        target_id INTEGER NOT NULL, relationship TEXT NOT NULL, created_at TEXT NOT NULL,
+        UNIQUE (source_id, target_id, relationship)
+    );
+    CREATE TABLE retrieval_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        query_hash TEXT NOT NULL, session_id TEXT, query_json TEXT NOT NULL,
+        scoring_version TEXT NOT NULL, scoring_params_json TEXT NOT NULL,
+        result_event_ids_json TEXT NOT NULL, result_count INTEGER NOT NULL,
+        executed_at TEXT NOT NULL, actor TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active'
+    );
+    CREATE INDEX IF NOT EXISTS idx_retrieval_log_status ON retrieval_log(status);
+    CREATE TABLE event_embeddings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_event_id INTEGER NOT NULL, content_hash TEXT NOT NULL,
+        vector_json TEXT NOT NULL, dimensions INTEGER NOT NULL,
+        model_name TEXT NOT NULL, model_version TEXT NOT NULL,
+        model_digest TEXT, provider_name TEXT NOT NULL,
+        adapter_name TEXT NOT NULL, adapter_version TEXT NOT NULL,
+        producer_version TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'candidate',
+        generated_at TEXT NOT NULL, invalidated_at TEXT, invalidated_reason TEXT,
+        provenance_json TEXT NOT NULL
+    );
+    CREATE TABLE embedding_model_pins (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pin_scope TEXT NOT NULL DEFAULT 'global',
+        adapter_name TEXT NOT NULL, adapter_version TEXT NOT NULL,
+        model_name TEXT NOT NULL, model_digest TEXT, dimensions INTEGER NOT NULL,
+        embedding_visible_fields_version TEXT NOT NULL DEFAULT '1',
+        pin_identity TEXT NOT NULL, provider_name TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active', pinned_at TEXT NOT NULL,
+        pinned_by TEXT NOT NULL, superseded_at TEXT, superseded_reason TEXT,
+        notes TEXT
+    );
+"""
+
+
+class TestSchemaV6Migration:
+    def _v5_db(self, tmp_path) -> str:
+        db = str(tmp_path / 'mem_v5.db')
+        conn = sqlite3.connect(db)
+        conn.executescript(_V5_DDL)
+        conn.close()
+        return db
+
+    def test_schema_version_is_6(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        conn = sqlite3.connect(db)
+        row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
+        conn.close()
+        assert row[0] == 6
+
+    def test_retrieval_log_has_semantic_mode(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        conn = sqlite3.connect(db)
+        cols = {row[1] for row in conn.execute('PRAGMA table_info(retrieval_log)')}
+        conn.close()
+        assert 'semantic_mode' in cols
+
+    def test_retrieval_log_has_semantic_provenance_json(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        conn = sqlite3.connect(db)
+        cols = {row[1] for row in conn.execute('PRAGMA table_info(retrieval_log)')}
+        conn.close()
+        assert 'semantic_provenance_json' in cols
+
+    def test_v5_db_migrates_to_v6(self, tmp_path):
+        db = self._v5_db(tmp_path)
+        service.init_db(db)
+        conn = sqlite3.connect(db)
+        version = conn.execute('SELECT version FROM memory_schema_version').fetchone()[0]
+        cols = {row[1] for row in conn.execute('PRAGMA table_info(retrieval_log)')}
+        conn.close()
+        assert version == 6
+        assert 'semantic_mode' in cols
+        assert 'semantic_provenance_json' in cols
+
+    def test_v6_migration_is_idempotent(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        service.init_db(db)
+        conn = sqlite3.connect(db)
+        row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
+        conn.close()
+        assert row[0] == 6
+
+    def test_v5_existing_rows_preserved_after_migration(self, tmp_path):
+        db = self._v5_db(tmp_path)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO retrieval_log "
+            "(query_hash, query_json, scoring_version, scoring_params_json, "
+            " result_event_ids_json, result_count, executed_at, actor, status) "
+            "VALUES ('abc', '{}', '1.0.0', '{}', '[]', 0, '2026-01-01T00:00:00Z', 'tester', 'active')"
+        )
+        conn.commit()
+        conn.close()
+        service.init_db(db)
+        conn = sqlite3.connect(db)
+        count = conn.execute('SELECT COUNT(*) FROM retrieval_log').fetchone()[0]
+        mode = conn.execute('SELECT semantic_mode FROM retrieval_log WHERE id=1').fetchone()[0]
+        conn.close()
+        assert count == 1
+        assert mode == 'none'
+
+    def test_semantic_mode_default_none_without_vector(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        log_id = log_retrieval_query(db, RetrievalQuery(), [], actor='test')
+        entry = get_retrieval_log(db, log_id)
+        assert entry.semantic_mode == 'none'
+        assert entry.semantic_provenance_json is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 3A: cosine similarity
+# ---------------------------------------------------------------------------
+
+class TestCosineSimilarity:
+    def test_identical_unit_vectors(self):
+        assert abs(_cosine_similarity([1.0, 0.0], [1.0, 0.0]) - 1.0) < 1e-9
+
+    def test_orthogonal_vectors(self):
+        assert abs(_cosine_similarity([1.0, 0.0], [0.0, 1.0])) < 1e-9
+
+    def test_zero_vector_returns_zero(self):
+        assert _cosine_similarity([0.0, 0.0], [1.0, 2.0]) == 0.0
+
+    def test_both_zero_vectors_returns_zero(self):
+        assert _cosine_similarity([0.0, 0.0], [0.0, 0.0]) == 0.0
+
+    def test_opposite_direction(self):
+        assert abs(_cosine_similarity([1.0, 0.0], [-1.0, 0.0]) + 1.0) < 1e-9
+
+    def test_symmetric(self):
+        v1 = [0.3, 0.4, 0.5]
+        v2 = [0.1, 0.2, 0.9]
+        assert abs(_cosine_similarity(v1, v2) - _cosine_similarity(v2, v1)) < 1e-12
+
+    def test_non_unit_vectors_same_as_normalized(self):
+        v1 = [2.0, 0.0]
+        v2 = [3.0, 0.0]
+        assert abs(_cosine_similarity(v1, v2) - 1.0) < 1e-9
+
+    def test_quantization_to_4_decimal_places(self, tmp_path):
+        # _compute_semantic_ranks quantizes with round(sim, 4); verify round trips
+        sim = _cosine_similarity([0.3, 0.4], [0.4, 0.3])
+        quantized = round(sim, 4)
+        assert len(str(quantized).split('.')[-1]) <= 4
+
+
+# ---------------------------------------------------------------------------
+# Phase 3A: _compute_semantic_ranks unit tests
+# ---------------------------------------------------------------------------
+
+def _insert_active_embedding(db: str, event_id: int, vector: list, content_hash: str) -> None:
+    """Direct SQL insert of an active embedding row with a known vector for testing."""
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO event_embeddings "
+        "(memory_event_id, content_hash, vector_json, dimensions, model_name, model_version, "
+        " provider_name, adapter_name, adapter_version, producer_version, status, "
+        " generated_at, provenance_json) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (event_id, content_hash, json.dumps(vector), len(vector),
+         'stub-model', '1.0.0', 'stub', 'stub_embedding', '1.0.0',
+         '1.0.0:1.0.0:stub-no-model-digest', 'active',
+         '2026-01-01T00:00:00Z', '{}'),
+    )
+    conn.commit()
+    conn.close()
+
+
+class TestComputeSemanticRanks:
+    def test_empty_events_returns_empty(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        ranks, scores, unembedded, stale, count = _compute_semantic_ranks([], [1.0, 0.0], db)
+        assert ranks == {}
+        assert scores == {}
+        assert unembedded == []
+        assert stale == []
+        assert count == 0
+
+    def test_event_with_no_active_embedding_is_unembedded(self, tmp_path):
+        from memory.artifact_governance import compute_content_hash
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        ev = _add(db)
+        events = [service.get_memory_event(db, ev.id)[0]]
+        ranks, scores, unembedded, stale, count = _compute_semantic_ranks(
+            events, [1.0, 0.0, 0.0, 0.0], db
+        )
+        assert ev.id in unembedded
+        assert ev.id not in scores
+        assert count == 0
+
+    def test_eligible_event_gets_rank_zero(self, tmp_path):
+        from memory.artifact_governance import compute_content_hash
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        ev = _add(db)
+        event = service.get_memory_event(db, ev.id)[0]
+        h = compute_content_hash(event.title, event.summary)
+        _insert_active_embedding(db, ev.id, [1.0, 0.0, 0.0, 0.0], h)
+        ranks, scores, unembedded, stale, count = _compute_semantic_ranks(
+            [event], [1.0, 0.0, 0.0, 0.0], db
+        )
+        assert ranks[ev.id] == 0
+        assert ev.id in scores
+        assert count == 1
+
+    def test_stale_embedding_goes_to_stale_list(self, tmp_path):
+        from memory.artifact_governance import compute_content_hash
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        ev = _add(db)
+        event = service.get_memory_event(db, ev.id)[0]
+        _insert_active_embedding(db, ev.id, [1.0, 0.0, 0.0, 0.0], 'wrong_hash')
+        ranks, scores, unembedded, stale, count = _compute_semantic_ranks(
+            [event], [1.0, 0.0, 0.0, 0.0], db
+        )
+        assert len(stale) == 1
+        assert ev.id in unembedded
+        assert count == 1
+
+    def test_dimension_mismatch_excluded(self, tmp_path):
+        from memory.artifact_governance import compute_content_hash
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        ev = _add(db)
+        event = service.get_memory_event(db, ev.id)[0]
+        h = compute_content_hash(event.title, event.summary)
+        _insert_active_embedding(db, ev.id, [1.0, 0.0, 0.0, 0.0], h)
+        # Query vector with different dimensions
+        ranks, scores, unembedded, stale, count = _compute_semantic_ranks(
+            [event], [1.0, 0.0], db  # 2 dims vs 4 dims stored
+        )
+        assert ev.id in unembedded
+        assert ev.id not in scores
+
+    def test_rank_ordering_by_descending_similarity(self, tmp_path):
+        from memory.artifact_governance import compute_content_hash
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        ev1 = _add(db, title='Alpha', summary='first event')
+        ev2 = _add(db, title='Beta', summary='second event')
+        e1 = service.get_memory_event(db, ev1.id)[0]
+        e2 = service.get_memory_event(db, ev2.id)[0]
+        query_vector = [1.0, 0.0, 0.0, 0.0]
+        # ev1 aligned with query (sim ≈ 1.0)
+        _insert_active_embedding(db, ev1.id, [1.0, 0.0, 0.0, 0.0], compute_content_hash(e1.title, e1.summary))
+        # ev2 orthogonal to query (sim ≈ 0.0)
+        _insert_active_embedding(db, ev2.id, [0.0, 1.0, 0.0, 0.0], compute_content_hash(e2.title, e2.summary))
+        ranks, scores, unembedded, stale, count = _compute_semantic_ranks(
+            [e1, e2], query_vector, db
+        )
+        assert ranks[ev1.id] < ranks[ev2.id]
+        assert unembedded == []
+
+    def test_unembedded_events_get_rank_c(self, tmp_path):
+        from memory.artifact_governance import compute_content_hash
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        ev1 = _add(db, title='Embedded', summary='Has embedding')
+        ev2 = _add(db, title='NoEmbed', summary='No embedding')
+        e1 = service.get_memory_event(db, ev1.id)[0]
+        e2 = service.get_memory_event(db, ev2.id)[0]
+        query_vector = [1.0, 0.0, 0.0, 0.0]
+        _insert_active_embedding(db, ev1.id, query_vector, compute_content_hash(e1.title, e1.summary))
+        ranks, scores, unembedded, stale, count = _compute_semantic_ranks(
+            [e1, e2], query_vector, db
+        )
+        C = len(scores)
+        assert ranks[ev1.id] < C
+        assert ranks[ev2.id] == C
+
+
+# ---------------------------------------------------------------------------
+# Phase 3A: semantic retrieve() integration
+# ---------------------------------------------------------------------------
+
+class TestSemanticRetrieval:
+    def test_no_query_vector_all_semantic_rank_zero(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        _add(db)
+        _add(db)
+        results = retrieve(db, RetrievalQuery(expand_related=False))
+        assert all(s.semantic_rank == 0 for s in results)
+
+    def test_composite_key_length_is_7(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        _add(db)
+        results = retrieve(db, RetrievalQuery(expand_related=False))
+        assert len(results[0].composite_key) == 7
+
+    def test_with_query_vector_assigns_rank_zero_to_embedded(self, tmp_path):
+        from memory.artifact_governance import compute_content_hash
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        ev = _add(db)
+        event = service.get_memory_event(db, ev.id)[0]
+        h = compute_content_hash(event.title, event.summary)
+        query_vector = [1.0, 0.0, 0.0, 0.0]
+        _insert_active_embedding(db, ev.id, query_vector, h)
+        results = retrieve(db, RetrievalQuery(expand_related=False), query_vector=query_vector)
+        assert results[0].semantic_rank == 0
+
+    def test_events_without_embeddings_get_rank_c(self, tmp_path):
+        from memory.artifact_governance import compute_content_hash
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        ev1 = _add(db, title='Embedded', summary='Has embedding here')
+        ev2 = _add(db, title='NoEmbed', summary='No embedding present')
+        e1 = service.get_memory_event(db, ev1.id)[0]
+        query_vector = [1.0, 0.0, 0.0, 0.0]
+        _insert_active_embedding(db, ev1.id, query_vector, compute_content_hash(e1.title, e1.summary))
+        results = retrieve(db, RetrievalQuery(expand_related=False), query_vector=query_vector)
+        by_id = {s.event.id: s for s in results}
+        # C=1: embedded event gets rank 0, unembedded gets rank 1
+        assert by_id[ev1.id].semantic_rank == 0
+        assert by_id[ev2.id].semantic_rank == 1
+
+    def test_graceful_degradation_no_active_embeddings(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        _add(db)
+        _add(db)
+        results = retrieve(db, RetrievalQuery(expand_related=False),
+                           query_vector=[1.0, 0.0, 0.0, 0.0])
+        # No active embeddings → C=0 → all events get rank C=0
+        assert all(s.semantic_rank == 0 for s in results)
+
+    def test_most_similar_event_gets_rank_zero(self, tmp_path):
+        from memory.artifact_governance import compute_content_hash
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        ev1 = _add(db, title='Alpha', summary='first event here')
+        ev2 = _add(db, title='Beta', summary='second event here')
+        e1 = service.get_memory_event(db, ev1.id)[0]
+        e2 = service.get_memory_event(db, ev2.id)[0]
+        query_vector = [1.0, 0.0, 0.0, 0.0]
+        # ev1 aligned with query
+        _insert_active_embedding(db, ev1.id, [1.0, 0.0, 0.0, 0.0], compute_content_hash(e1.title, e1.summary))
+        # ev2 orthogonal to query
+        _insert_active_embedding(db, ev2.id, [0.0, 1.0, 0.0, 0.0], compute_content_hash(e2.title, e2.summary))
+        results = retrieve(db, RetrievalQuery(expand_related=False), query_vector=query_vector)
+        by_id = {s.event.id: s for s in results}
+        assert by_id[ev1.id].semantic_rank < by_id[ev2.id].semantic_rank
+
+    def test_existing_ordering_preserved_without_query_vector(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        _add(db, event_type='hypothesis', confidence=5)
+        _add(db, event_type='governance_rule', confidence=1, status='accepted')
+        results = retrieve(db, RetrievalQuery())
+        assert results[0].event.event_type == 'governance_rule'
+
+
+# ---------------------------------------------------------------------------
+# Phase 3A: semantic provenance logging
+# ---------------------------------------------------------------------------
+
+class TestSemanticProvenance:
+    def test_no_query_vector_semantic_mode_is_none(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        log_id = log_retrieval_query(db, RetrievalQuery(), [], actor='test')
+        entry = get_retrieval_log(db, log_id)
+        assert entry.semantic_mode == 'none'
+
+    def test_with_query_vector_semantic_mode_is_vector(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        log_id = log_retrieval_query(
+            db, RetrievalQuery(), [], actor='test',
+            query_vector=[1.0, 0.0, 0.0, 0.0],
+        )
+        entry = get_retrieval_log(db, log_id)
+        assert entry.semantic_mode == 'vector'
+
+    def test_no_query_vector_provenance_json_is_none(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        log_id = log_retrieval_query(db, RetrievalQuery(), [], actor='test')
+        entry = get_retrieval_log(db, log_id)
+        assert entry.semantic_provenance_json is None
+
+    def test_with_query_vector_provenance_has_required_keys(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        meta = {
+            'semantic_ranks': {1: 0},
+            'semantic_scores': {1: 0.9999},
+            'unembedded_event_ids': [],
+            'stale_embedding_ids': [],
+            'embedding_count_consulted': 1,
+        }
+        log_id = log_retrieval_query(
+            db, RetrievalQuery(), [], actor='test',
+            query_vector=[1.0, 0.0, 0.0, 0.0],
+            semantic_meta=meta,
+        )
+        entry = get_retrieval_log(db, log_id)
+        prov = json.loads(entry.semantic_provenance_json)
+        required = {
+            'query_vector_hash', 'query_vector_provenance', 'query_vector_dimensions',
+            'pin_identity', 'pin_scope', 'embedding_count_consulted',
+            'semantic_scores', 'semantic_ranks', 'unembedded_event_ids', 'stale_embedding_ids',
+        }
+        assert required <= set(prov.keys())
+
+    def test_query_vector_hash_is_16_chars(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        log_id = log_retrieval_query(
+            db, RetrievalQuery(), [], actor='test',
+            query_vector=[1.0, 0.0],
+        )
+        entry = get_retrieval_log(db, log_id)
+        prov = json.loads(entry.semantic_provenance_json)
+        assert len(prov['query_vector_hash']) == 16
+
+    def test_query_vector_dimensions_recorded(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        log_id = log_retrieval_query(
+            db, RetrievalQuery(), [], actor='test',
+            query_vector=[1.0, 0.0, 0.0],
+        )
+        entry = get_retrieval_log(db, log_id)
+        prov = json.loads(entry.semantic_provenance_json)
+        assert prov['query_vector_dimensions'] == 3
+
+    def test_semantic_fields_in_to_dict(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        log_id = log_retrieval_query(db, RetrievalQuery(), [], actor='test')
+        entry = get_retrieval_log(db, log_id)
+        d = entry.to_dict()
+        assert 'semantic_mode' in d
+        assert 'semantic_provenance_json' in d
+        assert d['semantic_mode'] == 'none'
+        assert d['semantic_provenance_json'] is None
+
+    def test_retrieve_with_vector_logs_semantic_mode(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        _add(db)
+        retrieve(db, RetrievalQuery(expand_related=False),
+                 query_vector=[1.0, 0.0, 0.0, 0.0],
+                 log_retrieval=True, actor='agent')
+        entries = list_retrieval_log(db)
+        assert len(entries) == 1
+        assert entries[0].semantic_mode == 'vector'
+        assert entries[0].semantic_provenance_json is not None
+
+    def test_query_vector_provenance_stored(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        prov_in = {'adapter_name': 'ollama-embedding', 'model_name': 'nomic-embed-text'}
+        log_id = log_retrieval_query(
+            db, RetrievalQuery(), [], actor='test',
+            query_vector=[1.0, 0.0],
+            query_vector_provenance=prov_in,
+        )
+        entry = get_retrieval_log(db, log_id)
+        prov = json.loads(entry.semantic_provenance_json)
+        assert prov['query_vector_provenance'] == prov_in
+
+    def test_pin_identity_is_none_at_retrieval(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        log_id = log_retrieval_query(
+            db, RetrievalQuery(), [], actor='test',
+            query_vector=[1.0, 0.0],
+        )
+        entry = get_retrieval_log(db, log_id)
+        prov = json.loads(entry.semantic_provenance_json)
+        assert prov['pin_identity'] is None
+        assert prov['pin_scope'] is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 3A: CLI retrieve command
+# ---------------------------------------------------------------------------
+
+class TestCliRetrieve:
+    def test_retrieve_empty_db(self, tmp_path, capsys):
+        from memory.cli import main
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        main(['retrieve', '--db', db])
+        output = json.loads(capsys.readouterr().out)
+        assert output == []
+
+    def test_retrieve_returns_events(self, tmp_path, capsys):
+        from memory.cli import main
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        _add(db)
+        main(['retrieve', '--db', db])
+        output = json.loads(capsys.readouterr().out)
+        assert len(output) == 1
+        assert 'event_id' in output[0]
+        assert 'semantic_rank' in output[0]
+
+    def test_retrieve_with_query_vector(self, tmp_path, capsys):
+        from memory.artifact_governance import compute_content_hash
+        from memory.cli import main
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        ev = _add(db)
+        event = service.get_memory_event(db, ev.id)[0]
+        h = compute_content_hash(event.title, event.summary)
+        _insert_active_embedding(db, ev.id, [1.0, 0.0, 0.0, 0.0], h)
+        vec_json = json.dumps([1.0, 0.0, 0.0, 0.0])
+        main(['retrieve', '--db', db, '--query-vector-json', vec_json])
+        output = json.loads(capsys.readouterr().out)
+        assert len(output) == 1
+        assert output[0]['semantic_rank'] == 0
+
+    def test_retrieve_logs_when_flag_set(self, tmp_path, capsys):
+        from memory.cli import main
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        _add(db)
+        main(['retrieve', '--db', db, '--log-retrieval'])
+        capsys.readouterr()
+        entries = list_retrieval_log(db)
+        assert len(entries) == 1
