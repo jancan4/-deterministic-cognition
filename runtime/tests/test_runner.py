@@ -175,11 +175,14 @@ def test_run_executes_ready_tasks(tmp_path):
 
 def test_run_tasks_are_completed_after_execution(tmp_path):
     from orchestration.service import list_tasks
+    from runtime.handlers import TaskHandlerRegistry
     rt_db = _rt_db(tmp_path)
     orch_db = _orch_db(tmp_path)
     _add_ready_task(orch_db, n=1)
     rt = _runtime(rt_db, orch_db)
-    run_iterations(rt_db, rt.id, orch_db, _cfg(max_iterations=1))
+    registry = TaskHandlerRegistry()
+    registry.register('research', lambda task: None)
+    run_iterations(rt_db, rt.id, orch_db, _cfg(max_iterations=1), registry=registry)
     completed = list_tasks(orch_db, state='completed')
     assert len(completed) == 1
 
@@ -502,9 +505,12 @@ def test_poll_ready_tasks_returns_ready_only(tmp_path):
 
 
 def test_execute_task_transitions_to_completed(tmp_path):
+    from runtime.handlers import TaskHandlerRegistry
     from runtime.service import execute_task
     orch_db = _orch_db(tmp_path)
     t = create_task(orch_db, 'task', 'research', 'a')
     transition_task(orch_db, t.id, 'ready', reason='r', actor='a')
-    result = execute_task(orch_db, t.id, 'runner')
+    registry = TaskHandlerRegistry()
+    registry.register('research', lambda task: None)
+    result = execute_task(orch_db, t.id, 'runner', registry=registry)
     assert result.state == 'completed'

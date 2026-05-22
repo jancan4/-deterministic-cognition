@@ -19,6 +19,7 @@ import time
 from typing import Callable, Optional
 
 from .checkpoints import create_checkpoint
+from .handlers import TaskHandlerRegistry
 from .models import Runtime, RunResult, RuntimeConfig
 from .service import execute_task, poll_ready_tasks
 from .state_store import (
@@ -35,6 +36,7 @@ def run_iterations(
     orchestration_db: str,
     config: RuntimeConfig,
     should_stop: Optional[Callable[[], bool]] = None,
+    registry: Optional[TaskHandlerRegistry] = None,
 ) -> RunResult:
     """
     Run up to config.max_iterations iterations of the poll → execute → checkpoint cycle.
@@ -44,6 +46,10 @@ def run_iterations(
     Raises ValueError if both max_iterations and should_stop are absent and
     config.allow_unbounded is False — the default. Set config.allow_unbounded=True
     only for server-mode operation where an external signal drives termination.
+
+    registry is the handler dispatch table. When None (the default), any task
+    that is polled will transition to failed with reason 'missing_handler:{type}'.
+    Pass an explicit TaskHandlerRegistry to enable real dispatch.
 
     Raises NotFoundError if runtime_id does not exist.
     """
@@ -131,7 +137,7 @@ def run_iterations(
                 iteration=iteration,
             )
             for task in ready_tasks:
-                execute_task(orchestration_db, task.id, config.actor)
+                execute_task(orchestration_db, task.id, config.actor, registry=registry)
                 tasks_executed += 1
 
             # Checkpoint phase (every N iterations).
@@ -240,6 +246,7 @@ def resume_runtime(
     orchestration_db: str,
     config: RuntimeConfig,
     should_stop: Optional[Callable[[], bool]] = None,
+    registry: Optional[TaskHandlerRegistry] = None,
 ) -> RunResult:
     """Resume a paused runtime. Delegates to run_iterations which handles paused → idle."""
-    return run_iterations(state_db, runtime_id, orchestration_db, config, should_stop)
+    return run_iterations(state_db, runtime_id, orchestration_db, config, should_stop, registry)

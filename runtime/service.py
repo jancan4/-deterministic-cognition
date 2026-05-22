@@ -6,7 +6,7 @@ writes to the orchestration database go through these functions so the runner
 has a single, testable seam.
 """
 import sqlite3
-from typing import List
+from typing import List, Optional
 
 from orchestration.models import Task
 from orchestration.service import (
@@ -16,24 +16,56 @@ from orchestration.service import (
     transition_task,
 )
 
+from .handlers import TaskHandlerRegistry, execute_handler
+
 
 def poll_ready_tasks(orchestration_db: str) -> List[Task]:
     """Return all tasks in the 'ready' state, ordered by priority then id."""
     return list_tasks(orchestration_db, state='ready')
 
 
-def execute_task(orchestration_db: str, task_id: int, actor: str) -> Task:
+def execute_task(
+    orchestration_db: str,
+    task_id: int,
+    actor: str,
+    registry: Optional[TaskHandlerRegistry] = None,
+) -> Task:
     """
-    Advance a task from ready → running → completed.
+    Transition a task from ready → running, then dispatch to a registered handler.
 
-    In a production runtime each task type would dispatch to a real handler.
-    Here the transition pair is the stub: it records execution lineage without
-    doing any domain-specific work.
+    On handler success:
+        running → completed (reason: 'Handler succeeded: {task_type}')
+    On handler failure or exception:
+        running → failed   (reason: 'Handler failed: {error}')
+    If no handler is registered (registry is None or task_type unregistered):
+        running → failed   (reason: 'missing_handler:{task_type}')
+
+    No handler exception propagates to the caller. All outcomes produce a
+    deterministic task lineage record and a returned Task in its final state.
     """
-    transition_task(orchestration_db, task_id, 'running',
-                    reason='Runtime: task execution started', actor=actor)
-    return transition_task(orchestration_db, task_id, 'completed',
-                           reason='Runtime: task execution completed', actor=actor)
+    running_task = transition_task(
+        orchestration_db, task_id, 'running',
+        reason='Runtime: task execution started', actor=actor,
+    )
+
+    if registry is None or not registry.has(running_task.task_type):
+        return transition_task(
+            orchestration_db, task_id, 'failed',
+            reason=f'missing_handler:{running_task.task_type}', actor=actor,
+        )
+
+    result = execute_handler(registry, running_task)
+
+    if result.success:
+        return transition_task(
+            orchestration_db, task_id, 'completed',
+            reason=f'Handler succeeded: {running_task.task_type}', actor=actor,
+        )
+    else:
+        return transition_task(
+            orchestration_db, task_id, 'failed',
+            reason=f'Handler failed: {result.error}', actor=actor,
+        )
 
 
 def count_task_retries(orchestration_db: str, task_id: int) -> int:
