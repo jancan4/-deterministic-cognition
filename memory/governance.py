@@ -569,9 +569,82 @@ def detect_adaptation_lineage_gap(db_path: str) -> List[GovernanceIssue]:
     return issues
 
 
+def detect_unreviewed_confidence_candidates(
+    db_path: str,
+    warning_days: int = 7,
+    critical_days: int = 30,
+) -> List[GovernanceIssue]:
+    """Candidate confidence revisions in 'proposed' status older than warning_days."""
+    warning_cutoff = _cutoff(warning_days)
+    critical_cutoff = _cutoff(critical_days)
+    issues: List[GovernanceIssue] = []
+
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT cr.id AS revision_id, cr.memory_event_id, cr.confidence_before,
+                   cr.confidence_after, cr.revised_by, cr.reason,
+                   cr.contradiction_link_ids_json, cr.created_at,
+                   me.title
+            FROM confidence_revisions cr
+            JOIN memory_events me ON me.id = cr.memory_event_id
+            WHERE cr.revision_type = 'candidate'
+              AND cr.status = 'proposed'
+              AND cr.created_at < ?
+            ORDER BY cr.memory_event_id ASC, cr.id ASC
+            """,
+            (warning_cutoff,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        if row['created_at'] < critical_cutoff:
+            severity = 'critical'
+            days_label = f'more than {critical_days} days'
+        else:
+            severity = 'warning'
+            days_label = f'more than {warning_days} days'
+
+        metadata: Dict = {
+            'revision_id': row['revision_id'],
+            'memory_event_id': row['memory_event_id'],
+            'confidence_before': row['confidence_before'],
+            'confidence_after': row['confidence_after'],
+            'revised_by': row['revised_by'],
+            'reason': row['reason'],
+            'contradiction_link_ids_json': row['contradiction_link_ids_json'],
+        }
+
+        issues.append(GovernanceIssue(
+            issue_type='unreviewed_confidence_candidate',
+            severity=severity,
+            memory_id=row['memory_event_id'],
+            title=row['title'],
+            rationale=(
+                f"Candidate confidence revision (id={row['revision_id']}) for event "
+                f"[{row['memory_event_id']}] '{row['title']}' "
+                f"({row['confidence_before']} → {row['confidence_after']}) "
+                f"has been unreviewed for {days_label}. "
+                f"Created: {row['created_at']}."
+            ),
+            recommended_action=(
+                'Review the candidate revision and either promote it by creating an operator '
+                'revision, or reject it via reject_candidate_revision().'
+            ),
+            metadata=metadata,
+        ))
+    return issues
+
+
 # ---------------------------------------------------------------------------
 # Governance report
 # ---------------------------------------------------------------------------
+
+CANDIDATE_WARNING_DAYS = 7
+CANDIDATE_CRITICAL_DAYS = 30
+
 
 def build_governance_report(
     db_path: str,
@@ -581,6 +654,8 @@ def build_governance_report(
     unresolved_critical_days: int = UNRESOLVED_CRITICAL_DAYS,
     low_confidence_threshold: int = LOW_CONFIDENCE_ACTIVE_THRESHOLD,
     max_fanout: int = MAX_RELATED_FANOUT,
+    candidate_warning_days: int = CANDIDATE_WARNING_DAYS,
+    candidate_critical_days: int = CANDIDATE_CRITICAL_DAYS,
 ) -> GovernanceReport:
     """Run all governance checks and return a deterministically sorted report.
 
@@ -604,6 +679,7 @@ def build_governance_report(
     issues.extend(detect_duplicate_title(db_path))
     issues.extend(detect_excessive_fanout(db_path, max_fanout))
     issues.extend(detect_adaptation_lineage_gap(db_path))
+    issues.extend(detect_unreviewed_confidence_candidates(db_path, candidate_warning_days, candidate_critical_days))
 
     issues.sort(key=lambda i: (_SEVERITY_ORDER[i.severity], i.issue_type, i.memory_id))
 

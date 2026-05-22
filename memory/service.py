@@ -8,11 +8,11 @@ from .models import (
     CONFIDENCE_MAX, CONFIDENCE_MIN,
     REVIEW_STATUSES,
     VALID_EVENT_TYPES, VALID_RELATIONSHIPS, VALID_STATUSES,
-    MemoryEvent, MemoryLink, MemoryRevision,
+    ConfidenceRevision, MemoryEvent, MemoryLink, MemoryRevision,
 )
 
 _SCHEMA = Path(__file__).parent / 'schema.sql'
-_MEMORY_SCHEMA_VERSION = 8
+_MEMORY_SCHEMA_VERSION = 9
 
 
 class ValidationError(ValueError):
@@ -44,6 +44,24 @@ def _validate_confidence(confidence: int) -> None:
         raise ValidationError(
             f"confidence must be {CONFIDENCE_MIN}–{CONFIDENCE_MAX}, got {confidence}"
         )
+
+
+def _migrate_to_v9(conn: sqlite3.Connection) -> None:
+    # confidence_revisions was added to schema.sql in v9. The table is created
+    # by executescript() via CREATE TABLE IF NOT EXISTS. This function
+    # idempotently ensures the three governance indices exist.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conf_rev_event "
+        "ON confidence_revisions(memory_event_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conf_rev_type_status "
+        "ON confidence_revisions(revision_type, status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conf_rev_created_at "
+        "ON confidence_revisions(created_at)"
+    )
 
 
 def _migrate_to_v8(conn: sqlite3.Connection) -> None:
@@ -182,6 +200,7 @@ def init_db(db_path: str) -> None:
             _migrate_to_v6(conn)
             _migrate_to_v7(conn)
             _migrate_to_v8(conn)
+            _migrate_to_v9(conn)
             conn.execute(
                 'INSERT INTO memory_schema_version (version) VALUES (?)',
                 (_MEMORY_SCHEMA_VERSION,)
@@ -199,6 +218,8 @@ def init_db(db_path: str) -> None:
                 _migrate_to_v7(conn)
             if row['version'] < 8:
                 _migrate_to_v8(conn)
+            if row['version'] < 9:
+                _migrate_to_v9(conn)
             conn.execute(
                 'UPDATE memory_schema_version SET version = ?',
                 (_MEMORY_SCHEMA_VERSION,)
@@ -537,6 +558,174 @@ def retract_contradiction_link(
             'SELECT * FROM memory_links WHERE id = ?', (link_id,)
         ).fetchone()
         return MemoryLink.from_row(row)
+
+
+def revise_confidence(
+    db_path: str,
+    memory_id: int,
+    confidence_after: int,
+    revised_by: str,
+    reason: str,
+    *,
+    revision_type: str = 'operator',
+    contradiction_link_ids: Optional[List[int]] = None,
+    evidence: Optional[str] = None,
+    provenance: Optional[dict] = None,
+) -> ConfidenceRevision:
+    if revision_type not in ('operator', 'candidate'):
+        raise ValidationError(f"revision_type must be 'operator' or 'candidate', got '{revision_type}'")
+    _validate_confidence(confidence_after)
+    if not revised_by or not revised_by.strip():
+        raise ValidationError("'revised_by' must not be empty")
+    if not reason or not reason.strip():
+        raise ValidationError("'reason' must not be empty")
+
+    link_ids_json = json.dumps(sorted(contradiction_link_ids or []))
+    provenance_json = json.dumps(provenance, sort_keys=True) if provenance is not None else None
+    now = _now()
+
+    with _connect(db_path) as conn:
+        ev_row = conn.execute('SELECT id FROM memory_events WHERE id = ?', (memory_id,)).fetchone()
+        if ev_row is None:
+            raise NotFoundError(f"Memory event {memory_id} not found")
+
+        confidence_before = get_effective_confidence(db_path, memory_id)
+
+        if revision_type == 'operator':
+            conn.execute(
+                "UPDATE confidence_revisions SET status = 'superseded', superseded_at = ? "
+                "WHERE memory_event_id = ? AND revision_type = 'operator' AND status = 'active'",
+                (now, memory_id),
+            )
+            status = 'active'
+        else:
+            status = 'proposed'
+
+        cur = conn.execute(
+            'INSERT INTO confidence_revisions'
+            ' (memory_event_id, confidence_before, confidence_after, revised_by, reason,'
+            '  revision_type, status, contradiction_link_ids_json, evidence, provenance_json,'
+            '  created_at)'
+            ' VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            (memory_id, confidence_before, confidence_after, revised_by, reason,
+             revision_type, status, link_ids_json, evidence, provenance_json, now),
+        )
+        row = conn.execute(
+            'SELECT * FROM confidence_revisions WHERE id = ?', (cur.lastrowid,)
+        ).fetchone()
+        return ConfidenceRevision.from_row(row)
+
+
+def reject_candidate_revision(
+    db_path: str,
+    revision_id: int,
+    rejected_by: str,
+    reason: str,
+) -> ConfidenceRevision:
+    if not rejected_by or not rejected_by.strip():
+        raise ValidationError("'rejected_by' must not be empty")
+    if not reason or not reason.strip():
+        raise ValidationError("'reason' must not be empty")
+
+    now = _now()
+
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            'SELECT * FROM confidence_revisions WHERE id = ?', (revision_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"Confidence revision {revision_id} not found")
+        if row['revision_type'] != 'candidate':
+            raise ValidationError(
+                f"Revision {revision_id} has revision_type '{row['revision_type']}'; "
+                "only 'candidate' revisions can be rejected"
+            )
+        if row['status'] != 'proposed':
+            raise ValidationError(
+                f"Revision {revision_id} has status '{row['status']}'; "
+                "only 'proposed' revisions can be rejected"
+            )
+
+        conn.execute(
+            "UPDATE confidence_revisions "
+            "SET status = 'rejected', rejected_at = ?, rejected_by = ?, rejected_reason = ? "
+            "WHERE id = ?",
+            (now, rejected_by, reason, revision_id),
+        )
+        row = conn.execute(
+            'SELECT * FROM confidence_revisions WHERE id = ?', (revision_id,)
+        ).fetchone()
+        return ConfidenceRevision.from_row(row)
+
+
+def get_effective_confidence(db_path: str, memory_id: int) -> int:
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT confidence_after FROM confidence_revisions "
+            "WHERE memory_event_id = ? AND revision_type = 'operator' AND status = 'active' "
+            "ORDER BY id DESC LIMIT 1",
+            (memory_id,),
+        ).fetchone()
+        if row is not None:
+            return row['confidence_after']
+        ev_row = conn.execute(
+            'SELECT confidence FROM memory_events WHERE id = ?', (memory_id,)
+        ).fetchone()
+        if ev_row is None:
+            raise NotFoundError(f"Memory event {memory_id} not found")
+        return ev_row['confidence']
+
+
+def get_effective_confidence_batch(
+    db_path: str,
+    memory_ids: List[int],
+) -> dict:
+    if not memory_ids:
+        return {}
+    placeholders = ','.join('?' * len(memory_ids))
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT memory_event_id, confidence_after FROM confidence_revisions "
+            f"WHERE memory_event_id IN ({placeholders}) "
+            f"AND revision_type = 'operator' AND status = 'active' "
+            f"ORDER BY id DESC",
+            memory_ids,
+        ).fetchall()
+    result: dict = {}
+    for row in rows:
+        mid = row['memory_event_id']
+        if mid not in result:
+            result[mid] = row['confidence_after']
+    return result
+
+
+def list_confidence_revisions(
+    db_path: str,
+    memory_event_id: Optional[int] = None,
+    revision_type: Optional[str] = None,
+    status: Optional[str] = None,
+) -> List[ConfidenceRevision]:
+    clauses: List[str] = []
+    params: list = []
+
+    if memory_event_id is not None:
+        clauses.append('memory_event_id = ?')
+        params.append(memory_event_id)
+    if revision_type is not None:
+        clauses.append('revision_type = ?')
+        params.append(revision_type)
+    if status is not None:
+        clauses.append('status = ?')
+        params.append(status)
+
+    where = f'WHERE {" AND ".join(clauses)}' if clauses else ''
+
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            f'SELECT * FROM confidence_revisions {where} ORDER BY id ASC',
+            params,
+        ).fetchall()
+        return [ConfidenceRevision.from_row(r) for r in rows]
 
 
 def review_memory(

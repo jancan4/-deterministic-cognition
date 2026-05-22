@@ -169,3 +169,70 @@ class MemoryLink:
             retracted_reason=_get('retracted_reason'),
             retracted_by=_get('retracted_by'),
         )
+
+
+@dataclass
+class ConfidenceRevision:
+    id: int
+    memory_event_id: int
+    confidence_before: int
+    confidence_after: int
+    revised_by: str
+    reason: str
+    revision_type: str
+    status: str
+    contradiction_link_ids_json: Optional[str]
+    evidence: Optional[str]
+    provenance_json: Optional[str]
+    created_at: str
+    superseded_at: Optional[str]
+    rejected_at: Optional[str]
+    rejected_by: Optional[str]
+    rejected_reason: Optional[str]
+
+    def to_dict(self) -> dict:
+        return {
+            'id': self.id,
+            'memory_event_id': self.memory_event_id,
+            'confidence_before': self.confidence_before,
+            'confidence_after': self.confidence_after,
+            'revised_by': self.revised_by,
+            'reason': self.reason,
+            'revision_type': self.revision_type,
+            'status': self.status,
+            'contradiction_link_ids_json': self.contradiction_link_ids_json,
+            'evidence': self.evidence,
+            'provenance_json': self.provenance_json,
+            'created_at': self.created_at,
+            'superseded_at': self.superseded_at,
+            'rejected_at': self.rejected_at,
+            'rejected_by': self.rejected_by,
+            'rejected_reason': self.rejected_reason,
+        }
+
+    @classmethod
+    def from_row(cls, row) -> 'ConfidenceRevision':
+        def _get(key, default=None):
+            try:
+                return row[key]
+            except IndexError:
+                return default
+
+        return cls(
+            id=row['id'],
+            memory_event_id=row['memory_event_id'],
+            confidence_before=row['confidence_before'],
+            confidence_after=row['confidence_after'],
+            revised_by=row['revised_by'],
+            reason=row['reason'],
+            revision_type=row['revision_type'],
+            status=row['status'],
+            contradiction_link_ids_json=_get('contradiction_link_ids_json'),
+            evidence=_get('evidence'),
+            provenance_json=_get('provenance_json'),
+            created_at=row['created_at'],
+            superseded_at=_get('superseded_at'),
+            rejected_at=_get('rejected_at'),
+            rejected_by=_get('rejected_by'),
+            rejected_reason=_get('rejected_reason'),
+        )

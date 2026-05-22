@@ -166,3 +166,24 @@ CREATE TABLE IF NOT EXISTS context_assembly_log (
 );
 -- Indices for context_assembly_log are created by _migrate_to_v7() in service.py.
 -- This follows the same pattern as embedding_model_pins / retrieval_log status index.
+
+CREATE TABLE IF NOT EXISTS confidence_revisions (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_event_id             INTEGER NOT NULL,
+    confidence_before           INTEGER NOT NULL,
+    confidence_after            INTEGER NOT NULL CHECK (confidence_after >= 1 AND confidence_after <= 5),
+    revised_by                  TEXT    NOT NULL,
+    reason                      TEXT    NOT NULL,
+    revision_type               TEXT    NOT NULL DEFAULT 'operator',
+    status                      TEXT    NOT NULL DEFAULT 'active',
+    contradiction_link_ids_json TEXT,
+    evidence                    TEXT,
+    provenance_json             TEXT,
+    created_at                  TEXT    NOT NULL,
+    superseded_at               TEXT,
+    rejected_at                 TEXT,
+    rejected_by                 TEXT,
+    rejected_reason             TEXT,
+    FOREIGN KEY (memory_event_id) REFERENCES memory_events(id)
+);
+-- Indices for confidence_revisions are created by _migrate_to_v9() in service.py.

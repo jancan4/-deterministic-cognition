@@ -10,7 +10,7 @@ from . import service
 from .artifact_governance import ArtifactStatus, compute_content_hash
 from .models import MemoryEvent, VALID_EVENT_TYPES, VALID_STATUSES
 
-RETRIEVAL_SCORING_VERSION = '2.0.0'
+RETRIEVAL_SCORING_VERSION = '3.0.0'
 
 # Lower rank = higher priority. Types not listed default to 7.
 DOCTRINE_PRIORITY: Dict[str, int] = {
@@ -43,6 +43,7 @@ class ScoredEvent:
     recency_rank: int
     is_expanded: bool
     semantic_rank: int = 0
+    effective_confidence: int = 0
 
     @property
     def composite_key(self) -> Tuple:
@@ -50,7 +51,7 @@ class ScoredEvent:
         return (
             int(self.is_expanded),
             doctrine_rank,
-            -self.event.confidence,
+            -self.effective_confidence,
             self.semantic_rank,
             self.recency_rank,
             -self.tag_overlap,
@@ -75,7 +76,10 @@ def _query_hash(query_json: str) -> str:
 
 
 def _scoring_params_json() -> str:
-    return json.dumps({'doctrine_priority': DOCTRINE_PRIORITY}, sort_keys=True, ensure_ascii=True)
+    return json.dumps(
+        {'doctrine_priority': DOCTRINE_PRIORITY, 'effective_confidence_enabled': True},
+        sort_keys=True, ensure_ascii=True,
+    )
 
 
 @dataclass
@@ -160,6 +164,10 @@ def retrieve(
 
     if query.expand_related:
         scored = _expand_related(db_path, scored, query.tags)
+
+    eff_conf = service.get_effective_confidence_batch(db_path, [s.event.id for s in scored])
+    for s in scored:
+        s.effective_confidence = eff_conf.get(s.event.id, s.event.confidence)
 
     semantic_meta = None
     if query_vector is not None:
@@ -385,6 +393,7 @@ def _score_events(
             tag_overlap=overlap,
             recency_rank=recency[ev.id],
             is_expanded=is_expanded,
+            effective_confidence=ev.confidence,
         ))
     return scored
 

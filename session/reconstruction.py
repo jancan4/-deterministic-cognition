@@ -509,27 +509,39 @@ def verify_assembly_against_current_db(
 
     stored_snapshot = _json.loads(row['assembly_snapshot_json'])
 
-    def _ids_from_snapshot(d: dict) -> set:
-        ids: set = set()
+    def _items_from_snapshot(d: dict) -> Dict[int, dict]:
+        items: Dict[int, dict] = {}
         for key in ('governance_context', 'unresolved_items', 'active_investigations', 'relevant_memory'):
             for item in d.get(key, []):
-                ids.add(item['memory_id'])
-        return ids
+                items[item['memory_id']] = item
+        return items
 
-    def _ids_from_ctx(ctx: SessionContext) -> set:
-        ids: set = set()
+    def _items_from_ctx(ctx: SessionContext) -> Dict[int, 'ActivatedMemory']:
+        from .models import ActivatedMemory
+        items: Dict[int, ActivatedMemory] = {}
         for section in (ctx.governance_context, ctx.unresolved_items,
                         ctx.active_investigations, ctx.relevant_memory):
             for item in section:
-                ids.add(item.memory_id)
-        return ids
+                items[item.memory_id] = item
+        return items
 
-    stored_ids = _ids_from_snapshot(stored_snapshot)
-    current_ids = _ids_from_ctx(current_ctx)
+    stored_items = _items_from_snapshot(stored_snapshot)
+    current_items = _items_from_ctx(current_ctx)
+
+    stored_ids = set(stored_items.keys())
+    current_ids = set(current_items.keys())
 
     added = sorted(current_ids - stored_ids)
     removed = sorted(stored_ids - current_ids)
-    diverged = bool(added or removed)
+
+    rescored: List[int] = []
+    for mid in sorted(stored_ids & current_ids):
+        snap_conf = stored_items[mid].get('confidence')
+        curr_conf = current_items[mid].confidence
+        if snap_conf != curr_conf:
+            rescored.append(mid)
+
+    diverged = bool(added or removed or rescored)
 
     return AssemblyDivergenceReport(
         assembly_id=assembly_id,
@@ -537,5 +549,5 @@ def verify_assembly_against_current_db(
         diverged=diverged,
         events_added_since_assembly=added,
         events_removed_since_assembly=removed,
-        events_rescored_since_assembly=[],
+        events_rescored_since_assembly=rescored,
     )

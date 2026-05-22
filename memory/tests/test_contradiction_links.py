@@ -1,4 +1,4 @@
-"""Tests for Phase 4A: contradiction link provenance (schema v8)."""
+"""Tests for Phase 4A: contradiction link provenance (schema v9)."""
 import sqlite3
 
 import pytest
@@ -49,15 +49,15 @@ def _raw(db, sql, params=()):
 
 
 # ---------------------------------------------------------------------------
-# Schema v8 migration
+# Schema v9 migration
 # ---------------------------------------------------------------------------
 
-class TestSchemaV8Migration:
-    def test_fresh_db_has_schema_version_8(self, db):
+class TestSchemaV9Migration:
+    def test_fresh_db_has_schema_version_9(self, db):
         conn = sqlite3.connect(db)
         version = conn.execute('SELECT version FROM memory_schema_version').fetchone()[0]
         conn.close()
-        assert version == 8
+        assert version == 9
 
     def test_fresh_db_memory_links_has_v8_columns(self, db):
         conn = sqlite3.connect(db)
@@ -77,8 +77,8 @@ class TestSchemaV8Migration:
         assert 'idx_links_status' in indices
         assert 'idx_links_contradicts' in indices
 
-    def test_v7_db_migrates_to_v8(self, tmp_path):
-        """A DB at v7 should be upgraded to v8 by init_db()."""
+    def test_v7_db_migrates_to_v9(self, tmp_path):
+        """A DB at v7 should be upgraded to v9 by init_db()."""
         from memory.service import _connect
         db_path = str(tmp_path / 'v7.db')
         conn = _connect(db_path)
@@ -159,7 +159,7 @@ class TestSchemaV8Migration:
         indices = {r[1] for r in conn.execute('PRAGMA index_list(memory_links)')}
         conn.close()
 
-        assert version == 8
+        assert version == 9
         assert 'status' in cols
         assert 'created_by' in cols
         assert 'idx_links_status' in indices
@@ -170,7 +170,7 @@ class TestSchemaV8Migration:
         conn = sqlite3.connect(db)
         version = conn.execute('SELECT version FROM memory_schema_version').fetchone()[0]
         conn.close()
-        assert version == 8
+        assert version == 9
 
     def test_existing_links_backfilled_active(self, tmp_path):
         """Links created before v8 migration must have status='active' after migration."""

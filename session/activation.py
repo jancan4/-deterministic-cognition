@@ -64,7 +64,7 @@ def _activation_rank(
     return (
         tier,
         _doctrine_rank(ev.event_type),
-        -ev.confidence,
+        -scored.effective_confidence,
         scored.recency_rank,
         -scored.tag_overlap,
         ev.id,
@@ -92,7 +92,7 @@ def score_and_rank(
             title=ev.title,
             summary=ev.summary,
             evidence=ev.evidence,
-            confidence=ev.confidence,
+            confidence=scored.effective_confidence,
             status=ev.status,
             tags=list(ev.tags),
             source=ev.source,
