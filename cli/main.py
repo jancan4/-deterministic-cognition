@@ -7,12 +7,15 @@ Commands:
   inspect --execution-id ID  Replay and inspect one execution, optionally to a specific event.
   snapshot --execution-id ID Take a manual snapshot of one execution.
   run-once [--orch-db PATH]  Submit one round of ready nodes to the orchestration layer.
+  session-context            Export a deterministic context bundle from memory.
 
 Lineage is always canonical. The mutable state row is always a cache.
+Session context export is read-only. No memory is mutated.
 """
 import argparse
+import json
 import sys
-from typing import List
+from typing import List, Optional
 
 from workflow.recovery import RecoveryReport, find_non_terminal_execution_ids, recover_all
 from workflow.inspector import InspectionResult, inspect_execution
@@ -163,6 +166,228 @@ def cmd_run_once(args: argparse.Namespace) -> int:
     return 0
 
 
+def _session_context_to_json(reconstruction, filters: dict) -> str:
+    """Serialise a SessionReconstruction to a structured JSON string."""
+    ctx = reconstruction.context
+
+    def _mem_dicts(items):
+        return [m.to_dict() for m in items]
+
+    def _wf_dicts(items):
+        return [w.to_dict() for w in items]
+
+    payload = {
+        'session_id': ctx.session_id,
+        'created_at': ctx.created_at,
+        'char_budget': ctx.char_budget,
+        'chars_used': ctx.chars_used,
+        'total_candidates': ctx.total_candidates,
+        'included_entries': ctx.included_entries,
+        'truncated': ctx.truncated,
+        'filters': filters,
+        'sections': {
+            'governance_context': _mem_dicts(ctx.governance_context),
+            'unresolved_items': _mem_dicts(ctx.unresolved_items),
+            'active_workflows': _wf_dicts(ctx.active_workflows),
+            'active_investigations': _mem_dicts(ctx.active_investigations),
+            'relevant_memory': _mem_dicts(ctx.relevant_memory),
+            'execution_lineage': _wf_dicts(ctx.execution_lineage),
+            'runtime_snapshots': [r.to_dict() for r in ctx.runtime_snapshots],
+        },
+    }
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
+def _apply_output_filters(
+    reconstruction,
+    filter_event_types: List[str],
+    filter_statuses: List[str],
+):
+    """
+    Return a filtered view of the reconstruction's memory sections.
+
+    Filters are applied to the activated memory lists only — workflow and
+    runtime sections are never filtered. Filtering is post-reconstruction
+    (read-only: does not re-run activation).
+
+    Returns the same reconstruction object with filtered section lists
+    attached as a plain namespace for display purposes.
+    """
+    import types
+    ctx = reconstruction.context
+
+    def _keep(mem) -> bool:
+        if filter_event_types and mem.event_type not in filter_event_types:
+            return False
+        if filter_statuses and mem.status not in filter_statuses:
+            return False
+        return True
+
+    filtered = types.SimpleNamespace(
+        session_id=ctx.session_id,
+        created_at=ctx.created_at,
+        char_budget=ctx.char_budget,
+        chars_used=ctx.chars_used,
+        total_candidates=ctx.total_candidates,
+        included_entries=ctx.included_entries,
+        truncated=ctx.truncated,
+        governance_context=[m for m in ctx.governance_context if _keep(m)],
+        unresolved_items=[m for m in ctx.unresolved_items if _keep(m)],
+        active_workflows=ctx.active_workflows,
+        active_investigations=[m for m in ctx.active_investigations if _keep(m)],
+        relevant_memory=[m for m in ctx.relevant_memory if _keep(m)],
+        execution_lineage=ctx.execution_lineage,
+        runtime_snapshots=ctx.runtime_snapshots,
+    )
+    return filtered
+
+
+def _render_filtered_markdown(ctx, filters: dict) -> str:
+    """Render a filtered context view as a Markdown-formatted string."""
+    from session.models import _render_section
+
+    lines = [
+        "# SESSION CONTEXT",
+        f"session_id : {ctx.session_id}",
+        f"created_at : {ctx.created_at}",
+        f"budget     : {ctx.chars_used}/{ctx.char_budget} chars  "
+        f"({ctx.included_entries} entries)"
+        + ("  [TRUNCATED]" if ctx.truncated else ""),
+    ]
+    active_filters = {k: v for k, v in filters.items() if v}
+    if active_filters:
+        lines.append(f"filters    : {json.dumps(active_filters)}")
+
+    sections = []
+
+    if ctx.governance_context:
+        sections.append(_render_section(
+            'ACTIVE GOVERNANCE CONTEXT',
+            [m.render() for m in ctx.governance_context],
+        ))
+    if ctx.active_workflows:
+        sections.append(_render_section(
+            'ACTIVE WORKFLOWS',
+            [w.render() for w in ctx.active_workflows],
+        ))
+    if ctx.execution_lineage:
+        sections.append(_render_section(
+            'RECENT EXECUTION LINEAGE',
+            [w.render() for w in ctx.execution_lineage],
+        ))
+    if ctx.unresolved_items:
+        sections.append(_render_section(
+            'UNRESOLVED ITEMS',
+            [m.render() for m in ctx.unresolved_items],
+        ))
+    if ctx.relevant_memory:
+        sections.append(_render_section(
+            'RELEVANT MEMORY',
+            [m.render() for m in ctx.relevant_memory],
+        ))
+    if ctx.active_investigations:
+        sections.append(_render_section(
+            'ACTIVE INVESTIGATIONS',
+            [m.render() for m in ctx.active_investigations],
+        ))
+    if ctx.runtime_snapshots:
+        sections.append(_render_section(
+            'RUNTIME STATE',
+            [r.render() for r in ctx.runtime_snapshots],
+        ))
+
+    header = '\n'.join(lines)
+    if sections:
+        return header + '\n\n' + '\n\n'.join(sections)
+    return header + '\n\n(no items matched the activation policy)'
+
+
+def cmd_session_context(args: argparse.Namespace) -> int:
+    """
+    Reconstruct and export a deterministic session context bundle.
+
+    Reads from the memory database. Does not write to any database.
+    Output is deterministic: same db state + same flags = same output.
+    """
+    from session.models import ContextActivationPolicy
+    from session.reconstruction import reconstruct
+
+    # Build activation policy from CLI flags
+    policy = ContextActivationPolicy(
+        tags=list(args.tags),
+        max_entries=args.max_entries,
+        max_chars=args.max_chars,
+        include_governance=True,
+        include_unresolved=True,
+        include_adaptations=True,
+        expand_related=True,
+        workflow_db_path=args.workflow_db or None,
+        include_active_workflows=bool(args.workflow_db),
+        runtime_db_path=None,
+        include_runtime_state=False,
+    )
+
+    try:
+        reconstruction = reconstruct(args.db, policy)
+    except Exception as exc:
+        print(f"Error: reconstruction failed: {exc}", file=sys.stderr)
+        return 1
+
+    filters = {
+        'tags': list(args.tags),
+        'event_types': list(args.event_types),
+        'statuses': list(args.statuses),
+    }
+
+    # Apply optional post-reconstruction filters
+    filtered_ctx = _apply_output_filters(
+        reconstruction,
+        filter_event_types=list(args.event_types),
+        filter_statuses=list(args.statuses),
+    )
+
+    # Render output
+    if args.format == 'json':
+        # For JSON, build payload from the filtered context
+        payload = {
+            'session_id': filtered_ctx.session_id,
+            'created_at': filtered_ctx.created_at,
+            'char_budget': filtered_ctx.char_budget,
+            'chars_used': filtered_ctx.chars_used,
+            'total_candidates': filtered_ctx.total_candidates,
+            'included_entries': filtered_ctx.included_entries,
+            'truncated': filtered_ctx.truncated,
+            'filters': filters,
+            'sections': {
+                'governance_context': [m.to_dict() for m in filtered_ctx.governance_context],
+                'unresolved_items': [m.to_dict() for m in filtered_ctx.unresolved_items],
+                'active_workflows': [w.to_dict() for w in filtered_ctx.active_workflows],
+                'active_investigations': [m.to_dict() for m in filtered_ctx.active_investigations],
+                'relevant_memory': [m.to_dict() for m in filtered_ctx.relevant_memory],
+                'execution_lineage': [w.to_dict() for w in filtered_ctx.execution_lineage],
+                'runtime_snapshots': [r.to_dict() for r in filtered_ctx.runtime_snapshots],
+            },
+        }
+        output = json.dumps(payload, indent=2, sort_keys=True)
+    else:
+        output = _render_filtered_markdown(filtered_ctx, filters)
+
+    # Write to file or stdout
+    if args.out:
+        try:
+            with open(args.out, 'w', encoding='utf-8') as f:
+                f.write(output)
+                f.write('\n')
+            print(f"Context bundle written to: {args.out}")
+        except OSError as exc:
+            print(f"Error: could not write to {args.out!r}: {exc}", file=sys.stderr)
+            return 1
+    else:
+        print(output)
+
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='workflow-cli',
@@ -199,6 +424,54 @@ def build_parser() -> argparse.ArgumentParser:
     run_once_p.add_argument('--orch-db', default=None, dest='orch_db',
                             help='Orchestration DB path (defaults to --db)')
 
+    sc_p = sub.add_parser(
+        'session-context',
+        help='Export a deterministic context bundle from memory',
+    )
+    # For session-context, --db is the memory database (different default from workflow --db)
+    sc_p.add_argument(
+        '--db',
+        default='memory.db',
+        dest='db',
+        help='Path to the memory SQLite database (default: memory.db)',
+    )
+    sc_p.add_argument(
+        '--workflow-db',
+        default=None,
+        dest='workflow_db',
+        help='Path to the workflow SQLite database (optional; adds ACTIVE WORKFLOWS section)',
+    )
+    sc_p.add_argument(
+        '--max-entries', type=int, default=60, dest='max_entries',
+        help='Maximum number of entries in the context bundle (default: 60)',
+    )
+    sc_p.add_argument(
+        '--max-chars', type=int, default=12000, dest='max_chars',
+        help='Maximum character budget for the context bundle (default: 12000)',
+    )
+    sc_p.add_argument(
+        '--tag', action='append', default=[], dest='tags', metavar='TAG',
+        help='Filter by tag (repeatable; e.g. --tag fx --tag macro)',
+    )
+    sc_p.add_argument(
+        '--event-type', action='append', default=[], dest='event_types',
+        metavar='TYPE',
+        help='Post-filter by event type (repeatable; e.g. --event-type governance_rule)',
+    )
+    sc_p.add_argument(
+        '--status', action='append', default=[], dest='statuses',
+        metavar='STATUS',
+        help='Post-filter by status (repeatable; e.g. --status unresolved)',
+    )
+    sc_p.add_argument(
+        '--out', default=None, dest='out',
+        help='Write output to this file instead of stdout',
+    )
+    sc_p.add_argument(
+        '--format', choices=['json', 'markdown'], default='markdown', dest='format',
+        help='Output format: json or markdown (default: markdown)',
+    )
+
     return parser
 
 
@@ -212,6 +485,7 @@ def main(argv: List[str] = None) -> int:
         'inspect': cmd_inspect,
         'snapshot': cmd_snapshot,
         'run-once': cmd_run_once,
+        'session-context': cmd_session_context,
     }
     return dispatch[args.command](args)
 
