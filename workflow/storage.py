@@ -12,7 +12,7 @@ from typing import List, Optional
 
 from .state import WorkflowExecution, WorkflowExecutionLineageEvent
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 def init_db(db_path: str) -> None:
@@ -49,6 +49,7 @@ def init_db(db_path: str) -> None:
             stage_index    INTEGER NOT NULL DEFAULT 0,
             reason         TEXT NOT NULL,
             created_at     TEXT NOT NULL,
+            metadata_json  TEXT NOT NULL DEFAULT '{}',
             FOREIGN KEY (execution_id) REFERENCES workflow_executions(execution_id)
         );
 
@@ -121,8 +122,8 @@ def append_execution_event(
             """
             INSERT INTO workflow_execution_events
                 (execution_id, event_type, old_state, new_state, node_id,
-                 stage_index, reason, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 stage_index, reason, created_at, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.execution_id,
@@ -133,6 +134,7 @@ def append_execution_event(
                 event.stage_index,
                 event.reason,
                 event.created_at,
+                json.dumps(event.metadata, sort_keys=True),
             ),
         )
         conn.commit()
@@ -158,8 +160,8 @@ def append_execution_events(
                 """
                 INSERT INTO workflow_execution_events
                     (execution_id, event_type, old_state, new_state, node_id,
-                     stage_index, reason, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                     stage_index, reason, created_at, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.execution_id,
@@ -170,6 +172,7 @@ def append_execution_events(
                     event.stage_index,
                     event.reason,
                     event.created_at,
+                    json.dumps(event.metadata, sort_keys=True),
                 ),
             )
             ids.append(cur.lastrowid)
@@ -244,6 +247,7 @@ def load_execution_events(
             stage_index=row['stage_index'],
             reason=row['reason'],
             created_at=row['created_at'],
+            metadata=json.loads(row['metadata_json'] or '{}'),
         )
         for row in rows
     ]

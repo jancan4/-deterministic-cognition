@@ -124,6 +124,9 @@ class WorkflowExecutionLineageEvent:
     stage_index: int
     reason: str
     created_at: str
+    # Optional structured payload. The init event carries workflow_id and plan_id
+    # so that lineage is self-contained and identity is recoverable from events alone.
+    metadata: Dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -135,6 +138,7 @@ class WorkflowExecutionLineageEvent:
             'stage_index': self.stage_index,
             'reason': self.reason,
             'created_at': self.created_at,
+            'metadata': dict(self.metadata),
         }
 
 

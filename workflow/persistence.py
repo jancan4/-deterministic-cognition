@@ -35,14 +35,33 @@ def persist_execution(
     events: List[WorkflowExecutionLineageEvent],
 ) -> None:
     """
-    Persist execution state and its lineage events atomically.
+    Persist execution state and its lineage events.
 
-    Writes the mutable state row first, then appends events. Callers should
-    call this after every state transition to keep storage in sync.
+    Write order depends on whether the execution row already exists:
+
+    Initialization (row absent): the FK constraint on workflow_execution_events
+    requires the execution row to exist before events can be appended, so the
+    row is written first and events second. This is the only case where state
+    precedes lineage.
+
+    Post-init transitions (row present): events are written first, state second.
+    If the process crashes between the two commits, the lineage has the transition
+    recorded and replay reconstructs the correct (advanced) state. The mutable
+    row may be stale but lineage wins on recovery — never behind it.
     """
-    save_execution(db_path, execution)
-    if events:
+    if not events:
+        save_execution(db_path, execution)
+        return
+
+    is_new = load_execution(db_path, execution.execution_id) is None
+    if is_new:
+        # Initialization: FK forces row-before-events (documented exception).
+        save_execution(db_path, execution)
         _append_events(db_path, events)
+    else:
+        # Post-init: events first preserves lineage-as-truth under crash.
+        _append_events(db_path, events)
+        save_execution(db_path, execution)
 
 
 def append_execution_events(

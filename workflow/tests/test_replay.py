@@ -1,7 +1,13 @@
 """Tests for workflow lineage replay engine."""
 import pytest
 
-from workflow.replay import ReplayResult, replay_execution, replay_from_snapshot, validate_lineage
+from workflow.replay import (
+    ReplayResult,
+    _validate_delta_events,
+    replay_execution,
+    replay_from_snapshot,
+    validate_lineage,
+)
 from workflow.state import (
     EVENT_NODE_COMPLETED,
     EVENT_NODE_FAILED,
@@ -380,3 +386,196 @@ def test_replay_from_snapshot_node_submitted_no_change():
     result = replay_from_snapshot(snap, delta)
     assert result.execution == snap
     assert result.events_applied == 1
+
+
+# ---------------------------------------------------------------------------
+# W-4: validate_lineage checks old_state against current_state
+# ---------------------------------------------------------------------------
+
+def test_validate_old_state_matches_current_state():
+    """Correct old_state on a transition passes validation."""
+    events = [
+        _transition(None, 'initialized'),
+        _transition('initialized', 'ready'),   # old_state matches
+        _transition('ready', 'executing'),      # old_state matches
+    ]
+    assert validate_lineage(events) == []
+
+
+def test_validate_old_state_mismatch_raises_error():
+    """old_state that disagrees with tracked current_state is an error."""
+    events = [
+        _transition(None, 'initialized'),
+        _transition('initialized', 'ready'),
+        _transition('initialized', 'executing'),  # old_state='initialized' but current='ready'
+    ]
+    errors = validate_lineage(events)
+    assert errors
+    assert any("old_state" in e for e in errors)
+
+
+def test_validate_old_state_none_is_always_accepted():
+    """old_state=None means 'not recorded' and skips the check."""
+    events = [
+        _transition(None, 'initialized'),
+        _evt(EVENT_STATE_TRANSITION, old_state=None, new_state='ready'),
+        _evt(EVENT_STATE_TRANSITION, old_state=None, new_state='executing'),
+    ]
+    assert validate_lineage(events) == []
+
+
+def test_validate_old_state_mismatch_on_first_transition_not_checked():
+    """The first state_transition (bootstrapping) has no old_state constraint."""
+    events = [_transition('anything', 'initialized')]
+    # The bootstrap path only checks new_state == 'initialized', not old_state.
+    # old_state is ignored on the very first event.
+    errors = validate_lineage(events)
+    assert not errors
+
+
+# ---------------------------------------------------------------------------
+# C-2: replay_execution recovers workflow_id and plan_id from init event metadata
+# ---------------------------------------------------------------------------
+
+def test_replay_reconstructs_workflow_id_from_metadata():
+    """Pure replay (no DB) recovers workflow_id from the init event's metadata."""
+    events = [
+        _evt(EVENT_STATE_TRANSITION, new_state='initialized',
+             metadata={'workflow_id': 'wf-xyz', 'plan_id': 'plan-abc'}),
+        _transition('initialized', 'ready'),
+        _transition('ready', 'executing'),
+    ]
+    result = replay_execution(events)
+    assert result.is_valid
+    assert result.execution.workflow_id == 'wf-xyz'
+
+
+def test_replay_reconstructs_plan_id_from_metadata():
+    events = [
+        _evt(EVENT_STATE_TRANSITION, new_state='initialized',
+             metadata={'workflow_id': 'wf-xyz', 'plan_id': 'plan-abc'}),
+        _transition('initialized', 'ready'),
+        _transition('ready', 'executing'),
+    ]
+    result = replay_execution(events)
+    assert result.execution.plan_id == 'plan-abc'
+
+
+def test_replay_identity_empty_when_no_metadata():
+    """Events without metadata produce empty identity strings (not errors)."""
+    events = _minimal_sequence()  # no metadata
+    result = replay_execution(events)
+    assert result.is_valid
+    assert result.execution.workflow_id == ''
+    assert result.execution.plan_id == ''
+
+
+def test_replay_identity_independent_of_event_order_of_non_init_events():
+    """Only the init event's metadata is used for identity — subsequent events don't override."""
+    events = [
+        _evt(EVENT_STATE_TRANSITION, new_state='initialized',
+             metadata={'workflow_id': 'correct-wf', 'plan_id': 'correct-plan'}),
+        _evt(EVENT_STATE_TRANSITION, old_state='initialized', new_state='ready',
+             metadata={'workflow_id': 'wrong-wf'}),
+        _transition('ready', 'executing'),
+    ]
+    result = replay_execution(events)
+    assert result.execution.workflow_id == 'correct-wf'
+
+
+# ---------------------------------------------------------------------------
+# W-2: replay_from_snapshot validates delta events
+# ---------------------------------------------------------------------------
+
+def test_replay_from_snapshot_rejects_wrong_execution_id():
+    snap = _snapshot(execution_id='eid-1')
+    delta = [_evt(EVENT_NODE_COMPLETED, execution_id='eid-WRONG', node_id='fetch')]
+    result = replay_from_snapshot(snap, delta)
+    assert result.is_valid is False
+    assert any('eid-WRONG' in e for e in result.validation_errors)
+
+
+def test_replay_from_snapshot_rejects_events_when_snapshot_is_terminal():
+    snap = _snapshot(state='completed')
+    delta = [_node_completed('fetch')]
+    result = replay_from_snapshot(snap, delta)
+    assert result.is_valid is False
+    assert any('terminal' in e.lower() for e in result.validation_errors)
+
+
+def test_replay_from_snapshot_rejects_cancelled_snapshot_with_delta():
+    snap = _snapshot(state='cancelled')
+    delta = [_node_submitted('fetch')]
+    result = replay_from_snapshot(snap, delta)
+    assert result.is_valid is False
+
+
+def test_replay_from_snapshot_rejects_duplicate_node_completion_vs_snapshot():
+    snap = _snapshot(completed_node_ids=['fetch'])
+    delta = [_node_completed('fetch')]  # already in snapshot
+    result = replay_from_snapshot(snap, delta)
+    assert result.is_valid is False
+    assert any('fetch' in e for e in result.validation_errors)
+
+
+def test_replay_from_snapshot_rejects_duplicate_node_completion_within_delta():
+    snap = _snapshot()
+    delta = [_node_completed('fetch'), _node_completed('fetch')]
+    result = replay_from_snapshot(snap, delta)
+    assert result.is_valid is False
+    assert any('duplicate' in e.lower() for e in result.validation_errors)
+
+
+def test_replay_from_snapshot_rejects_node_failed_after_completed_in_snapshot():
+    snap = _snapshot(completed_node_ids=['fetch'])
+    delta = [_node_failed('fetch')]
+    result = replay_from_snapshot(snap, delta)
+    assert result.is_valid is False
+
+
+def test_replay_from_snapshot_rejects_node_failed_after_completed_in_delta():
+    snap = _snapshot()
+    delta = [_node_completed('fetch'), _node_failed('fetch')]
+    result = replay_from_snapshot(snap, delta)
+    assert result.is_valid is False
+
+
+def test_replay_from_snapshot_rejects_events_after_terminal_within_delta():
+    snap = _snapshot()
+    delta = [
+        _transition('executing', 'completed'),
+        _node_submitted('fetch'),  # after terminal
+    ]
+    result = replay_from_snapshot(snap, delta)
+    assert result.is_valid is False
+    assert any('terminal' in e.lower() for e in result.validation_errors)
+
+
+def test_replay_from_snapshot_invalid_returns_snapshot_unchanged():
+    """When delta is invalid, execution returned is the unmodified snapshot."""
+    snap = _snapshot(completed_node_ids=['already-done'])
+    delta = [_node_completed('already-done')]  # duplicate
+    result = replay_from_snapshot(snap, delta)
+    assert result.is_valid is False
+    assert result.execution == snap
+    assert result.events_applied == 0
+
+
+def test_replay_from_snapshot_rejects_invalid_state_transition_in_delta():
+    snap = _snapshot(state='executing')
+    delta = [_transition('executing', 'initialized')]  # not a valid transition
+    result = replay_from_snapshot(snap, delta)
+    assert result.is_valid is False
+
+
+def test_replay_from_snapshot_valid_delta_still_applies_correctly():
+    """Valid deltas continue to apply and produce is_valid=True."""
+    snap = _snapshot(state='executing', version=3)
+    delta = [
+        _node_completed('fetch'),
+        _transition('executing', 'completed'),
+    ]
+    result = replay_from_snapshot(snap, delta)
+    assert result.is_valid is True
+    assert result.execution.state == 'completed'
+    assert 'fetch' in result.execution.completed_node_ids

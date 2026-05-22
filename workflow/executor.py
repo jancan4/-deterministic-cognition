@@ -169,6 +169,9 @@ def initialize_execution(
         stage_index=0,
         reason='Execution initialized from plan',
         created_at=now,
+        # Embed identity so that lineage is self-contained: pure replay can recover
+        # workflow_id and plan_id without relying on the mutable state row.
+        metadata={'workflow_id': plan.workflow_id, 'plan_id': plan.plan_id},
     )
     return execution, evt
 

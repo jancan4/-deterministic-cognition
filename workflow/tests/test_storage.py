@@ -93,7 +93,7 @@ def test_init_db_sets_schema_version(tmp_path):
     row = conn.execute('SELECT version FROM workflow_schema_version').fetchone()
     conn.close()
     assert row is not None
-    assert row[0] == 1
+    assert row[0] == 2  # schema version 2 adds metadata_json to events
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +255,47 @@ def test_event_fields_preserved(tmp_path):
     assert e.node_id == 'fetch'
     assert e.stage_index == 2
     assert e.reason == 'submitted by coordinator'
+
+
+def test_event_metadata_roundtrip(tmp_path):
+    """metadata dict is serialized to metadata_json and restored on load."""
+    db = _db(tmp_path)
+    save_execution(db, _execution())
+    evt = _event(
+        new_state='initialized',
+        metadata={'workflow_id': 'wf-42', 'plan_id': 'plan-99'},
+    )
+    append_execution_event(db, evt)
+
+    loaded = load_execution_events(db, 'eid-1')
+    assert loaded[0].metadata == {'workflow_id': 'wf-42', 'plan_id': 'plan-99'}
+
+
+def test_event_metadata_defaults_to_empty_dict(tmp_path):
+    """Events without explicit metadata load as empty dict."""
+    db = _db(tmp_path)
+    save_execution(db, _execution())
+    append_execution_event(db, _event())  # no metadata kwarg
+
+    loaded = load_execution_events(db, 'eid-1')
+    assert loaded[0].metadata == {}
+
+
+def test_event_metadata_preserved_in_batch_append(tmp_path):
+    """metadata is correctly persisted for each event in a batch."""
+    db = _db(tmp_path)
+    save_execution(db, _execution())
+    evts = [
+        _event(new_state='initialized', metadata={'workflow_id': 'wf-1', 'plan_id': 'p-1'}),
+        _event(new_state='ready', metadata={}),
+        _event(new_state='executing', metadata={'extra': 'data'}),
+    ]
+    append_execution_events(db, evts)
+
+    loaded = load_execution_events(db, 'eid-1')
+    assert loaded[0].metadata == {'workflow_id': 'wf-1', 'plan_id': 'p-1'}
+    assert loaded[1].metadata == {}
+    assert loaded[2].metadata == {'extra': 'data'}
 
 
 # ---------------------------------------------------------------------------

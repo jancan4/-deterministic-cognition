@@ -97,6 +97,12 @@ def validate_lineage(events: List[WorkflowExecutionLineageEvent]) -> List[str]:
                         f"Event {i}: state transition '{current_state}' → "
                         f"'{evt.new_state}' is not permitted"
                     )
+                # Rule W-4: old_state field must match the actual current state
+                if evt.old_state is not None and evt.old_state != current_state:
+                    errors.append(
+                        f"Event {i}: old_state='{evt.old_state}' does not match "
+                        f"current state '{current_state}'"
+                    )
                 current_state = evt.new_state
 
             if current_state in TERMINAL_WORKFLOW_EXECUTION_STATES:
@@ -157,15 +163,16 @@ def replay_execution(
     plan_id: str = ''
     version: int = 0
 
-    # Extract context from the first state_transition event
+    # Extract identity and created_at from the first state_transition (init) event.
+    # workflow_id and plan_id are embedded in the init event's metadata so that
+    # lineage is self-contained — pure replay never needs the mutable state row.
     first_transition = next(
         (e for e in events if e.event_type == EVENT_STATE_TRANSITION), None
     )
     if first_transition:
         created_at = first_transition.created_at
-        # workflow_id and plan_id are not stored in events — they come from the
-        # execution record. We extract them from event metadata if available,
-        # but they may remain empty when replaying events alone.
+        workflow_id = first_transition.metadata.get('workflow_id', '')
+        plan_id = first_transition.metadata.get('plan_id', '')
 
     events_applied = 0
     for evt in events:
@@ -238,6 +245,92 @@ def replay_execution(
     )
 
 
+def _validate_delta_events(
+    snapshot: WorkflowExecution,
+    events: List[WorkflowExecutionLineageEvent],
+) -> List[str]:
+    """
+    Validate delta events for replay on top of a snapshot.
+
+    Checks:
+    - All events share the snapshot's execution_id.
+    - No events if the snapshot is already in a terminal state.
+    - No events after a terminal state is reached within the delta.
+    - No node_completed for a node already completed in the snapshot.
+    - No node_completed duplicate within the delta itself.
+    - No node_failed for a node already completed (in snapshot or delta).
+    """
+    errors: List[str] = []
+
+    if not events:
+        return errors
+
+    # Snapshot already terminal: no delta events permitted.
+    if snapshot.state in TERMINAL_WORKFLOW_EXECUTION_STATES:
+        errors.append(
+            f"Snapshot is in terminal state '{snapshot.state}'; "
+            f"delta events are not permitted"
+        )
+        return errors
+
+    completed_in_snapshot = frozenset(snapshot.completed_node_ids)
+    completed_in_delta: set = set()
+    terminal_at: Optional[int] = None
+    current_state = snapshot.state
+
+    for i, evt in enumerate(events):
+        # Wrong execution_id
+        if evt.execution_id != snapshot.execution_id:
+            errors.append(
+                f"Delta event {i}: execution_id='{evt.execution_id}' "
+                f"does not match snapshot execution_id='{snapshot.execution_id}'"
+            )
+
+        # Events after terminal state reached in the delta
+        if terminal_at is not None:
+            errors.append(
+                f"Delta event {i} (type='{evt.event_type}') appears after "
+                f"terminal state reached at delta event {terminal_at}"
+            )
+            continue
+
+        if evt.event_type == EVENT_STATE_TRANSITION:
+            allowed = VALID_WORKFLOW_EXECUTION_TRANSITIONS.get(current_state, frozenset())
+            if evt.new_state not in allowed:
+                errors.append(
+                    f"Delta event {i}: state transition '{current_state}' → "
+                    f"'{evt.new_state}' is not permitted"
+                )
+            current_state = evt.new_state
+            if current_state in TERMINAL_WORKFLOW_EXECUTION_STATES:
+                terminal_at = i
+
+        elif evt.event_type == EVENT_NODE_COMPLETED:
+            nid = evt.node_id
+            if nid in completed_in_snapshot:
+                errors.append(
+                    f"Delta event {i}: node_completed for '{nid}' already "
+                    f"completed in snapshot"
+                )
+            elif nid in completed_in_delta:
+                errors.append(
+                    f"Delta event {i}: duplicate node_completed for '{nid}' "
+                    f"within delta"
+                )
+            if nid:
+                completed_in_delta.add(nid)
+
+        elif evt.event_type == EVENT_NODE_FAILED:
+            nid = evt.node_id
+            if nid and (nid in completed_in_snapshot or nid in completed_in_delta):
+                errors.append(
+                    f"Delta event {i}: node_failed for '{nid}' which already "
+                    f"had node_completed"
+                )
+
+    return errors
+
+
 def replay_from_snapshot(
     snapshot: WorkflowExecution,
     events_after_snapshot: List[WorkflowExecutionLineageEvent],
@@ -245,11 +338,11 @@ def replay_from_snapshot(
     """
     Apply incremental lineage events on top of a snapshot.
 
-    The snapshot becomes the starting state. Events are applied in order
-    without re-validating the full lineage (the snapshot is already trusted).
-    Only events after the snapshot's last_event_id are applied.
+    The snapshot is the trusted starting state. Delta events are validated
+    before application. Invalid deltas return is_valid=False with the snapshot
+    as the execution (no partial application).
 
-    Returns a ReplayResult. is_valid=True when no application errors occur.
+    Returns a ReplayResult. is_valid=True only when delta validation passes.
     """
     if not events_after_snapshot:
         return ReplayResult(
@@ -257,6 +350,15 @@ def replay_from_snapshot(
             events_applied=0,
             validation_errors=[],
             is_valid=True,
+        )
+
+    errors = _validate_delta_events(snapshot, events_after_snapshot)
+    if errors:
+        return ReplayResult(
+            execution=snapshot,
+            events_applied=0,
+            validation_errors=errors,
+            is_valid=False,
         )
 
     completed_node_ids = list(snapshot.completed_node_ids)
