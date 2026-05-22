@@ -19,6 +19,8 @@ from typing import Optional
 
 from .models import ParsedDocument
 
+PARSER_VERSION = '1.0'
+
 # Frontmatter block: optional '---' delimited header at the start of the file
 _FRONTMATTER_RE = re.compile(
     r'\A---\s*\n(.*?)\n---\s*\n',
