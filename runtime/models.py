@@ -19,7 +19,8 @@ VALID_RUNTIME_STATES = (
 TERMINAL_RUNTIME_STATES: FrozenSet[str] = frozenset({'stopped'})
 
 VALID_RUNTIME_TRANSITIONS: Dict[str, FrozenSet[str]] = {
-    'initialized':   frozenset({'idle', 'stopped', 'interrupted'}),
+    # initialized → interrupted removed: a runtime that has never run cannot be interrupted.
+    'initialized':   frozenset({'idle', 'stopped'}),
     'idle':          frozenset({'polling', 'paused', 'stopped', 'interrupted'}),
     'polling':       frozenset({'executing', 'idle', 'checkpointing', 'interrupted', 'paused', 'stopped'}),
     'executing':     frozenset({'polling', 'checkpointing', 'idle', 'interrupted', 'paused'}),
@@ -45,6 +46,8 @@ def validate_runtime_transition(old_state: str, new_state: str) -> None:
         raise TransitionError(f"Unknown source state: '{old_state}'")
     if new_state not in VALID_RUNTIME_STATES:
         raise TransitionError(f"Unknown target state: '{new_state}'")
+    if old_state == new_state:
+        raise TransitionError(f"Self-transition on '{old_state}' is not permitted")
     if not can_transition(old_state, new_state):
         valid = sorted(VALID_RUNTIME_TRANSITIONS[old_state])
         label = valid if valid else ['(none — terminal state)']
@@ -60,6 +63,12 @@ class RuntimeConfig:
     poll_interval_s: float = 0.0
     max_retries: int = 3
     checkpoint_every: int = 1
+
+    def __post_init__(self) -> None:
+        if self.checkpoint_every < 1:
+            raise ValueError(
+                f"checkpoint_every must be >= 1, got {self.checkpoint_every}"
+            )
 
     def to_dict(self) -> dict:
         return {

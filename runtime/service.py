@@ -40,6 +40,8 @@ def count_task_retries(orchestration_db: str, task_id: int) -> int:
     """Count how many times this task has been retried (failed → ready transitions)."""
     conn = sqlite3.connect(orchestration_db)
     conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA foreign_keys=ON')
     try:
         row = conn.execute(
             "SELECT COUNT(*) AS cnt FROM task_lineage"

@@ -106,6 +106,19 @@ def test_restore_from_checkpoint_is_copy(tmp_path):
     assert cp.state['x'] == 1
 
 
+def test_restore_from_checkpoint_deep_copy(tmp_path):
+    """Nested mutations in restored dict must not propagate to checkpoint state."""
+    db = _db(tmp_path)
+    rt = _runtime(db)
+    state = {'metrics': {'count': 5, 'labels': ['a', 'b']}}
+    cp = create_checkpoint(db, rt.id, 1, state, 'r')
+    restored = restore_from_checkpoint(cp)
+    restored['metrics']['count'] = 999
+    restored['metrics']['labels'].append('c')
+    assert cp.state['metrics']['count'] == 5
+    assert cp.state['metrics']['labels'] == ['a', 'b']
+
+
 def test_restore_from_checkpoint_pure(tmp_path):
     """restore_from_checkpoint does not write to any database."""
     db = _db(tmp_path)

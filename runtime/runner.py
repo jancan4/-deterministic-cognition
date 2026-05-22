@@ -164,38 +164,59 @@ def pause_runtime(
     state_db: str,
     runtime_id: int,
     reason: str,
-    iteration: int = 0,
+    iteration: Optional[int] = None,
 ) -> Runtime:
-    """Transition a running runtime to paused from any pauseable state."""
+    """
+    Transition a runtime to paused from any pauseable state.
+
+    If iteration is not supplied, the current_iteration stored in the DB is
+    preserved in lineage rather than silently resetting to 0.
+    """
     rt = get_runtime(state_db, runtime_id)
+    eff_iter = rt.current_iteration if iteration is None else iteration
     return transition_runtime(state_db, runtime_id, 'paused',
-                              reason=reason, iteration=iteration)
+                              reason=reason, iteration=eff_iter)
 
 
 def stop_runtime(
     state_db: str,
     runtime_id: int,
     reason: str,
-    iteration: int = 0,
+    iteration: Optional[int] = None,
 ) -> Runtime:
-    """Transition a runtime to the terminal stopped state."""
+    """
+    Transition a runtime to the terminal stopped state.
+
+    If iteration is not supplied, the current_iteration stored in the DB is
+    preserved in lineage rather than silently resetting to 0.
+    """
+    rt = get_runtime(state_db, runtime_id)
+    eff_iter = rt.current_iteration if iteration is None else iteration
     return transition_runtime(state_db, runtime_id, 'stopped',
-                              reason=reason, iteration=iteration)
+                              reason=reason, iteration=eff_iter)
 
 
 def recover_runtime(
     state_db: str,
     runtime_id: int,
     reason: str,
-    iteration: int = 0,
+    iteration: Optional[int] = None,
 ) -> Runtime:
-    """Transition an interrupted or failed runtime to recovering → idle."""
+    """
+    Transition an interrupted or failed runtime through recovering → idle.
+
+    If already in recovering state, skips the first transition but still
+    records the caller's reason in the recovering → idle lineage event.
+    If iteration is not supplied, current_iteration from the DB is preserved.
+    """
     rt = get_runtime(state_db, runtime_id)
+    eff_iter = rt.current_iteration if iteration is None else iteration
     if rt.state != 'recovering':
         transition_runtime(state_db, runtime_id, 'recovering',
-                           reason=reason, iteration=iteration)
+                           reason=reason, iteration=eff_iter)
     return transition_runtime(state_db, runtime_id, 'idle',
-                              reason='Recovery complete', iteration=iteration)
+                              reason=f'Recovery complete — {reason}',
+                              iteration=eff_iter)
 
 
 def resume_runtime(

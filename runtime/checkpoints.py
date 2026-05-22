@@ -5,6 +5,7 @@ All state serialization uses sort_keys=True to maintain determinism across
 Python versions and dict ordering. Restoration is a pure function — it never
 writes to any database.
 """
+import copy
 import json
 from typing import Any, Dict
 
@@ -34,5 +35,8 @@ def restore_from_checkpoint(checkpoint: Checkpoint) -> Dict[str, Any]:
 
     Pure function — reads from the in-memory Checkpoint object, writes
     nothing. The caller decides what to do with the restored state.
+
+    Returns a deep copy so the caller cannot mutate nested structures in the
+    Checkpoint's in-memory state dict.
     """
-    return dict(checkpoint.state)
+    return copy.deepcopy(checkpoint.state)

@@ -343,6 +343,63 @@ def test_resume_runtime_invalid_from_stopped(tmp_path):
 # service layer integration
 # ---------------------------------------------------------------------------
 
+def test_runtime_config_checkpoint_every_zero_rejected(tmp_path):
+    with pytest.raises(ValueError, match='checkpoint_every'):
+        RuntimeConfig(actor='a', checkpoint_every=0)
+
+
+def test_runtime_config_checkpoint_every_negative_rejected(tmp_path):
+    with pytest.raises(ValueError, match='checkpoint_every'):
+        RuntimeConfig(actor='a', checkpoint_every=-1)
+
+
+def test_runtime_config_checkpoint_every_one_accepted(tmp_path):
+    cfg = RuntimeConfig(actor='a', checkpoint_every=1)
+    assert cfg.checkpoint_every == 1
+
+
+def test_recover_runtime_reason_in_lineage(tmp_path):
+    from runtime.state_store import transition_runtime
+    rt_db = _rt_db(tmp_path)
+    orch_db = _orch_db(tmp_path)
+    rt = _runtime(rt_db, orch_db)
+    transition_runtime(rt_db, rt.id, 'idle', reason='r', iteration=0)
+    transition_runtime(rt_db, rt.id, 'interrupted', reason='crash', iteration=3)
+    recover_runtime(rt_db, rt.id, reason='post-crash recovery')
+    lineage = get_runtime_lineage(rt_db, rt.id)
+    # The recovering → idle lineage event must include the caller reason.
+    idle_event = lineage[-1]
+    assert idle_event.new_state == 'idle'
+    assert 'post-crash recovery' in idle_event.reason
+
+
+def test_pause_runtime_preserves_iteration_in_lineage(tmp_path):
+    from runtime.state_store import transition_runtime
+    rt_db = _rt_db(tmp_path)
+    orch_db = _orch_db(tmp_path)
+    rt = _runtime(rt_db, orch_db)
+    transition_runtime(rt_db, rt.id, 'idle', reason='r', iteration=5)
+    pause_runtime(rt_db, rt.id, reason='manual pause')
+    lineage = get_runtime_lineage(rt_db, rt.id)
+    pause_event = lineage[-1]
+    assert pause_event.new_state == 'paused'
+    assert pause_event.iteration == 5
+
+
+def test_stop_runtime_preserves_iteration_in_lineage(tmp_path):
+    from runtime.state_store import transition_runtime
+    rt_db = _rt_db(tmp_path)
+    orch_db = _orch_db(tmp_path)
+    rt = _runtime(rt_db, orch_db)
+    transition_runtime(rt_db, rt.id, 'idle', reason='r', iteration=7)
+    transition_runtime(rt_db, rt.id, 'paused', reason='r', iteration=7)
+    stop_runtime(rt_db, rt.id, reason='shutdown')
+    lineage = get_runtime_lineage(rt_db, rt.id)
+    stop_event = lineage[-1]
+    assert stop_event.new_state == 'stopped'
+    assert stop_event.iteration == 7
+
+
 def test_count_task_retries_zero_initially(tmp_path):
     from runtime.service import count_task_retries
     orch_db = _orch_db(tmp_path)

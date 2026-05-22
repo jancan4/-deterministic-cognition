@@ -160,6 +160,22 @@ def test_transition_runtime_invalid_raises(tmp_path):
         transition_runtime(db, rt.id, 'completed', reason='bad', iteration=0)
 
 
+def test_transition_runtime_self_transition_raises(tmp_path):
+    db = _db(tmp_path)
+    rt = register_runtime(db, 'r', '/o.db', _cfg())
+    transition_runtime(db, rt.id, 'idle', reason='r', iteration=0)
+    with pytest.raises(TransitionError, match='Self-transition'):
+        transition_runtime(db, rt.id, 'idle', reason='no-op', iteration=0)
+
+
+def test_transition_runtime_initialized_to_interrupted_raises(tmp_path):
+    """initialized → interrupted is not a valid arc — nothing ran to be interrupted."""
+    db = _db(tmp_path)
+    rt = register_runtime(db, 'r', '/o.db', _cfg())
+    with pytest.raises(TransitionError):
+        transition_runtime(db, rt.id, 'interrupted', reason='bad', iteration=0)
+
+
 def test_transition_runtime_terminal_raises(tmp_path):
     db = _db(tmp_path)
     rt = register_runtime(db, 'r', '/o.db', _cfg())
