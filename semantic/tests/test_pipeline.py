@@ -259,29 +259,52 @@ class TestSemanticPipelineResultSerialisation:
 # ---------------------------------------------------------------------------
 
 class TestEnrichChunksWithSemantic:
+    """
+    enrich_chunks_with_semantic() returns List[SemanticPipelineResult], one per
+    chunk (skipping invalid/empty chunks). Callers flatten candidates via:
+        [c for r in results for c in r.candidates]
+    """
+
     def test_empty_chunks_returns_empty(self):
         result = enrich_chunks_with_semantic([], StubModelAdapter())
         assert result == []
 
-    def test_one_chunk_returns_candidates(self):
+    def test_returns_pipeline_results_not_candidates(self):
         chunk = _make_chunk('The Federal Reserve held interest rates steady.')
-        result = enrich_chunks_with_semantic([chunk], StubModelAdapter())
-        assert len(result) >= 1
+        results = enrich_chunks_with_semantic([chunk], StubModelAdapter())
+        assert len(results) == 1
+        assert isinstance(results[0], SemanticPipelineResult)
 
-    def test_multiple_chunks(self):
+    def test_one_chunk_has_candidates(self):
+        chunk = _make_chunk('The Federal Reserve held interest rates steady.')
+        results = enrich_chunks_with_semantic([chunk], StubModelAdapter())
+        candidates = [c for r in results for c in r.candidates]
+        assert len(candidates) >= 1
+
+    def test_multiple_chunks_returns_one_result_per_chunk(self):
         chunks = [
             _make_chunk('The Fed held rates.', chunk_index=0),
             _make_chunk('The ECB raised rates.', chunk_index=1),
         ]
-        result = enrich_chunks_with_semantic(chunks, StubModelAdapter())
-        assert len(result) >= 2  # at least one candidate per chunk
+        results = enrich_chunks_with_semantic(chunks, StubModelAdapter())
+        assert len(results) == 2
+
+    def test_multiple_chunks_flat_candidates(self):
+        chunks = [
+            _make_chunk('The Fed held rates.', chunk_index=0),
+            _make_chunk('The ECB raised rates.', chunk_index=1),
+        ]
+        results = enrich_chunks_with_semantic(chunks, StubModelAdapter())
+        candidates = [c for r in results for c in r.candidates]
+        assert len(candidates) >= 2
 
     def test_all_candidates_proposed(self):
         chunk = _make_chunk()
-        result = enrich_chunks_with_semantic([chunk], StubModelAdapter())
-        for c in result:
-            assert c.status == 'proposed'
-            assert c.committed_id is None
+        results = enrich_chunks_with_semantic([chunk], StubModelAdapter())
+        for r in results:
+            for c in r.candidates:
+                assert c.status == 'proposed'
+                assert c.committed_id is None
 
     def test_no_database_write(self):
         import os, tempfile
@@ -296,35 +319,46 @@ class TestEnrichChunksWithSemantic:
 
     def test_custom_event_type(self):
         chunk = _make_chunk()
-        result = enrich_chunks_with_semantic(
+        results = enrich_chunks_with_semantic(
             [chunk], StubModelAdapter(), event_type='regime_observation'
         )
-        for c in result:
-            assert c.event_type == 'regime_observation'
+        for r in results:
+            for c in r.candidates:
+                assert c.event_type == 'regime_observation'
 
     def test_custom_created_by(self):
         chunk = _make_chunk()
-        result = enrich_chunks_with_semantic(
+        results = enrich_chunks_with_semantic(
             [chunk], StubModelAdapter(), created_by='test-enricher'
         )
-        for c in result:
-            assert c.created_by == 'test-enricher'
+        for r in results:
+            for c in r.candidates:
+                assert c.created_by == 'test-enricher'
 
     def test_echo_adapter_integration(self):
         chunk = _make_chunk('Federal Reserve ECB USD rates decision.')
-        result = enrich_chunks_with_semantic([chunk], EchoModelAdapter())
-        # EchoModelAdapter may or may not generate candidates depending on content
-        assert isinstance(result, list)
+        results = enrich_chunks_with_semantic([chunk], EchoModelAdapter())
+        assert isinstance(results, list)
 
     def test_source_id_from_chunk(self):
         chunk = _make_chunk('text', source_id='my-source-001')
-        result = enrich_chunks_with_semantic([chunk], StubModelAdapter())
-        # Source_id should flow through into candidate source attribution
-        assert isinstance(result, list)
+        results = enrich_chunks_with_semantic([chunk], StubModelAdapter())
+        assert isinstance(results, list)
 
     def test_default_task_type_is_memory_candidate_classification(self):
-        """Default task_type flows correctly to pipeline."""
+        """Default task_type flows correctly to pipeline — no SemanticValidationError."""
         chunk = _make_chunk()
-        # Should not raise — memory_candidate_classification is approved
-        result = enrich_chunks_with_semantic([chunk], StubModelAdapter())
-        assert isinstance(result, list)
+        results = enrich_chunks_with_semantic([chunk], StubModelAdapter())
+        assert isinstance(results, list)
+
+    def test_each_result_carries_execution_result(self):
+        chunk = _make_chunk()
+        results = enrich_chunks_with_semantic([chunk], StubModelAdapter())
+        assert len(results) == 1
+        assert results[0].execution_result.adapter_name == 'stub'
+
+    def test_each_result_carries_task(self):
+        chunk = _make_chunk('some text here')
+        results = enrich_chunks_with_semantic([chunk], StubModelAdapter())
+        assert len(results) == 1
+        assert results[0].task.input_text == 'some text here'
