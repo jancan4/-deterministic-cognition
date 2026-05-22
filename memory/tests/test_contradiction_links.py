@@ -552,3 +552,65 @@ class TestDetectConflictsV8:
         update_status(db, e1.id, 'deprecated', reason='obsolete', created_by='op')
         issues = detect_conflicts(db)
         assert len(issues) == 0
+
+
+# ---------------------------------------------------------------------------
+# Generic link hardening — link_memory_events rejects contradicts
+# ---------------------------------------------------------------------------
+
+class TestLinkMemoryEventsHardening:
+    def test_contradicts_raises_validation_error(self, db):
+        e1 = _add(db, title='E1')
+        e2 = _add(db, title='E2')
+        with pytest.raises(ValidationError):
+            link_memory_events(db, e1.id, e2.id, 'contradicts')
+
+    def test_error_message_references_create_contradiction_link(self, db):
+        e1 = _add(db, title='E1')
+        e2 = _add(db, title='E2')
+        with pytest.raises(ValidationError, match="create_contradiction_link"):
+            link_memory_events(db, e1.id, e2.id, 'contradicts')
+
+    def test_no_row_inserted_on_rejected_contradicts(self, db):
+        e1 = _add(db, title='E1')
+        e2 = _add(db, title='E2')
+        before = _raw(db, 'SELECT COUNT(*) AS n FROM memory_links')['n']
+        try:
+            link_memory_events(db, e1.id, e2.id, 'contradicts')
+        except ValidationError:
+            pass
+        after = _raw(db, 'SELECT COUNT(*) AS n FROM memory_links')['n']
+        assert after == before
+
+    def test_no_memory_event_mutation_on_rejected_contradicts(self, db):
+        e1 = _add(db, title='E1')
+        e2 = _add(db, title='E2')
+        before1 = _raw(db, 'SELECT version, status FROM memory_events WHERE id=?', (e1.id,))
+        before2 = _raw(db, 'SELECT version, status FROM memory_events WHERE id=?', (e2.id,))
+        try:
+            link_memory_events(db, e1.id, e2.id, 'contradicts')
+        except ValidationError:
+            pass
+        after1 = _raw(db, 'SELECT version, status FROM memory_events WHERE id=?', (e1.id,))
+        after2 = _raw(db, 'SELECT version, status FROM memory_events WHERE id=?', (e2.id,))
+        assert before1['version'] == after1['version']
+        assert before2['version'] == after2['version']
+
+    def test_non_contradicts_relationships_still_work(self, db):
+        e1 = _add(db, title='E1')
+        e2 = _add(db, title='E2')
+        for rel in ('supports', 'supersedes', 'refines', 'derived_from',
+                    'related_to', 'blocks', 'depends_on'):
+            e_a = _add(db, title=f'A-{rel}')
+            e_b = _add(db, title=f'B-{rel}')
+            lnk = link_memory_events(db, e_a.id, e_b.id, rel)
+            assert lnk.relationship == rel
+
+    def test_create_contradiction_link_still_works_after_hardening(self, db):
+        e1 = _add(db, title='E1')
+        e2 = _add(db, title='E2')
+        link = create_contradiction_link(
+            db, e1.id, e2.id, created_by='op', reason='conflict', link_confidence=3,
+        )
+        assert link.relationship == 'contradicts'
+        assert link.status == 'active'

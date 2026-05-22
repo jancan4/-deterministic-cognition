@@ -419,7 +419,7 @@ class TestLinkMemoryEvents:
         assert lnk.target_id == e2.id
         assert lnk.relationship == 'supports'
 
-    @pytest.mark.parametrize('rel', VALID_RELATIONSHIPS)
+    @pytest.mark.parametrize('rel', [r for r in VALID_RELATIONSHIPS if r != 'contradicts'])
     def test_all_valid_relationships(self, db, rel):
         e1 = _add(db)
         e2 = _add(db)
@@ -443,8 +443,14 @@ class TestLinkMemoryEvents:
         e1 = _add(db)
         e2 = _add(db)
         service.link_memory_events(db, e1.id, e2.id, 'supports')
-        lnk2 = service.link_memory_events(db, e1.id, e2.id, 'contradicts')
-        assert lnk2.relationship == 'contradicts'
+        lnk2 = service.link_memory_events(db, e1.id, e2.id, 'refines')
+        assert lnk2.relationship == 'refines'
+
+    def test_contradicts_relationship_rejected_by_generic_api(self, db):
+        e1 = _add(db)
+        e2 = _add(db)
+        with pytest.raises(service.ValidationError, match="create_contradiction_link"):
+            service.link_memory_events(db, e1.id, e2.id, 'contradicts')
 
     def test_source_not_found(self, db):
         e = _add(db)

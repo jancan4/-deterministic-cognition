@@ -156,7 +156,7 @@ class TestReviewConflicts:
         service.init_db(db)
         e1 = _add(db, status='accepted')
         e2 = _add(db, status='accepted')
-        service.link_memory_events(db, e1.id, e2.id, 'contradicts')
+        service.create_contradiction_link(db, e1.id, e2.id, created_by='tester', reason='conflict', link_confidence=3)
         issues = review_conflicts(db)
         assert len(issues) == 1
         assert issues[0].issue_type == 'conflicting_active'
@@ -167,8 +167,8 @@ class TestReviewConflicts:
         e1 = _add(db, status='accepted')
         e2 = _add(db, status='accepted')
         e3 = _add(db, status='accepted')
-        service.link_memory_events(db, e2.id, e3.id, 'contradicts')
-        service.link_memory_events(db, e1.id, e3.id, 'contradicts')
+        service.create_contradiction_link(db, e2.id, e3.id, created_by='tester', reason='conflict', link_confidence=3)
+        service.create_contradiction_link(db, e1.id, e3.id, created_by='tester', reason='conflict', link_confidence=3)
         issues = review_conflicts(db)
         ids = [i.memory_id for i in issues]
         assert ids == sorted(ids)
@@ -341,7 +341,7 @@ class TestReviewQueue:
         service.init_db(db)
         e1 = _add(db, status='accepted')
         e2 = _add(db, status='accepted')
-        service.link_memory_events(db, e1.id, e2.id, 'contradicts')
+        service.create_contradiction_link(db, e1.id, e2.id, created_by='tester', reason='conflict', link_confidence=3)
         queue = get_review_queue(db)
         assert len(queue.conflicts) == 1
 
@@ -400,8 +400,8 @@ class TestDeterministicOrdering:
         e1 = _add(db, status='accepted')
         e2 = _add(db, status='accepted')
         e3 = _add(db, status='accepted')
-        service.link_memory_events(db, e1.id, e2.id, 'contradicts')
-        service.link_memory_events(db, e2.id, e3.id, 'contradicts')
+        service.create_contradiction_link(db, e1.id, e2.id, created_by='tester', reason='conflict', link_confidence=3)
+        service.create_contradiction_link(db, e2.id, e3.id, created_by='tester', reason='conflict', link_confidence=3)
         r1 = [i.memory_id for i in review_conflicts(db)]
         r2 = [i.memory_id for i in review_conflicts(db)]
         assert r1 == r2

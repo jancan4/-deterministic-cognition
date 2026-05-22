@@ -384,6 +384,11 @@ def link_memory_events(
     target_id: int,
     relationship: str,
 ) -> MemoryLink:
+    if relationship == 'contradicts':
+        raise ValidationError(
+            "Cannot create a 'contradicts' link via link_memory_events(). "
+            "Use create_contradiction_link() to ensure provenance is recorded."
+        )
     if relationship not in VALID_RELATIONSHIPS:
         raise ValidationError(f"Invalid relationship '{relationship}'. Valid: {VALID_RELATIONSHIPS}")
 

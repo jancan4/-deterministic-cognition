@@ -170,7 +170,7 @@ class TestDetectConflicts:
         service.init_db(db)
         e1 = _add(db, status='accepted')
         e2 = _add(db, status='accepted')
-        service.link_memory_events(db, e1.id, e2.id, 'contradicts')
+        service.create_contradiction_link(db, e1.id, e2.id, created_by='tester', reason='conflict', link_confidence=3)
         issues = detect_conflicts(db)
         assert len(issues) == 1
         assert issues[0].issue_type == 'conflicting_active'
@@ -180,8 +180,9 @@ class TestDetectConflicts:
         db = str(tmp_path / 'mem.db')
         service.init_db(db)
         e1 = _add(db, status='accepted')
-        e2 = _add(db, status='superseded')
-        service.link_memory_events(db, e1.id, e2.id, 'contradicts')
+        e2 = _add(db, status='accepted')
+        service.create_contradiction_link(db, e1.id, e2.id, created_by='tester', reason='conflict', link_confidence=3)
+        service.update_status(db, e2.id, 'superseded', reason='test supersession', created_by='tester')
         assert detect_conflicts(db) == []
 
     def test_no_conflict_for_supports_link(self, tmp_path):
@@ -197,7 +198,7 @@ class TestDetectConflicts:
         service.init_db(db)
         e1 = _add(db, status='accepted')
         e2 = _add(db, status='accepted')
-        service.link_memory_events(db, e1.id, e2.id, 'contradicts')
+        service.create_contradiction_link(db, e1.id, e2.id, created_by='tester', reason='conflict', link_confidence=3)
         issues = detect_conflicts(db)
         assert issues[0].memory_id == e1.id
 
@@ -207,8 +208,8 @@ class TestDetectConflicts:
         e1 = _add(db, status='accepted')
         e2 = _add(db, status='accepted')
         e3 = _add(db, status='accepted')
-        service.link_memory_events(db, e2.id, e3.id, 'contradicts')
-        service.link_memory_events(db, e1.id, e3.id, 'contradicts')
+        service.create_contradiction_link(db, e2.id, e3.id, created_by='tester', reason='conflict', link_confidence=3)
+        service.create_contradiction_link(db, e1.id, e3.id, created_by='tester', reason='conflict', link_confidence=3)
         issues = detect_conflicts(db)
         ids = [i.memory_id for i in issues]
         assert ids == sorted(ids)
@@ -786,7 +787,7 @@ class TestSeverityAssignment:
         service.init_db(db)
         e1 = _add(db, status='accepted')
         e2 = _add(db, status='accepted')
-        service.link_memory_events(db, e1.id, e2.id, 'contradicts')
+        service.create_contradiction_link(db, e1.id, e2.id, created_by='tester', reason='conflict', link_confidence=3)
         issues = detect_conflicts(db)
         assert issues[0].severity == 'critical'
 
