@@ -33,23 +33,16 @@ ID derivation
 input_hash lets you find all runs for a given text across adapters; run_id
 differentiates them by adapter identity.
 
-KNOWN LIMITATION — continuity bundle portability
--------------------------------------------------
-The continuity bundle exporter (continuity/exporter.py) does not yet export
-semantic_execution_runs or semantic_candidate_events. Therefore:
+Continuity bundle portability
+------------------------------
+As of schema 1.1, continuity/exporter.py exports semantic_execution_runs and
+semantic_candidate_events for all promoted candidates. Import via
+continuity/importer.py restores the full semantic provenance chain.
 
-  - promoted memory_events are portable across substrates (the event row is
-    in the bundle; the evidence string is preserved).
-  - evidence strings (semantic:<adapter> | run:<run_id> | candidate:<id>)
-    are portable — they are stored in memory_events.evidence.
-  - full semantic provenance (normalized_result_json, source_span, provenance)
-    is NOT portable — it lives only in the source system's ledger tables.
-  - replay of semantic candidate generation is source-system-local only until
-    semantic ledger bundle support is added to continuity/exporter.py and
-    continuity/importer.py.
-
-This is an explicit, accepted milestone limitation. Bundle portability for
-the ledger tables is planned as a follow-on milestone.
+  - promoted memory_events: portable (schema 1.0+)
+  - evidence strings (semantic:<adapter> | run:<run_id> | candidate:<id>): portable (1.0+)
+  - full semantic provenance (normalized_result, source_span, provenance): portable (1.1+)
+  - unpromoted/rejected candidates: source-system-local only (never bundled)
 
 Governing invariants
 --------------------

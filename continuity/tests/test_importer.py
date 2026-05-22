@@ -280,3 +280,132 @@ class TestNoMutation:
                 import_bundle(bundle, dst_db)
         finally:
             os.chmod(dst_db, 0o644)
+
+
+# ---------------------------------------------------------------------------
+# Semantic ledger portability (schema 1.1)
+# ---------------------------------------------------------------------------
+
+def _init_ledger_db(db_path: str) -> None:
+    from memory import service as mem_service
+    from sources.registry import init_registry
+    from ingestion.runs import init_run_ledger
+    from semantic.ledger import init_ledger
+    mem_service.init_db(db_path)
+    init_registry(db_path)
+    init_run_ledger(db_path)
+    init_ledger(db_path)
+
+
+def _promote_candidate(db_path: str, text: str = 'The Fed held rates.') -> tuple:
+    """Run, record, and promote one semantic candidate. Returns (run_id, cid, mid)."""
+    from models.adapters import StubModelAdapter
+    from semantic.pipeline import run_semantic_task
+    from semantic.ledger import record_run, derive_candidate_id, promote_candidate
+    _init_ledger_db(db_path)
+    pr = run_semantic_task('tagging', text, StubModelAdapter())
+    record_run(db_path, pr)
+    run_id = pr.execution_result.request_id
+    cid = derive_candidate_id(run_id, 0)
+    mid = promote_candidate(db_path, cid, approved_by='test')
+    return run_id, cid, mid
+
+
+class TestSemanticLedgerRoundtrip:
+    def test_promoted_candidate_survives_roundtrip(self, tmp_path):
+        src_db = str(tmp_path / 'src.db')
+        dst_db = str(tmp_path / 'dst.db')
+        run_id, cid, mid = _promote_candidate(src_db)
+        bundle = export_bundle(src_db)
+        result = import_bundle(bundle, dst_db)
+        assert result.success
+        assert result.imported_semantic_candidate_events == 1
+        assert result.imported_semantic_execution_runs == 1
+
+    def test_semantic_run_row_present_in_dst(self, tmp_path):
+        src_db = str(tmp_path / 'src.db')
+        dst_db = str(tmp_path / 'dst.db')
+        run_id, cid, mid = _promote_candidate(src_db)
+        bundle = export_bundle(src_db)
+        import_bundle(bundle, dst_db)
+        assert _count_table(dst_db, 'semantic_execution_runs') == 1
+
+    def test_semantic_candidate_row_present_in_dst(self, tmp_path):
+        src_db = str(tmp_path / 'src.db')
+        dst_db = str(tmp_path / 'dst.db')
+        run_id, cid, mid = _promote_candidate(src_db)
+        bundle = export_bundle(src_db)
+        import_bundle(bundle, dst_db)
+        assert _count_table(dst_db, 'semantic_candidate_events') == 1
+
+    def test_candidate_promoted_memory_id_preserved(self, tmp_path):
+        src_db = str(tmp_path / 'src.db')
+        dst_db = str(tmp_path / 'dst.db')
+        run_id, cid, mid = _promote_candidate(src_db)
+        bundle = export_bundle(src_db)
+        import_bundle(bundle, dst_db)
+        conn = sqlite3.connect(dst_db)
+        row = conn.execute(
+            "SELECT promoted_memory_id FROM semantic_candidate_events WHERE candidate_id = ?", (cid,)
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row[0] == mid
+
+    def test_second_import_skips_semantic_rows(self, tmp_path):
+        src_db = str(tmp_path / 'src.db')
+        dst_db = str(tmp_path / 'dst.db')
+        _promote_candidate(src_db)
+        bundle = export_bundle(src_db)
+        import_bundle(bundle, dst_db)
+        result2 = import_bundle(bundle, dst_db)
+        assert result2.success
+        assert result2.imported_semantic_execution_runs == 0
+        assert result2.imported_semantic_candidate_events == 0
+        assert result2.skipped_semantic_execution_runs == 1
+        assert result2.skipped_semantic_candidate_events == 1
+
+    def test_dry_run_reports_semantic_counts(self, tmp_path):
+        src_db = str(tmp_path / 'src.db')
+        dst_db = str(tmp_path / 'dst.db')
+        _promote_candidate(src_db)
+        bundle = export_bundle(src_db)
+        result = import_bundle(bundle, dst_db, dry_run=True)
+        assert result.dry_run is True
+        assert result.imported_semantic_execution_runs == 1
+        assert result.imported_semantic_candidate_events == 1
+        assert _count_table(dst_db, 'semantic_execution_runs') == 0
+
+    def test_semantic_bundle_validates_on_dst_re_export(self, tmp_path):
+        from continuity.manifest import validate_bundle as vb
+        src_db = str(tmp_path / 'src.db')
+        dst_db = str(tmp_path / 'dst.db')
+        _promote_candidate(src_db)
+        bundle = export_bundle(src_db)
+        import_bundle(bundle, dst_db)
+        re_exported = export_bundle(dst_db)
+        vb(re_exported)  # no exception
+
+    def test_dangling_promoted_memory_id_is_collision(self, tmp_path):
+        """Candidate referencing a memory_event not in bundle or dst → collision."""
+        src_db = str(tmp_path / 'src.db')
+        dst_db = str(tmp_path / 'dst.db')
+        _promote_candidate(src_db)
+        bundle = export_bundle(src_db)
+        # Remove memory_events from bundle → candidate has dangling promoted_memory_id
+        bundle_no_events = dict(bundle)
+        bundle_no_events['memory_events'] = []
+        # Recompute manifest and checksum to make bundle valid structurally
+        from continuity.manifest import build_manifest
+        manifest = build_manifest(
+            bundle={k: v for k, v in bundle_no_events.items() if k != 'manifest'},
+            exported_at=bundle['manifest']['exported_at'],
+            exported_by=bundle['manifest']['exported_by'],
+            filters=bundle['manifest'].get('filters', {}),
+        )
+        bundle_no_events['manifest'] = manifest
+        result = import_bundle(bundle_no_events, dst_db)
+        assert result.has_collisions
+        assert any(
+            c.record_type == 'semantic_candidate_event' for c in result.collisions
+        )

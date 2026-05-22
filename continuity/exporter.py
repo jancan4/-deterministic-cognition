@@ -6,10 +6,12 @@ deterministic bundle. It is strictly read-only — it issues no INSERT, UPDATE,
 or DELETE against any database.
 
 Ordering guarantees (required for checksum stability):
-  memory_events    → ORDER BY id ASC
-  source_documents → ORDER BY path ASC, version ASC
-  ingestion_runs   → ORDER BY started_at ASC, run_id ASC
-  workflow_references → ORDER BY execution_id ASC
+  memory_events             → ORDER BY id ASC
+  source_documents          → ORDER BY path ASC, version ASC
+  ingestion_runs            → ORDER BY started_at ASC, run_id ASC
+  workflow_references       → ORDER BY execution_id ASC
+  semantic_candidate_events → ORDER BY created_at ASC, candidate_id ASC
+  semantic_execution_runs   → ORDER BY started_at ASC, run_id ASC
 """
 import json
 import sqlite3
@@ -197,6 +199,86 @@ def _run_row_to_dict(row) -> dict:
     }
 
 
+def _fetch_semantic_candidates(
+    conn: sqlite3.Connection,
+    memory_events: List[dict],
+) -> List[dict]:
+    """Fetch promoted semantic candidates whose promoted_memory_id is in the exported events."""
+    if not _table_exists(conn, 'semantic_candidate_events') or not memory_events:
+        return []
+    promoted_ids = [e['id'] for e in memory_events]
+    ph = ','.join('?' * len(promoted_ids))
+    rows = conn.execute(
+        f"SELECT * FROM semantic_candidate_events"
+        f" WHERE status = 'promoted' AND promoted_memory_id IN ({ph})"
+        f" ORDER BY created_at ASC, candidate_id ASC",
+        promoted_ids,
+    ).fetchall()
+    return [_sem_cand_row_to_dict(r) for r in rows]
+
+
+def _sem_cand_row_to_dict(row) -> dict:
+    return {
+        'candidate_id': row['candidate_id'],
+        'semantic_run_id': row['semantic_run_id'],
+        'candidate_index': row['candidate_index'],
+        'event_type': row['event_type'],
+        'title': row['title'],
+        'summary': row['summary'],
+        'evidence': row['evidence'],
+        'source': row['source'],
+        'confidence': row['confidence'],
+        'source_id': row['source_id'],
+        'source_span': json.loads(row['source_span_json']) if row['source_span_json'] else None,
+        'extraction_method': row['extraction_method'],
+        'provenance': json.loads(row['provenance_json'] or '{}'),
+        'tags': json.loads(row['tags_json'] or '[]'),
+        'status': row['status'],
+        'promoted_memory_id': row['promoted_memory_id'],
+        'created_at': row['created_at'],
+    }
+
+
+def _fetch_semantic_runs(
+    conn: sqlite3.Connection,
+    semantic_candidates: List[dict],
+) -> List[dict]:
+    """Fetch semantic execution runs referenced by the exported candidates."""
+    if not _table_exists(conn, 'semantic_execution_runs') or not semantic_candidates:
+        return []
+    run_ids = list(dict.fromkeys(c['semantic_run_id'] for c in semantic_candidates))
+    ph = ','.join('?' * len(run_ids))
+    rows = conn.execute(
+        f"SELECT * FROM semantic_execution_runs WHERE run_id IN ({ph})"
+        f" ORDER BY started_at ASC, run_id ASC",
+        run_ids,
+    ).fetchall()
+    return [_sem_run_row_to_dict(r) for r in rows]
+
+
+def _sem_run_row_to_dict(row) -> dict:
+    return {
+        'run_id': row['run_id'],
+        'task_id': row['task_id'],
+        'task_type': row['task_type'],
+        'adapter_name': row['adapter_name'],
+        'adapter_version': row['adapter_version'],
+        'input_hash': row['input_hash'],
+        'input_text': row['input_text'],
+        'source_id': row['source_id'],
+        'source_span': json.loads(row['source_span_json']) if row['source_span_json'] else None,
+        'execution_policy': json.loads(row['execution_policy_json'] or '{}'),
+        'model_metadata': json.loads(row['model_metadata_json'] or '{}'),
+        'raw_output': json.loads(row['raw_output_json']) if row['raw_output_json'] is not None else None,
+        'normalized_result': json.loads(row['normalized_result_json'] or '{}'),
+        'candidate_count': row['candidate_count'],
+        'promoted_count': row['promoted_count'],
+        'status': row['status'],
+        'started_at': row['started_at'],
+        'completed_at': row['completed_at'],
+    }
+
+
 def _fetch_workflow_references(workflow_db_path: str) -> List[dict]:
     """Fetch minimal workflow references from a workflow database."""
     try:
@@ -245,6 +327,8 @@ def export_bundle(
         memory_events = _fetch_memory_events(conn, export_filter)
         source_documents = _fetch_source_documents(conn, memory_events, export_filter)
         ingestion_runs = _fetch_ingestion_runs(conn, source_documents)
+        semantic_candidates = _fetch_semantic_candidates(conn, memory_events)
+        semantic_runs = _fetch_semantic_runs(conn, semantic_candidates)
 
     workflow_references: List[dict] = []
     if workflow_db_path:
@@ -259,6 +343,8 @@ def export_bundle(
         'source_documents': source_documents,
         'ingestion_runs': ingestion_runs,
         'workflow_references': workflow_references,
+        'semantic_execution_runs': semantic_runs,
+        'semantic_candidate_events': semantic_candidates,
     }
 
     manifest = build_manifest(
