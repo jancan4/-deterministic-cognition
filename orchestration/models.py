@@ -25,6 +25,7 @@ VALID_TASK_TYPES = (
     'governance',
     'implementation',
     'report',
+    'semantic_extraction',
 )
 
 VALID_DEPENDENCY_TYPES = (
