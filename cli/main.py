@@ -589,6 +589,47 @@ def build_parser() -> argparse.ArgumentParser:
     irs_p.add_argument('--db', default='memory.db', dest='db', help='Registry database')
     irs_p.add_argument('--run-id', required=True, dest='run_id', help='16-char run_id')
 
+    # export-bundle ------------------------------------------------------
+    eb_p = sub.add_parser(
+        'export-bundle',
+        help='Export a deterministic continuity bundle to JSON',
+    )
+    eb_p.set_defaults(command='export-bundle')
+    eb_p.add_argument('--db', default='memory.db', dest='db', help='Memory database path')
+    eb_p.add_argument('--out', default=None, dest='out', help='Output file (stdout if omitted)')
+    eb_p.add_argument(
+        '--tag', action='append', default=[], dest='tags',
+        metavar='TAG', help='Filter: include only events with this tag (repeatable)',
+    )
+    eb_p.add_argument(
+        '--source-id', action='append', default=[], dest='source_ids',
+        metavar='SOURCE_ID', help='Filter: include only events from this source_id (repeatable)',
+    )
+    eb_p.add_argument(
+        '--unresolved-only', action='store_true', default=False, dest='unresolved_only',
+        help='Filter: include only unresolved/proposed events',
+    )
+    eb_p.add_argument('--since', default=None, dest='since', help='Filter: since ISO-8601 timestamp (inclusive)')
+    eb_p.add_argument('--until', default=None, dest='until', help='Filter: until ISO-8601 timestamp (inclusive)')
+    eb_p.add_argument(
+        '--workflow-db', default=None, dest='workflow_db',
+        help='Optional workflow database path for workflow_references section',
+    )
+    eb_p.add_argument('--exported-by', default='fx-orchestration-system', dest='exported_by')
+
+    # import-bundle ------------------------------------------------------
+    ib_p = sub.add_parser(
+        'import-bundle',
+        help='Import a continuity bundle into a database',
+    )
+    ib_p.set_defaults(command='import-bundle')
+    ib_p.add_argument('--db', default='memory.db', dest='db', help='Target memory database path')
+    ib_p.add_argument('--path', required=True, dest='path', help='Path to bundle JSON file')
+    ib_p.add_argument(
+        '--dry-run', action='store_true', default=False, dest='dry_run',
+        help='Validate and plan import without writing anything',
+    )
+
     return parser
 
 
@@ -762,6 +803,101 @@ def cmd_sources_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export_bundle(args: argparse.Namespace) -> int:
+    import json
+    from continuity.exporter import export_bundle
+    from continuity.models import ExportFilter
+
+    export_filter = None
+    f = ExportFilter(
+        tags=args.tags,
+        source_ids=args.source_ids,
+        unresolved_only=args.unresolved_only,
+        since=args.since,
+        until=args.until,
+    )
+    if not f.is_empty():
+        export_filter = f
+
+    try:
+        bundle = export_bundle(
+            db_path=args.db,
+            export_filter=export_filter,
+            workflow_db_path=args.workflow_db,
+            exported_by=args.exported_by,
+        )
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    serialized = json.dumps(bundle, sort_keys=True, indent=2)
+    if args.out:
+        with open(args.out, 'w') as fh:
+            fh.write(serialized)
+            fh.write('\n')
+        manifest = bundle['manifest']
+        print(
+            f"Exported bundle {manifest['bundle_id']!r}: "
+            f"{manifest['memory_event_count']} events, "
+            f"{manifest['source_count']} sources → {args.out}"
+        )
+    else:
+        print(serialized)
+
+    return 0
+
+
+def cmd_import_bundle(args: argparse.Namespace) -> int:
+    import json
+    from continuity.importer import import_bundle
+    from continuity.manifest import BundleValidationError
+
+    try:
+        with open(args.path) as fh:
+            bundle_dict = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"ERROR reading bundle: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        result = import_bundle(bundle_dict, args.db, dry_run=args.dry_run)
+    except BundleValidationError as exc:
+        print(f"ERROR: bundle validation failed: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+
+    if result.has_collisions:
+        print(
+            f"\nImport refused: {len(result.collisions)} collision(s) detected. "
+            f"No records written.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.dry_run:
+        print(
+            f"\nDry-run complete: would import "
+            f"{result.imported_memory_events} events, "
+            f"{result.imported_source_documents} sources, "
+            f"{result.imported_ingestion_runs} runs. "
+            f"No writes made."
+        )
+    else:
+        print(
+            f"\nImported: "
+            f"{result.imported_memory_events} events, "
+            f"{result.imported_source_documents} sources, "
+            f"{result.imported_ingestion_runs} runs. "
+            f"Skipped: {result.skipped_memory_events} events."
+        )
+
+    return 0
+
+
 def main(argv: List[str] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -779,6 +915,8 @@ def main(argv: List[str] = None) -> int:
         'sources-show': cmd_sources_show,
         'ingestion-runs': cmd_ingestion_runs,
         'ingestion-run-show': cmd_ingestion_run_show,
+        'export-bundle': cmd_export_bundle,
+        'import-bundle': cmd_import_bundle,
     }
     return dispatch[args.command](args)
 
