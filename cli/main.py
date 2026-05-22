@@ -513,6 +513,53 @@ def build_parser() -> argparse.ArgumentParser:
         choices=['authoritative', 'high', 'medium', 'low', 'unknown'],
         help='Authority tier for registry (default: unknown)',
     )
+    if_p.add_argument(
+        '--semantic-adapter', default=None, dest='semantic_adapter',
+        metavar='ADAPTER',
+        help='Optional: enrich candidates using this semantic adapter (stub|echo)',
+    )
+
+    # semantic-run -------------------------------------------------------
+    sr2_p = sub.add_parser(
+        'semantic-run',
+        help='Run a deterministic semantic extraction task via a registered adapter',
+    )
+    sr2_p.set_defaults(command='semantic-run')
+    input_group = sr2_p.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        '--input-text', default=None, dest='input_text',
+        metavar='TEXT', help='Inline input text',
+    )
+    input_group.add_argument(
+        '--input-file', default=None, dest='input_file',
+        metavar='PATH', help='Path to input text file',
+    )
+    sr2_p.add_argument(
+        '--task-type', required=True, dest='task_type',
+        choices=[
+            'tagging', 'polarity_classification', 'entity_extraction',
+            'claim_extraction', 'relation_extraction', 'summary_extraction',
+            'clustering_hint', 'memory_candidate_classification',
+        ],
+        help='Semantic task type',
+    )
+    sr2_p.add_argument(
+        '--adapter', default='stub', dest='adapter',
+        help='Adapter name (default: stub). Registered: stub, echo',
+    )
+    sr2_p.add_argument(
+        '--format', default='json', dest='format',
+        choices=['json', 'markdown'],
+        help='Output format (default: json)',
+    )
+    sr2_p.add_argument(
+        '--source-id', default=None, dest='source_id',
+        help='Optional source_id for provenance',
+    )
+    sr2_p.add_argument(
+        '--timeout', default=30.0, type=float, dest='timeout',
+        help='Execution timeout in seconds (default: 30)',
+    )
 
     # sources-register ---------------------------------------------------
     sr_p = sub.add_parser(
@@ -708,9 +755,41 @@ def cmd_ingest_file(args: argparse.Namespace) -> int:
     if run_status == 'failed':
         return 1
 
+    # Optional semantic enrichment — candidates only, no extra writes
+    semantic_candidates = []
+    semantic_enrichment_meta: dict = {}
+    semantic_adapter_name = getattr(args, 'semantic_adapter', None)
+    if semantic_adapter_name and result is not None:
+        from models.registry import make_default_registry, AdapterRegistryError
+        from semantic.pipeline import enrich_chunks_with_semantic
+        from ingestion.candidates import commit_candidates as _commit_candidates
+        from memory import service as _mem_service
+        try:
+            sem_registry = make_default_registry()
+            sem_adapter = sem_registry.get(semantic_adapter_name)
+            semantic_candidates = enrich_chunks_with_semantic(
+                result.chunks, sem_adapter,
+            )
+            if args.commit and semantic_candidates:
+                _mem_service.init_db(args.db)
+                _commit_candidates(semantic_candidates, args.db)
+            semantic_enrichment_meta = {
+                'adapter': semantic_adapter_name,
+                'chunk_count': len(result.chunks),
+                'candidate_count': len(semantic_candidates),
+                'committed': args.commit and bool(semantic_candidates),
+            }
+        except AdapterRegistryError as exc:
+            print(f"WARNING: semantic adapter not found: {exc}", file=sys.stderr)
+        except Exception as exc:
+            print(f"WARNING: semantic enrichment failed: {exc}", file=sys.stderr)
+
     output_dict = result.to_dict()
     output_dict['source_registry'] = src_doc.to_dict()
     output_dict['ingestion_run'] = run.to_dict()
+    if semantic_adapter_name:
+        output_dict['semantic_candidates'] = [c.to_dict() for c in semantic_candidates]
+        output_dict['semantic_enrichment'] = semantic_enrichment_meta
     output = json.dumps(output_dict, indent=2, sort_keys=True)
 
     if args.out:
@@ -801,6 +880,63 @@ def cmd_sources_show(args: argparse.Namespace) -> int:
 
     print(json.dumps(doc.to_dict(), indent=2, sort_keys=True))
     return 0
+
+
+def cmd_semantic_run(args: argparse.Namespace) -> int:
+    import json
+    from models.registry import make_default_registry, AdapterRegistryError
+    from models.execution import make_policy
+    from semantic.pipeline import run_semantic_task
+    from semantic.validators import SemanticValidationError
+
+    # Resolve input text
+    if args.input_text:
+        input_text = args.input_text
+    else:
+        try:
+            with open(args.input_file, encoding='utf-8') as fh:
+                input_text = fh.read()
+        except OSError as exc:
+            print(f"ERROR reading input file: {exc}", file=sys.stderr)
+            return 1
+    if not input_text or not input_text.strip():
+        print("ERROR: input text is empty", file=sys.stderr)
+        return 1
+
+    # Resolve adapter
+    registry = make_default_registry()
+    try:
+        adapter = registry.get(args.adapter)
+    except AdapterRegistryError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    # Build policy
+    try:
+        policy = make_policy(timeout_seconds=args.timeout)
+    except Exception as exc:
+        print(f"ERROR: invalid timeout: {exc}", file=sys.stderr)
+        return 1
+
+    # Execute pipeline
+    try:
+        result = run_semantic_task(
+            task_type=args.task_type,
+            input_text=input_text,
+            adapter=adapter,
+            source_id=getattr(args, 'source_id', None),
+            policy=policy,
+        )
+    except SemanticValidationError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if args.format == 'markdown':
+        print(result.to_markdown())
+    else:
+        print(result.to_json())
+
+    return 0 if result.success else 1
 
 
 def cmd_export_bundle(args: argparse.Namespace) -> int:
@@ -917,6 +1053,7 @@ def main(argv: List[str] = None) -> int:
         'ingestion-run-show': cmd_ingestion_run_show,
         'export-bundle': cmd_export_bundle,
         'import-bundle': cmd_import_bundle,
+        'semantic-run': cmd_semantic_run,
     }
     return dispatch[args.command](args)
 
