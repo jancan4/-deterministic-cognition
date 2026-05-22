@@ -278,17 +278,18 @@ def enrich_chunks_with_semantic(
     policy: Optional[ModelExecutionPolicy] = None,
     event_type: str = SEMANTIC_DEFAULT_EVENT_TYPE,
     created_by: str = SEMANTIC_ENRICHMENT_CREATED_BY,
-) -> List['CandidateMemoryEvent']:
+) -> List['SemanticPipelineResult']:
     """
-    Run semantic extraction on each chunk and return CandidateMemoryEvent
-    candidates.
+    Run semantic extraction on each chunk and return one SemanticPipelineResult
+    per chunk (skipping chunks with invalid/empty text).
 
-    Each chunk is treated as a separate SemanticTask. Candidates are
-    generated for chunks that produce non-empty semantic results.
+    Callers that need only the flat candidate list:
+        results = enrich_chunks_with_semantic(chunks, adapter)
+        candidates = [c for r in results for c in r.candidates]
 
-    No database writes. Candidates are all status='proposed'.
+    No database writes. All candidates are status='proposed'.
     """
-    candidates: List['CandidateMemoryEvent'] = []
+    results: List[SemanticPipelineResult] = []
 
     for chunk in chunks:
         try:
@@ -302,9 +303,9 @@ def enrich_chunks_with_semantic(
                 created_by=created_by,
                 generate_candidates=True,
             )
-            candidates.extend(pipeline_result.candidates)
+            results.append(pipeline_result)
         except SemanticValidationError:
             # Skip chunks with invalid/empty text
             continue
 
-    return candidates
+    return results

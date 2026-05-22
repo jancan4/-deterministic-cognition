@@ -14,9 +14,16 @@ Commands:
   sources-show --source-id S Show a single source document record.
   ingestion-runs             List ingestion run records.
   ingestion-run-show --run-id Show a single ingestion run record.
+  semantic-run               Run a deterministic semantic extraction task.
+  semantic-candidates list   List semantic candidate events from the ledger.
+  memory-review list         List memory events pending operator review.
+  memory-review approve      Transition a memory event to active/accepted.
+  memory-review reject       Transition a memory event to rejected.
 
 Lineage is always canonical. The mutable state row is always a cache.
 Session context export is read-only. No memory is mutated.
+Semantic promotion writes memory_events with status=unresolved; approval and
+rejection must go through memory-review and are recorded in memory_revisions.
 """
 import argparse
 import json
@@ -561,6 +568,62 @@ def build_parser() -> argparse.ArgumentParser:
         help='Execution timeout in seconds (default: 30)',
     )
 
+    # semantic-candidates ------------------------------------------------
+    sc_p = sub.add_parser(
+        'semantic-candidates',
+        help='List semantic candidate events from the ledger',
+    )
+    sc_p.set_defaults(command='semantic-candidates')
+    sc_p.add_argument('--db', default='memory.db', help='Database path')
+    sc_p.add_argument('--run-id', default=None, dest='run_id',
+                      help='Filter by semantic run_id')
+    sc_p.add_argument('--status', default=None,
+                      choices=['candidate', 'promoted', 'rejected'],
+                      help='Filter by candidate status')
+    sc_p.add_argument('--source-id', default=None, dest='source_id',
+                      help='Filter by source_id')
+    sc_p.add_argument('--limit', default=100, type=int,
+                      help='Maximum results (default: 100)')
+    sc_p.add_argument('--out', default=None,
+                      help='Write output to file instead of stdout')
+
+    # memory-review ------------------------------------------------------
+    mr_p = sub.add_parser(
+        'memory-review',
+        help='Inspect, approve, or reject memory events pending operator review',
+    )
+    mr_p.set_defaults(command='memory-review')
+    mr_sub = mr_p.add_subparsers(dest='review_subcommand')
+    mr_sub.required = True
+
+    mr_list = mr_sub.add_parser('list', help='List memory events under review')
+    mr_list.add_argument('--db', default='memory.db', help='Database path')
+    mr_list.add_argument('--status', default=None,
+                         help='Filter by status (default: all review statuses)')
+    mr_list.add_argument('--event-type', default=None, dest='event_type',
+                         help='Filter by event_type')
+    mr_list.add_argument('--out', default=None,
+                         help='Write output to file instead of stdout')
+
+    mr_approve = mr_sub.add_parser('approve', help='Approve a memory event')
+    mr_approve.add_argument('--db', default='memory.db', help='Database path')
+    mr_approve.add_argument('--id', required=True, type=int,
+                             help='memory_events.id to approve')
+    mr_approve.add_argument('--by', required=True,
+                             help='Operator identifier (created_by)')
+    mr_approve.add_argument('--status', default='active',
+                             choices=['active', 'accepted'],
+                             help='Target status (default: active)')
+
+    mr_reject = mr_sub.add_parser('reject', help='Reject a memory event')
+    mr_reject.add_argument('--db', default='memory.db', help='Database path')
+    mr_reject.add_argument('--id', required=True, type=int,
+                            help='memory_events.id to reject')
+    mr_reject.add_argument('--by', required=True,
+                            help='Operator identifier (created_by)')
+    mr_reject.add_argument('--reason', required=True,
+                            help='Rejection reason (recorded in memory_revisions)')
+
     # sources-register ---------------------------------------------------
     sr_p = sub.add_parser(
         'sources-register',
@@ -755,29 +818,51 @@ def cmd_ingest_file(args: argparse.Namespace) -> int:
     if run_status == 'failed':
         return 1
 
-    # Optional semantic enrichment — candidates only, no extra writes
+    # Optional semantic enrichment — ledger write always; memory write only with --commit
     semantic_candidates = []
     semantic_enrichment_meta: dict = {}
     semantic_adapter_name = getattr(args, 'semantic_adapter', None)
     if semantic_adapter_name and result is not None:
         from models.registry import make_default_registry, AdapterRegistryError
         from semantic.pipeline import enrich_chunks_with_semantic
-        from ingestion.candidates import commit_candidates as _commit_candidates
+        from semantic.ledger import (
+            init_ledger as _init_ledger,
+            record_run as _record_run,
+            derive_candidate_id,
+            list_candidates as _list_candidates,
+            promote_candidate as _promote_candidate,
+        )
         from memory import service as _mem_service
+        promoted_ids: list = []
         try:
             sem_registry = make_default_registry()
             sem_adapter = sem_registry.get(semantic_adapter_name)
-            semantic_candidates = enrich_chunks_with_semantic(
-                result.chunks, sem_adapter,
-            )
-            if args.commit and semantic_candidates:
+            # enrich_chunks returns List[SemanticPipelineResult] — one per chunk
+            pipeline_results = enrich_chunks_with_semantic(result.chunks, sem_adapter)
+            semantic_candidates = [c for r in pipeline_results for c in r.candidates]
+
+            # Always persist to ledger (idempotent; no memory write)
+            _init_ledger(args.db)
+            for pr in pipeline_results:
+                _record_run(args.db, pr)
+
+            # On --commit: promote each candidate to memory as status='unresolved'
+            if args.commit and pipeline_results:
                 _mem_service.init_db(args.db)
-                _commit_candidates(semantic_candidates, args.db)
+                for pr in pipeline_results:
+                    run_id = pr.execution_result.request_id
+                    for idx in range(len(pr.candidates)):
+                        cid = derive_candidate_id(run_id, idx)
+                        mid = _promote_candidate(args.db, cid, approved_by='ingest-file')
+                        promoted_ids.append(mid)
+
             semantic_enrichment_meta = {
                 'adapter': semantic_adapter_name,
                 'chunk_count': len(result.chunks),
                 'candidate_count': len(semantic_candidates),
-                'committed': args.commit and bool(semantic_candidates),
+                'ledger_runs': len(pipeline_results),
+                'promoted_memory_ids': promoted_ids,
+                'committed': args.commit and bool(promoted_ids),
             }
         except AdapterRegistryError as exc:
             print(f"WARNING: semantic adapter not found: {exc}", file=sys.stderr)
@@ -939,6 +1024,110 @@ def cmd_semantic_run(args: argparse.Namespace) -> int:
     return 0 if result.success else 1
 
 
+def cmd_semantic_candidates(args: argparse.Namespace) -> int:
+    """List semantic candidate events from the ledger."""
+    import json
+    from semantic.ledger import LedgerError, list_candidates
+
+    try:
+        candidates = list_candidates(
+            args.db,
+            run_id=getattr(args, 'run_id', None),
+            status=getattr(args, 'status', None),
+            source_id=getattr(args, 'source_id', None),
+            limit=getattr(args, 'limit', 100),
+        )
+    except LedgerError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    output = json.dumps([c.to_dict() for c in candidates], indent=2, sort_keys=True)
+    if getattr(args, 'out', None):
+        with open(args.out, 'w', encoding='utf-8') as fh:
+            fh.write(output)
+    else:
+        print(output)
+    return 0
+
+
+def cmd_memory_review(args: argparse.Namespace) -> int:
+    """Inspect, approve, or reject memory events pending operator review."""
+    import json
+    from memory import service as mem_service
+    from memory.service import ValidationError, NotFoundError
+
+    subcommand = args.review_subcommand
+
+    if subcommand == 'list':
+        try:
+            events = mem_service.review_memory(
+                args.db,
+                status=getattr(args, 'status', None),
+                event_type=getattr(args, 'event_type', None),
+            )
+        except ValidationError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        output = json.dumps(
+            [e.to_dict() for e in events], indent=2, sort_keys=True
+        )
+        if getattr(args, 'out', None):
+            with open(args.out, 'w', encoding='utf-8') as fh:
+                fh.write(output)
+        else:
+            print(output)
+        return 0
+
+    elif subcommand == 'approve':
+        new_status = getattr(args, 'status', 'active') or 'active'
+        if new_status not in ('active', 'accepted'):
+            print(
+                "ERROR: --status for approve must be 'active' or 'accepted'",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            event = mem_service.update_status(
+                args.db,
+                args.id,
+                new_status,
+                reason='operator approval',
+                created_by=args.by,
+            )
+        except NotFoundError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        except ValidationError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(event.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    elif subcommand == 'reject':
+        if not getattr(args, 'reason', None) or not args.reason.strip():
+            print("ERROR: --reason is required for reject", file=sys.stderr)
+            return 1
+        try:
+            event = mem_service.update_status(
+                args.db,
+                args.id,
+                'rejected',
+                reason=args.reason,
+                created_by=args.by,
+            )
+        except NotFoundError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        except ValidationError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(event.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    print(f"ERROR: unknown memory-review subcommand: {subcommand!r}", file=sys.stderr)
+    return 1
+
+
 def cmd_export_bundle(args: argparse.Namespace) -> int:
     import json
     from continuity.exporter import export_bundle
@@ -1054,6 +1243,8 @@ def main(argv: List[str] = None) -> int:
         'export-bundle': cmd_export_bundle,
         'import-bundle': cmd_import_bundle,
         'semantic-run': cmd_semantic_run,
+        'semantic-candidates': cmd_semantic_candidates,
+        'memory-review': cmd_memory_review,
     }
     return dispatch[args.command](args)
 
