@@ -46,8 +46,42 @@ List[CandidateMemoryEvent]  ──── extract_candidates (rules applied)
      │
      ├──── default mode: print to stdout / write to --out JSON
      │
-     └──── --commit mode: commit_candidates → memory_events table
+     └──── --commit mode: commit_candidates
+                               │
+                               ▼
+                    memory.service.add_memory_event()  ← single governed write boundary
+                               │
+                               ▼
+                    memory_events table (real schema, validated)
 ```
+
+### Single Governed Write Boundary
+
+**`ingestion` is a producer of candidates. `memory.service` is the owner of all
+writes to `memory_events`.**
+
+`commit_candidates()` calls `memory.service.add_memory_event()` for each accepted
+candidate. The service enforces:
+
+- Event type validation against `VALID_EVENT_TYPES`
+- Status validation against `VALID_STATUSES`
+- Confidence range check (1–5)
+- Non-empty field checks (title, summary, source, created_by)
+- Correct column mapping (`tags_json`, `related_ids_json`)
+- Timestamp assignment (`created_at`, `updated_at` as UTC ISO-8601)
+- Version tracking (`version = 1` on insert)
+- WAL + foreign key PRAGMA setup
+
+This means:
+- If `memory.service` validation rules tighten, ingestion commits automatically
+  comply — no ingestion code change required.
+- If the `memory_events` schema adds a required column, the service absorbs the
+  change; ingestion is unaffected.
+- There is no path by which ingestion can bypass `memory.service` and write
+  a malformed row.
+
+The old direct-SQL path (which used the wrong column name `tags` instead of
+`tags_json` and omitted required columns) has been removed.
 
 ### Source Attribution
 
@@ -154,12 +188,19 @@ sort  ──── by (source_span.start, event_type)
      │
 List[CandidateMemoryEvent]  ──── presented to operator
      │
-     └──── --commit: commit_candidates → INSERT INTO memory_events
+     └──── --commit: commit_candidates → memory.service.add_memory_event()
+                                                  │
+                                                  ▼
+                                         memory_events (via governed service)
 ```
 
 Deduplication key: `(source_path, chunk_index, event_type)`. When two rules
 produce the same event type from the same chunk, the higher-confidence candidate
 survives. On tie, registration order wins (stable).
+
+Commit ordering: candidates are committed in `(source_span.start, event_type)` order —
+the same deterministic order in which they were extracted. The resulting
+`memory_event.id` sequence is therefore document-order ascending.
 
 ---
 

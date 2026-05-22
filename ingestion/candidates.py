@@ -13,8 +13,12 @@ Confidence floor:
 
 Commit:
   commit_candidates(candidates, memory_db_path) writes accepted candidates
-  to the memory_events table and returns the list of inserted IDs.
-  This is the only function that writes to the database.
+  to the memory database via memory.service.add_memory_event — the single
+  governed write boundary for all memory_events writes.
+
+  memory.service owns: column mapping, schema validation, timestamp
+  assignment, version tracking, and CHECK constraint enforcement.
+  ingestion never touches the memory schema directly.
 
   All functions except commit_candidates are read-only and produce no
   side effects. The caller (CLI ingest-file) decides whether to commit.
@@ -103,52 +107,37 @@ def commit_candidates(
     memory_db_path: str,
 ) -> List[int]:
     """
-    Write accepted candidates to the memory_events table.
+    Write accepted candidates to the memory database.
+
+    All writes go through memory.service.add_memory_event — the single
+    governed write boundary. The service enforces schema validation,
+    column mapping, timestamp assignment, and version tracking.
+    ingestion never constructs SQL against memory_events directly.
 
     Returns the list of inserted memory_event IDs in insertion order.
     Sets committed_id on each candidate in-place.
 
-    This is the only function in the ingestion package that writes to the
-    database. It is only called when the operator passes --commit.
+    Only called when the operator passes --commit.
     """
-    import sqlite3
+    from memory import service as mem_service
 
     inserted_ids: List[int] = []
 
-    conn = sqlite3.connect(memory_db_path)
-    try:
-        conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('PRAGMA foreign_keys=ON')
-
-        for cand in candidates:
-            import json
-            cur = conn.execute(
-                """
-                INSERT INTO memory_events (
-                    event_type, title, summary, evidence,
-                    source, confidence, status,
-                    tags, created_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    cand.event_type,
-                    cand.title,
-                    cand.summary,
-                    cand.evidence,
-                    cand.source,
-                    cand.confidence,
-                    cand.status,
-                    json.dumps(sorted(cand.tags)),
-                    cand.created_by,
-                ),
-            )
-            row_id = cur.lastrowid
-            inserted_ids.append(row_id)
-            cand.committed_id = row_id
-
-        conn.commit()
-    finally:
-        conn.close()
+    for cand in candidates:
+        event = mem_service.add_memory_event(
+            db_path=memory_db_path,
+            event_type=cand.event_type,
+            title=cand.title,
+            summary=cand.summary,
+            source=cand.source,
+            confidence=cand.confidence,
+            status=cand.status,
+            created_by=cand.created_by,
+            evidence=cand.evidence,
+            tags=list(cand.tags),
+        )
+        inserted_ids.append(event.id)
+        cand.committed_id = event.id
 
     return inserted_ids
 
