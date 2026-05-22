@@ -1,9 +1,18 @@
+import json
+
 import pytest
 from memory import service
 from memory.retrieval import (
     DOCTRINE_PRIORITY,
+    RETRIEVAL_SCORING_VERSION,
+    RetrievalLogEntry,
     RetrievalQuery,
     ScoredEvent,
+    _canonical_query_dict,
+    _query_hash,
+    get_retrieval_log,
+    list_retrieval_log,
+    log_retrieval_query,
     retrieve,
     retrieve_adaptations,
     retrieve_governance,
@@ -436,3 +445,434 @@ class TestDeterminism:
         key = results[0].composite_key
         assert isinstance(key, tuple)
         assert len(key) == 6
+
+
+# ---------------------------------------------------------------------------
+# retrieval logging substrate
+# ---------------------------------------------------------------------------
+
+class TestCanonicalQueryDict:
+    def test_tags_sorted(self):
+        q = RetrievalQuery(tags=['z', 'a', 'm'])
+        d = _canonical_query_dict(q)
+        assert d['tags'] == ['a', 'm', 'z']
+
+    def test_event_types_sorted(self):
+        q = RetrievalQuery(event_types=['hypothesis', 'adaptation'])
+        d = _canonical_query_dict(q)
+        assert d['event_types'] == ['adaptation', 'hypothesis']
+
+    def test_statuses_sorted(self):
+        q = RetrievalQuery(statuses=['proposed', 'accepted'])
+        d = _canonical_query_dict(q)
+        assert d['statuses'] == ['accepted', 'proposed']
+
+    def test_scalars_preserved(self):
+        q = RetrievalQuery(min_confidence=3, limit=10, offset=5, expand_related=False)
+        d = _canonical_query_dict(q)
+        assert d['min_confidence'] == 3
+        assert d['limit'] == 10
+        assert d['offset'] == 5
+        assert d['expand_related'] is False
+
+    def test_deterministic_json(self):
+        q = RetrievalQuery(tags=['b', 'a'], event_types=['hypothesis'])
+        j1 = json.dumps(_canonical_query_dict(q), sort_keys=True, ensure_ascii=True)
+        j2 = json.dumps(_canonical_query_dict(q), sort_keys=True, ensure_ascii=True)
+        assert j1 == j2
+
+    def test_different_tag_order_same_json(self):
+        q1 = RetrievalQuery(tags=['b', 'a'])
+        q2 = RetrievalQuery(tags=['a', 'b'])
+        j1 = json.dumps(_canonical_query_dict(q1), sort_keys=True, ensure_ascii=True)
+        j2 = json.dumps(_canonical_query_dict(q2), sort_keys=True, ensure_ascii=True)
+        assert j1 == j2
+
+
+class TestQueryHash:
+    def test_hash_is_16_chars(self):
+        q = RetrievalQuery()
+        j = json.dumps(_canonical_query_dict(q), sort_keys=True, ensure_ascii=True)
+        h = _query_hash(j)
+        assert len(h) == 16
+
+    def test_hash_is_valid_hex(self):
+        q = RetrievalQuery(tags=['fx'])
+        j = json.dumps(_canonical_query_dict(q), sort_keys=True, ensure_ascii=True)
+        h = _query_hash(j)
+        int(h, 16)
+
+    def test_same_query_same_hash(self):
+        q = RetrievalQuery(tags=['fx'], event_types=['hypothesis'])
+        j = json.dumps(_canonical_query_dict(q), sort_keys=True, ensure_ascii=True)
+        assert _query_hash(j) == _query_hash(j)
+
+    def test_different_queries_different_hashes(self):
+        q1 = RetrievalQuery(tags=['fx'])
+        q2 = RetrievalQuery(tags=['rates'])
+        j1 = json.dumps(_canonical_query_dict(q1), sort_keys=True, ensure_ascii=True)
+        j2 = json.dumps(_canonical_query_dict(q2), sort_keys=True, ensure_ascii=True)
+        assert _query_hash(j1) != _query_hash(j2)
+
+
+class TestLogRetrievalQuery:
+    def test_log_returns_int_id(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        log_id = log_retrieval_query(db, RetrievalQuery(), [], actor='test')
+        assert isinstance(log_id, int)
+        assert log_id >= 1
+
+    def test_log_persisted_and_fetchable(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        log_id = log_retrieval_query(db, RetrievalQuery(tags=['fx']), [], actor='quant', session_id='s1')
+        entry = get_retrieval_log(db, log_id)
+        assert entry.actor == 'quant'
+        assert entry.session_id == 's1'
+        assert entry.scoring_version == RETRIEVAL_SCORING_VERSION
+        assert entry.result_count == 0
+
+    def test_result_ids_preserve_rank_order(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        e1 = _add(db)
+        e2 = _add(db)
+        q = RetrievalQuery(expand_related=False)
+        results = retrieve(db, q)
+        log_id = log_retrieval_query(db, q, results, actor='system')
+        entry = get_retrieval_log(db, log_id)
+        logged_ids = json.loads(entry.result_event_ids_json)
+        assert logged_ids == [s.event.id for s in results]
+
+    def test_query_hash_matches_canonical(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        q = RetrievalQuery(tags=['macro'], min_confidence=2)
+        log_id = log_retrieval_query(db, q, [], actor='system')
+        entry = get_retrieval_log(db, log_id)
+        expected_json = json.dumps(_canonical_query_dict(q), sort_keys=True, ensure_ascii=True)
+        assert entry.query_hash == _query_hash(expected_json)
+        assert entry.query_json == expected_json
+
+    def test_retrieve_log_retrieval_kwarg(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        _add(db)
+        retrieve(db, RetrievalQuery(expand_related=False), log_retrieval=True, actor='agent')
+        entries = list_retrieval_log(db)
+        assert len(entries) == 1
+        assert entries[0].actor == 'agent'
+
+
+class TestListRetrievalLog:
+    def test_returns_all_entries(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        log_retrieval_query(db, RetrievalQuery(), [], actor='a')
+        log_retrieval_query(db, RetrievalQuery(), [], actor='b')
+        entries = list_retrieval_log(db)
+        assert len(entries) == 2
+
+    def test_ordered_descending_by_id(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        log_retrieval_query(db, RetrievalQuery(), [], actor='first')
+        log_retrieval_query(db, RetrievalQuery(), [], actor='second')
+        entries = list_retrieval_log(db)
+        assert entries[0].actor == 'second'
+
+    def test_session_id_filter(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        log_retrieval_query(db, RetrievalQuery(), [], actor='a', session_id='s1')
+        log_retrieval_query(db, RetrievalQuery(), [], actor='b', session_id='s2')
+        entries = list_retrieval_log(db, session_id='s1')
+        assert len(entries) == 1
+        assert entries[0].actor == 'a'
+
+    def test_limit_respected(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        for _ in range(5):
+            log_retrieval_query(db, RetrievalQuery(), [], actor='system')
+        entries = list_retrieval_log(db, limit=3)
+        assert len(entries) == 3
+
+
+class TestRetrievalLogEntry:
+    def test_to_dict_roundtrip_fields(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        log_id = log_retrieval_query(db, RetrievalQuery(tags=['fx']), [], actor='test', session_id='sess')
+        entry = get_retrieval_log(db, log_id)
+        d = entry.to_dict()
+        assert d['id'] == log_id
+        assert d['actor'] == 'test'
+        assert d['session_id'] == 'sess'
+        assert d['scoring_version'] == RETRIEVAL_SCORING_VERSION
+
+    def test_query_property_reconstructs(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        q = RetrievalQuery(tags=['fx', 'macro'], min_confidence=3, limit=5, offset=1, expand_related=False)
+        log_id = log_retrieval_query(db, q, [], actor='system')
+        entry = get_retrieval_log(db, log_id)
+        reconstructed = entry.query
+        assert reconstructed.tags == sorted(q.tags)
+        assert reconstructed.min_confidence == q.min_confidence
+        assert reconstructed.limit == q.limit
+        assert reconstructed.offset == q.offset
+        assert reconstructed.expand_related == q.expand_related
+
+    def test_status_field_defaults_active(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        log_id = log_retrieval_query(db, RetrievalQuery(), [], actor='agent')
+        entry = get_retrieval_log(db, log_id)
+        assert entry.status == 'active'
+
+    def test_status_present_in_to_dict(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        log_id = log_retrieval_query(db, RetrievalQuery(), [], actor='system')
+        entry = get_retrieval_log(db, log_id)
+        d = entry.to_dict()
+        assert 'status' in d
+        assert d['status'] == 'active'
+
+
+# ---------------------------------------------------------------------------
+# governance schema validation on retrieval_log
+# ---------------------------------------------------------------------------
+
+class TestGovernanceOnRetrieval:
+    def test_validate_schema_passes_on_retrieval_log(self, tmp_path):
+        from memory.artifact_governance import validate_artifact_table_schema, GovernanceSchemaError
+        import sqlite3
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        conn = sqlite3.connect(db)
+        validate_artifact_table_schema(
+            conn,
+            'retrieval_log',
+            required_columns=[
+                'id', 'query_hash', 'session_id', 'query_json',
+                'scoring_version', 'scoring_params_json',
+                'result_event_ids_json', 'result_count',
+                'executed_at', 'actor', 'status',
+            ],
+            required_indices=[
+                'idx_retrieval_log_query_hash',
+                'idx_retrieval_log_scoring_version',
+                'idx_retrieval_log_session_id',
+                'idx_retrieval_log_executed_at',
+                'idx_retrieval_log_status',
+            ],
+        )
+        conn.close()
+
+    def test_validate_schema_fails_if_status_missing(self, tmp_path):
+        from memory.artifact_governance import validate_artifact_table_schema, GovernanceSchemaError
+        import sqlite3
+        db = str(tmp_path / 'no_status.db')
+        conn = sqlite3.connect(db)
+        conn.execute("""
+            CREATE TABLE retrieval_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query_hash TEXT NOT NULL,
+                executed_at TEXT NOT NULL,
+                actor TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        with pytest.raises(GovernanceSchemaError, match="status"):
+            validate_artifact_table_schema(
+                conn, 'retrieval_log',
+                required_columns=['id', 'query_hash', 'executed_at', 'actor', 'status'],
+            )
+        conn.close()
+
+    def test_status_index_present_after_init(self, tmp_path):
+        import sqlite3
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        conn = sqlite3.connect(db)
+        indices = {row[1] for row in conn.execute('PRAGMA index_list(retrieval_log)')}
+        conn.close()
+        assert 'idx_retrieval_log_status' in indices
+
+
+class TestMemorySchemaVersion:
+    def test_init_db_sets_schema_version_4(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        import sqlite3
+        conn = sqlite3.connect(db)
+        row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
+        conn.close()
+        assert row[0] == 4
+
+    def test_init_db_idempotent(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        service.init_db(db)
+        import sqlite3
+        conn = sqlite3.connect(db)
+        row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
+        conn.close()
+        assert row[0] == 4
+
+    def test_migrate_from_v2_adds_status_column(self, tmp_path):
+        """Simulate a v2 DB without status column and verify migration adds it."""
+        import sqlite3
+        db = str(tmp_path / 'mem_v2.db')
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE memory_schema_version (version INTEGER NOT NULL);
+            INSERT INTO memory_schema_version VALUES (2);
+            CREATE TABLE memory_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL,
+                evidence TEXT, source TEXT NOT NULL, confidence INTEGER NOT NULL,
+                status TEXT NOT NULL, tags_json TEXT NOT NULL DEFAULT '[]',
+                related_ids_json TEXT NOT NULL DEFAULT '[]', created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE memory_revisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, memory_id INTEGER NOT NULL,
+                old_value_json TEXT NOT NULL, new_value_json TEXT NOT NULL,
+                reason TEXT NOT NULL, created_at TEXT NOT NULL, created_by TEXT NOT NULL
+            );
+            CREATE TABLE memory_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL, relationship TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(source_id, target_id, relationship)
+            );
+            CREATE TABLE retrieval_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query_hash TEXT NOT NULL,
+                session_id TEXT,
+                query_json TEXT NOT NULL,
+                scoring_version TEXT NOT NULL,
+                scoring_params_json TEXT NOT NULL,
+                result_event_ids_json TEXT NOT NULL,
+                result_count INTEGER NOT NULL,
+                executed_at TEXT NOT NULL,
+                actor TEXT NOT NULL
+            );
+        """)
+        conn.close()
+
+        service.init_db(db)
+
+        conn2 = sqlite3.connect(db)
+        cols = {row[1] for row in conn2.execute('PRAGMA table_info(retrieval_log)')}
+        version_row = conn2.execute('SELECT version FROM memory_schema_version').fetchone()
+        conn2.close()
+        assert 'status' in cols
+        assert version_row[0] == 4
+
+    def test_migrate_from_v2_backfills_existing_rows(self, tmp_path):
+        """Rows inserted before migration must have status='active' after migration."""
+        import sqlite3
+        db = str(tmp_path / 'mem_v2_rows.db')
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE memory_schema_version (version INTEGER NOT NULL);
+            INSERT INTO memory_schema_version VALUES (2);
+            CREATE TABLE memory_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL,
+                evidence TEXT, source TEXT NOT NULL, confidence INTEGER NOT NULL,
+                status TEXT NOT NULL, tags_json TEXT NOT NULL DEFAULT '[]',
+                related_ids_json TEXT NOT NULL DEFAULT '[]', created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE memory_revisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, memory_id INTEGER NOT NULL,
+                old_value_json TEXT NOT NULL, new_value_json TEXT NOT NULL,
+                reason TEXT NOT NULL, created_at TEXT NOT NULL, created_by TEXT NOT NULL
+            );
+            CREATE TABLE memory_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL, relationship TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(source_id, target_id, relationship)
+            );
+            CREATE TABLE retrieval_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query_hash TEXT NOT NULL,
+                session_id TEXT,
+                query_json TEXT NOT NULL,
+                scoring_version TEXT NOT NULL,
+                scoring_params_json TEXT NOT NULL,
+                result_event_ids_json TEXT NOT NULL,
+                result_count INTEGER NOT NULL,
+                executed_at TEXT NOT NULL,
+                actor TEXT NOT NULL
+            );
+            INSERT INTO retrieval_log
+                (query_hash, query_json, scoring_version, scoring_params_json,
+                 result_event_ids_json, result_count, executed_at, actor)
+            VALUES
+                ('abc123', '{}', '1.0.0', '{}', '[]', 0, '2026-01-01T00:00:00Z', 'tester');
+        """)
+        conn.close()
+
+        service.init_db(db)
+
+        conn2 = sqlite3.connect(db)
+        row = conn2.execute("SELECT status FROM retrieval_log WHERE id=1").fetchone()
+        conn2.close()
+        assert row[0] == 'active'
+
+    def test_migration_is_idempotent_on_v2_db(self, tmp_path):
+        """Calling init_db twice on a migrated DB must not raise or corrupt data."""
+        import sqlite3
+        db = str(tmp_path / 'mem_v2_idem.db')
+        conn = sqlite3.connect(db)
+        conn.executescript("""
+            CREATE TABLE memory_schema_version (version INTEGER NOT NULL);
+            INSERT INTO memory_schema_version VALUES (2);
+            CREATE TABLE memory_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL,
+                evidence TEXT, source TEXT NOT NULL, confidence INTEGER NOT NULL,
+                status TEXT NOT NULL, tags_json TEXT NOT NULL DEFAULT '[]',
+                related_ids_json TEXT NOT NULL DEFAULT '[]', created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE memory_revisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, memory_id INTEGER NOT NULL,
+                old_value_json TEXT NOT NULL, new_value_json TEXT NOT NULL,
+                reason TEXT NOT NULL, created_at TEXT NOT NULL, created_by TEXT NOT NULL
+            );
+            CREATE TABLE memory_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, source_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL, relationship TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(source_id, target_id, relationship)
+            );
+            CREATE TABLE retrieval_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query_hash TEXT NOT NULL, session_id TEXT,
+                query_json TEXT NOT NULL, scoring_version TEXT NOT NULL,
+                scoring_params_json TEXT NOT NULL, result_event_ids_json TEXT NOT NULL,
+                result_count INTEGER NOT NULL, executed_at TEXT NOT NULL,
+                actor TEXT NOT NULL
+            );
+        """)
+        conn.close()
+
+        service.init_db(db)
+        service.init_db(db)  # second call must not raise
+
+        conn2 = sqlite3.connect(db)
+        row = conn2.execute('SELECT version FROM memory_schema_version').fetchone()
+        conn2.close()
+        assert row[0] == 4

@@ -12,6 +12,7 @@ from .models import (
 )
 
 _SCHEMA = Path(__file__).parent / 'schema.sql'
+_MEMORY_SCHEMA_VERSION = 4
 
 
 class ValidationError(ValueError):
@@ -45,9 +46,63 @@ def _validate_confidence(confidence: int) -> None:
         )
 
 
+def _migrate_to_v4(conn: sqlite3.Connection) -> None:
+    # event_embeddings was added to schema.sql in v4. For all DBs (fresh and
+    # upgraded), executescript() runs before this function and creates the table
+    # and indices via CREATE TABLE/INDEX IF NOT EXISTS. This function idempotently
+    # ensures all four governance indices exist in case they were created outside
+    # the normal init_db path.
+    for idx, col in (
+        ('idx_embeddings_event_id',         'memory_event_id'),
+        ('idx_embeddings_content_hash',     'content_hash'),
+        ('idx_embeddings_status',           'status'),
+        ('idx_embeddings_producer_version', 'producer_version'),
+    ):
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS {idx} ON event_embeddings({col})"
+        )
+
+
+def _migrate_to_v3(conn: sqlite3.Connection) -> None:
+    # Add status column to retrieval_log if absent (v2 → v3 upgrade path).
+    # For fresh DBs the column already exists via schema.sql; the guard makes
+    # this function safe to call in both cases.
+    existing_cols = {row[1] for row in conn.execute('PRAGMA table_info(retrieval_log)')}
+    if 'status' not in existing_cols:
+        conn.execute(
+            "ALTER TABLE retrieval_log ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
+        )
+    # Create the status index here rather than in schema.sql so it is never
+    # attempted before the column exists on a v2 DB.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_retrieval_log_status ON retrieval_log(status)"
+    )
+
+
 def init_db(db_path: str) -> None:
     with _connect(db_path) as conn:
         conn.executescript(_SCHEMA.read_text())
+        row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
+        if row is None:
+            # Fresh DB: schema.sql created retrieval_log with status, but the
+            # status index is not in schema.sql (see comment there). Run
+            # _migrate_to_v3 to create it idempotently. Run _migrate_to_v4 to
+            # idempotently ensure event_embeddings indices exist.
+            _migrate_to_v3(conn)
+            _migrate_to_v4(conn)
+            conn.execute(
+                'INSERT INTO memory_schema_version (version) VALUES (?)',
+                (_MEMORY_SCHEMA_VERSION,)
+            )
+        elif row['version'] < _MEMORY_SCHEMA_VERSION:
+            if row['version'] < 3:
+                _migrate_to_v3(conn)
+            if row['version'] < 4:
+                _migrate_to_v4(conn)
+            conn.execute(
+                'UPDATE memory_schema_version SET version = ?',
+                (_MEMORY_SCHEMA_VERSION,)
+            )
 
 
 def add_memory_event(
@@ -254,6 +309,9 @@ def link_memory_events(
 
 
 def export_memory(db_path: str) -> dict:
+    # Governance: retrieval_log and event_embeddings are local derived artifacts.
+    # They are excluded from continuity bundles by governance policy.
+    # Future portability can be considered explicitly, not silently.
     with _connect(db_path) as conn:
         events = [
             MemoryEvent.from_row(r)
