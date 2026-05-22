@@ -387,6 +387,50 @@ def test_retry_allows_resubmission(tmp_path):
     assert len(tasks) == 1  # re-submitted
 
 
+# ---------------------------------------------------------------------------
+# task_payload_json embedding
+# ---------------------------------------------------------------------------
+
+def test_submit_semantic_node_embeds_task_payload_json(tmp_path):
+    """semantic_extraction nodes with a non-default payload get it in task metadata."""
+    import json as _json
+    orch_db = _orch_db(tmp_path)
+    payload = _json.dumps({'task_type': 'tagging', 'adapter': 'stub', 'input_text': 'test'})
+    n = WorkflowNode(
+        node_id='sem',
+        task_type='semantic_extraction',
+        task_payload_json=payload,
+        dependency_ids=[],
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
+    wf, plan = _make_wf_and_plan(n)
+    execution = _running_execution(plan)
+
+    tasks, _ = submit_ready_nodes(orch_db, execution, plan, wf, 'coordinator')
+
+    assert 'task_payload_json' in tasks[0].metadata
+    stored = _json.loads(tasks[0].metadata['task_payload_json'])
+    assert stored['task_type'] == 'tagging'
+
+
+def test_submit_node_with_default_payload_omits_task_payload_json(tmp_path):
+    """Nodes with the default empty-object payload do not add task_payload_json to metadata."""
+    orch_db = _orch_db(tmp_path)
+    n = WorkflowNode(
+        node_id='plain',
+        task_type='research',
+        task_payload_json='{}',
+        dependency_ids=[],
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
+    wf, plan = _make_wf_and_plan(n)
+    execution = _running_execution(plan)
+
+    tasks, _ = submit_ready_nodes(orch_db, execution, plan, wf, 'coordinator')
+
+    assert 'task_payload_json' not in tasks[0].metadata
+
+
 def test_submission_order_deterministic_across_runs(tmp_path):
     """Repeated step_execution on same state must produce same node ordering."""
     orch_db1 = _orch_db(tmp_path)
