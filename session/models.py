@@ -9,8 +9,16 @@ I/O logic.
 Canonical truth remains the lineage and persisted memory events. Session
 models are ephemeral: same inputs always produce the same session.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as _dataclass_fields
 from typing import Dict, List, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Assembly constants
+# ---------------------------------------------------------------------------
+
+CONTEXT_ASSEMBLY_VERSION = '1.0.0'
+CHAR_BUDGET_DEFAULT = 12000
+ENTRY_BUDGET_DEFAULT = 60
 
 
 # ---------------------------------------------------------------------------
@@ -37,9 +45,11 @@ class ContextActivationPolicy:
     tags: List[str] = field(default_factory=list)
     min_confidence: int = 1
     include_unresolved: bool = True
-    include_governance: bool = True
     include_adaptations: bool = True
     expand_related: bool = True
+
+    # Compression mode — only 'none' is valid in Phase 3B; hook for future summarization
+    compression_mode: str = 'none'
 
     # Workflow retrieval
     include_active_workflows: bool = True
@@ -55,17 +65,17 @@ class ContextActivationPolicy:
     max_memory_candidates: int = 50
 
     # Context window
-    max_chars: int = 12000
-    max_entries: int = 60
+    max_chars: int = CHAR_BUDGET_DEFAULT
+    max_entries: int = ENTRY_BUDGET_DEFAULT
 
     def to_dict(self) -> dict:
         return {
             'tags': list(self.tags),
             'min_confidence': self.min_confidence,
             'include_unresolved': self.include_unresolved,
-            'include_governance': self.include_governance,
             'include_adaptations': self.include_adaptations,
             'expand_related': self.expand_related,
+            'compression_mode': self.compression_mode,
             'include_active_workflows': self.include_active_workflows,
             'workflow_db_path': self.workflow_db_path,
             'max_workflows': self.max_workflows,
@@ -76,6 +86,12 @@ class ContextActivationPolicy:
             'max_chars': self.max_chars,
             'max_entries': self.max_entries,
         }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'ContextActivationPolicy':
+        """Deserialize from a dict; unknown keys (e.g. include_governance from old logs) are ignored."""
+        known = {f.name for f in _dataclass_fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
 
 
 # ---------------------------------------------------------------------------
@@ -266,10 +282,14 @@ class SessionContext:
     chars_used: int
     truncated: bool          # True if budget was exhausted
 
+    # Assembly provenance — default 'unknown' for backward compat with pre-v7 snapshots
+    assembly_version: str = 'unknown'
+
     def to_dict(self) -> dict:
         return {
             'session_id': self.session_id,
             'created_at': self.created_at,
+            'assembly_version': self.assembly_version,
             'policy': self.policy.to_dict(),
             'governance_context': [m.to_dict() for m in self.governance_context],
             'unresolved_items': [m.to_dict() for m in self.unresolved_items],
@@ -287,6 +307,22 @@ class SessionContext:
 
 
 @dataclass
+class AssemblyDivergenceReport:
+    """
+    Result of verify_assembly_against_current_db().
+
+    Describes how the current memory DB state differs from what was captured
+    at assembly time. Diagnostic only — never mutates any database.
+    """
+    assembly_id: int
+    assembly_hash: str
+    diverged: bool
+    events_added_since_assembly: List[int]    # memory_ids present now but not at assembly
+    events_removed_since_assembly: List[int]  # memory_ids at assembly but not present now
+    events_rescored_since_assembly: List[int] # memory_ids in both but with changed metadata
+
+
+@dataclass
 class SessionReconstruction:
     """
     The complete reconstructed session: structured context + rendered text.
@@ -298,6 +334,7 @@ class SessionReconstruction:
     reproduce or audit the reconstruction without re-querying the databases.
     """
     context: SessionContext
+    replayed: bool = False   # True when restored from context_assembly_log via replay_assembly()
 
     def render(self) -> str:
         """Render the session as human-readable text with labelled sections."""

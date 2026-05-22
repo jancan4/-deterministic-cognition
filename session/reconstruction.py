@@ -18,13 +18,17 @@ I/O pattern:
 No autonomous decisions. No hidden context injection. No mutation.
 """
 import hashlib
+import json as _json
+import sqlite3 as _sqlite3
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from .activation import activate_memory, partition_by_section
 from .context_window import apply_context_budget
 from .models import (
+    AssemblyDivergenceReport,
     ActiveWorkflow,
+    CONTEXT_ASSEMBLY_VERSION,
     ContextActivationPolicy,
     RuntimeSnapshot,
     SessionContext,
@@ -36,15 +40,55 @@ def _now_utc() -> str:
     return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
-def _make_session_id(memory_db_path: str, policy: ContextActivationPolicy, created_at: str) -> str:
-    """
-    Deterministic session ID derived from inputs.
+def _mem_connect(db_path: str) -> _sqlite3.Connection:
+    conn = _sqlite3.connect(db_path)
+    conn.row_factory = _sqlite3.Row
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA foreign_keys=ON')
+    return conn
 
-    Same memory_db_path + policy tags + created_at always produces the same
-    session_id. Used for replay identification, not security.
+
+def _make_session_id(
+    memory_db_path: str,
+    policy: ContextActivationPolicy,
+    query_vector_hash: Optional[str] = None,
+) -> str:
     """
-    key = f"{memory_db_path}|{sorted(policy.tags)}|{policy.min_confidence}|{created_at}"
-    return hashlib.sha256(key.encode()).hexdigest()[:32]
+    Deterministic session ID derived from policy inputs only.
+
+    Same memory_db_path + policy tags + min_confidence always produces the
+    same session_id. Used for supersession tracking in context_assembly_log.
+    Does NOT include the reconstruction timestamp so that repeated assemblies
+    of the same policy intent share a session_id and can supersede each other.
+    """
+    components = [memory_db_path, str(sorted(policy.tags)), str(policy.min_confidence)]
+    if query_vector_hash:
+        components.append(query_vector_hash)
+    return hashlib.sha256('|'.join(components).encode()).hexdigest()[:32]
+
+
+def _make_assembly_hash(
+    session_id: str,
+    policy: ContextActivationPolicy,
+    context: SessionContext,
+    snapshot_json: str,
+) -> str:
+    """
+    Deterministic content-addressable hash for one assembly.
+
+    Same reconstruction output (same snapshot_json, same budget accounting,
+    same policy, same CONTEXT_ASSEMBLY_VERSION) → same assembly_hash.
+    """
+    payload = _json.dumps({
+        'assembly_version': CONTEXT_ASSEMBLY_VERSION,
+        'session_id': session_id,
+        'compression_mode': policy.compression_mode,
+        'policy_json': _json.dumps(policy.to_dict(), sort_keys=True, separators=(',', ':')),
+        'entries_accepted': context.included_entries,
+        'char_budget_used': context.chars_used,
+        'snapshot_json': snapshot_json,
+    }, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(payload.encode()).hexdigest()[:32]
 
 
 def _find_non_terminal_execution_ids(workflow_db_path: str) -> List[str]:
@@ -188,7 +232,7 @@ def reconstruct(
         policy = ContextActivationPolicy()
 
     created_at = _now_utc()
-    session_id = _make_session_id(memory_db_path, policy, created_at)
+    session_id = _make_session_id(memory_db_path, policy)
 
     # 1. Activate and rank memory events
     activated = activate_memory(memory_db_path, policy)
@@ -242,6 +286,7 @@ def reconstruct(
         char_budget=budgeted.char_budget,
         chars_used=budgeted.chars_used,
         truncated=budgeted.truncated,
+        assembly_version=CONTEXT_ASSEMBLY_VERSION,
     )
 
     return SessionReconstruction(context=context)
@@ -322,4 +367,175 @@ def reconstruct_from_dict(
         char_budget=context_dict['char_budget'],
         chars_used=context_dict['chars_used'],
         truncated=context_dict['truncated'],
+        assembly_version=context_dict.get('assembly_version', 'unknown'),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Assembly log: persist, replay, verify
+# ---------------------------------------------------------------------------
+
+def log_assembly(
+    db_path: str,
+    reconstruction: SessionReconstruction,
+    *,
+    query_vector_hash: Optional[str] = None,
+    query_vector_provenance_json: Optional[str] = None,
+) -> dict:
+    """
+    Persist a reconstruction to context_assembly_log and return the log row.
+
+    Idempotency: if the same reconstruction is logged twice (identical
+    assembly_hash), the existing row is returned without any write.
+
+    Supersession: if a different reconstruction shares the same session_id,
+    the previous active row is superseded and the new one is inserted.
+
+    Returns the log row as a plain dict (keys match context_assembly_log columns).
+    """
+    ctx = reconstruction.context
+    policy = ctx.policy
+    snapshot_json = _json.dumps(ctx.to_dict(), sort_keys=True, separators=(',', ':'))
+    assembly_hash = _make_assembly_hash(ctx.session_id, policy, ctx, snapshot_json)
+    now = _now_utc()
+
+    conn = _mem_connect(db_path)
+    try:
+        with conn:
+            existing = conn.execute(
+                'SELECT * FROM context_assembly_log WHERE assembly_hash = ?',
+                (assembly_hash,),
+            ).fetchone()
+            if existing is not None:
+                return dict(existing)
+
+            conn.execute(
+                """UPDATE context_assembly_log
+                   SET status = 'superseded', superseded_at = ?, superseded_reason = 'new_assembly'
+                   WHERE session_id = ? AND status = 'active'""",
+                (now, ctx.session_id),
+            )
+
+            cur = conn.execute(
+                """INSERT INTO context_assembly_log
+                   (assembly_hash, session_id, assembly_version, assembled_at, db_path,
+                    policy_json, query_vector_hash, query_vector_provenance_json,
+                    entries_accepted, entries_rejected_budget, entries_rejected_filter,
+                    char_budget_used, char_budget_limit, compression_mode,
+                    assembly_snapshot_json, status)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active')""",
+                (
+                    assembly_hash,
+                    ctx.session_id,
+                    CONTEXT_ASSEMBLY_VERSION,
+                    now,
+                    db_path,
+                    _json.dumps(policy.to_dict(), sort_keys=True),
+                    query_vector_hash,
+                    query_vector_provenance_json,
+                    ctx.included_entries,
+                    ctx.total_candidates - ctx.included_entries,
+                    0,
+                    ctx.chars_used,
+                    ctx.char_budget,
+                    policy.compression_mode,
+                    snapshot_json,
+                ),
+            )
+            row = conn.execute(
+                'SELECT * FROM context_assembly_log WHERE id = ?', (cur.lastrowid,)
+            ).fetchone()
+            return dict(row)
+    finally:
+        conn.close()
+
+
+def replay_assembly(assembly_id: int, db_path: str) -> SessionReconstruction:
+    """
+    Restore a SessionReconstruction from a stored context_assembly_log row.
+
+    Pure snapshot replay: loads assembly_snapshot_json and calls
+    reconstruct_from_dict(). Does not re-query memory_events or any other
+    table beyond fetching the single log row.
+
+    Raises ValueError if assembly_id is not found.
+    """
+    conn = _mem_connect(db_path)
+    try:
+        row = conn.execute(
+            'SELECT * FROM context_assembly_log WHERE id = ?', (assembly_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        raise ValueError(f"Assembly {assembly_id} not found in context_assembly_log")
+
+    snapshot_dict = _json.loads(row['assembly_snapshot_json'])
+    ctx = reconstruct_from_dict(snapshot_dict)
+    return SessionReconstruction(context=ctx, replayed=True)
+
+
+def verify_assembly_against_current_db(
+    assembly_id: int,
+    db_path: str,
+) -> AssemblyDivergenceReport:
+    """
+    Re-run reconstruction and compare its output against the stored snapshot.
+
+    Diagnostic only: reads the stored policy, re-runs reconstruct() against
+    the current DB, and diffs memory_ids across all activated sections.
+
+    Does not write to context_assembly_log or any other table.
+    Does not perform replay — this is verification, not replay.
+
+    Raises ValueError if assembly_id is not found.
+    """
+    conn = _mem_connect(db_path)
+    try:
+        row = conn.execute(
+            'SELECT * FROM context_assembly_log WHERE id = ?', (assembly_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
+        raise ValueError(f"Assembly {assembly_id} not found in context_assembly_log")
+
+    policy = ContextActivationPolicy.from_dict(_json.loads(row['policy_json']))
+
+    current_recon = reconstruct(db_path, policy)
+    current_ctx = current_recon.context
+
+    stored_snapshot = _json.loads(row['assembly_snapshot_json'])
+
+    def _ids_from_snapshot(d: dict) -> set:
+        ids: set = set()
+        for key in ('governance_context', 'unresolved_items', 'active_investigations', 'relevant_memory'):
+            for item in d.get(key, []):
+                ids.add(item['memory_id'])
+        return ids
+
+    def _ids_from_ctx(ctx: SessionContext) -> set:
+        ids: set = set()
+        for section in (ctx.governance_context, ctx.unresolved_items,
+                        ctx.active_investigations, ctx.relevant_memory):
+            for item in section:
+                ids.add(item.memory_id)
+        return ids
+
+    stored_ids = _ids_from_snapshot(stored_snapshot)
+    current_ids = _ids_from_ctx(current_ctx)
+
+    added = sorted(current_ids - stored_ids)
+    removed = sorted(stored_ids - current_ids)
+    diverged = bool(added or removed)
+
+    return AssemblyDivergenceReport(
+        assembly_id=assembly_id,
+        assembly_hash=row['assembly_hash'],
+        diverged=diverged,
+        events_added_since_assembly=added,
+        events_removed_since_assembly=removed,
+        events_rescored_since_assembly=[],
     )

@@ -344,12 +344,17 @@ def cmd_session_context(args: argparse.Namespace) -> int:
     from session.models import ContextActivationPolicy
     from session.reconstruction import reconstruct
 
+    sc_sub = getattr(args, 'sc_subcommand', None)
+    if sc_sub == 'replay':
+        return _cmd_session_replay(args)
+    if sc_sub == 'verify':
+        return _cmd_session_verify(args)
+
     # Build activation policy from CLI flags
     policy = ContextActivationPolicy(
         tags=list(args.tags),
         max_entries=args.max_entries,
         max_chars=args.max_chars,
-        include_governance=True,
         include_unresolved=True,
         include_adaptations=True,
         expand_related=True,
@@ -364,6 +369,18 @@ def cmd_session_context(args: argparse.Namespace) -> int:
     except Exception as exc:
         print(f"Error: reconstruction failed: {exc}", file=sys.stderr)
         return 1
+
+    if getattr(args, 'log_assembly', False):
+        from session.reconstruction import log_assembly as _log_assembly
+        try:
+            log_row = _log_assembly(args.db, reconstruction)
+            print(
+                f"Assembly logged: id={log_row['id']}  hash={log_row['assembly_hash']}  "
+                f"status={log_row['status']}",
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            print(f"Warning: assembly logging failed: {exc}", file=sys.stderr)
 
     filters = {
         'tags': list(args.tags),
@@ -418,6 +435,72 @@ def cmd_session_context(args: argparse.Namespace) -> int:
         print(output)
 
     return 0
+
+
+def _cmd_session_replay(args: argparse.Namespace) -> int:
+    """
+    Restore a SessionReconstruction from context_assembly_log by assembly_id.
+
+    Pure snapshot replay: no re-query of memory_events, no re-scoring,
+    no adapter calls. Only the single log row is read.
+    """
+    from session.reconstruction import replay_assembly
+
+    assembly_id = getattr(args, 'assembly_id', None)
+    if assembly_id is None:
+        print("Error: --assembly-id is required", file=sys.stderr)
+        return 1
+
+    try:
+        recon = replay_assembly(assembly_id, args.db)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"Error: replay failed: {exc}", file=sys.stderr)
+        return 1
+
+    fmt = getattr(args, 'format', 'markdown')
+    if fmt == 'json':
+        print(json.dumps(recon.context.to_dict(), indent=2, sort_keys=True))
+    else:
+        print(recon.render())
+    return 0
+
+
+def _cmd_session_verify(args: argparse.Namespace) -> int:
+    """
+    Re-run reconstruction against the current DB and diff against a stored assembly.
+
+    Diagnostic only — no writes to context_assembly_log or any other table.
+    This is verification, not replay.
+    """
+    from session.reconstruction import verify_assembly_against_current_db
+
+    assembly_id = getattr(args, 'assembly_id', None)
+    if assembly_id is None:
+        print("Error: --assembly-id is required", file=sys.stderr)
+        return 1
+
+    try:
+        report = verify_assembly_against_current_db(assembly_id, args.db)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"Error: verify failed: {exc}", file=sys.stderr)
+        return 1
+
+    result = {
+        'assembly_id': report.assembly_id,
+        'assembly_hash': report.assembly_hash,
+        'diverged': report.diverged,
+        'events_added_since_assembly': report.events_added_since_assembly,
+        'events_removed_since_assembly': report.events_removed_since_assembly,
+        'events_rescored_since_assembly': report.events_rescored_since_assembly,
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 1 if report.diverged else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -502,6 +585,44 @@ def build_parser() -> argparse.ArgumentParser:
     sc_p.add_argument(
         '--format', choices=['json', 'markdown'], default='markdown', dest='format',
         help='Output format: json or markdown (default: markdown)',
+    )
+    sc_p.add_argument(
+        '--log-assembly', action='store_true', default=False, dest='log_assembly',
+        help='Persist assembly to context_assembly_log for replay/verify',
+    )
+
+    # session-context subcommands: replay and verify
+    sc_sub = sc_p.add_subparsers(dest='sc_subcommand')
+    sc_sub.required = False
+
+    sc_replay_p = sc_sub.add_parser(
+        'replay',
+        help='Restore a session from context_assembly_log (pure snapshot replay; no DB re-query)',
+    )
+    sc_replay_p.add_argument(
+        '--db', default='memory.db', dest='db',
+        help='Path to the memory SQLite database (default: memory.db)',
+    )
+    sc_replay_p.add_argument(
+        '--assembly-id', required=True, type=int, dest='assembly_id',
+        help='Row id in context_assembly_log to replay',
+    )
+    sc_replay_p.add_argument(
+        '--format', choices=['json', 'markdown'], default='markdown', dest='format',
+        help='Output format: json or markdown (default: markdown)',
+    )
+
+    sc_verify_p = sc_sub.add_parser(
+        'verify',
+        help='Re-run reconstruction and diff against a stored assembly (diagnostic only)',
+    )
+    sc_verify_p.add_argument(
+        '--db', default='memory.db', dest='db',
+        help='Path to the memory SQLite database (default: memory.db)',
+    )
+    sc_verify_p.add_argument(
+        '--assembly-id', required=True, type=int, dest='assembly_id',
+        help='Row id in context_assembly_log to verify against',
     )
 
     # ingest-file --------------------------------------------------------

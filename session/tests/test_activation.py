@@ -155,28 +155,26 @@ def test_activate_memory_respects_min_confidence(tmp_path):
     db = _mem_db(tmp_path)
     _add(db, event_type='hypothesis', title='Low', confidence=1, status='proposed')
     _add(db, event_type='hypothesis', title='High', confidence=4, status='proposed')
-    result = activate_memory(db, _policy(min_confidence=3, include_governance=False, include_unresolved=False))
+    result = activate_memory(db, _policy(min_confidence=3, include_unresolved=False))
     titles = [m.title for m in result]
     assert 'Low' not in titles
     assert 'High' in titles
 
 
-def test_activate_memory_include_governance_false(tmp_path):
+def test_activate_memory_always_includes_governance(tmp_path):
     db = _mem_db(tmp_path)
     _add(db, event_type='governance_rule', title='G1', status='active')
-    result = activate_memory(db, _policy(include_governance=False, include_unresolved=False))
-    # governance_rule should not be activated through governance path
-    # (may still come in through general retrieve if tags match, but with no tags, general won't include it)
-    # With no tags and no governance path, general query should still pick it up
-    # This test verifies the flag is respected at the retrieval-path level
-    assert isinstance(result, list)
+    result = activate_memory(db, _policy(include_unresolved=False))
+    # governance events are always activated regardless of policy flags
+    types = [m.event_type for m in result]
+    assert 'governance_rule' in types
 
 
 def test_activate_memory_tag_overlap_tracked(tmp_path):
     db = _mem_db(tmp_path)
     _add(db, event_type='hypothesis', title='H1', tags=['fx', 'macro'], status='proposed')
     _add(db, event_type='hypothesis', title='H2', tags=[], status='proposed')
-    result = activate_memory(db, _policy(tags=['fx'], include_governance=False, include_unresolved=False))
+    result = activate_memory(db, _policy(tags=['fx'], include_unresolved=False))
     h1 = next((m for m in result if m.title == 'H1'), None)
     if h1:
         assert h1.tag_overlap == 1

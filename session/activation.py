@@ -20,7 +20,7 @@ _DEFAULT_DOCTRINE_RANK = 7
 # Event types classified as "active investigations"
 INVESTIGATION_EVENT_TYPES = frozenset({'open_question', 'hypothesis'})
 
-# Governance event types — always surfaced when include_governance=True
+# Governance event types — always surfaced; not filterable by activation policy
 GOVERNANCE_EVENT_TYPES = frozenset({'governance_rule', 'architecture_decision'})
 
 # Statuses that indicate an unresolved item
@@ -115,7 +115,7 @@ def activate_memory(
     Retrieve and rank memory events according to the activation policy.
 
     Combines:
-    - Governance context (if include_governance=True)
+    - Governance context (always — governance events are not filterable)
     - Unresolved items (if include_unresolved=True)
     - Tag/type filtered relevant memory
     - Adaptation events (if include_adaptations=True)
@@ -132,8 +132,7 @@ def activate_memory(
                 seen_ids.add(e.event.id)
                 collected.append(e)
 
-    if policy.include_governance:
-        _add(retrieve_governance(memory_db_path, limit=policy.max_memory_candidates))
+    _add(retrieve_governance(memory_db_path, limit=policy.max_memory_candidates))
 
     if policy.include_unresolved:
         _add(retrieve_unresolved(memory_db_path, limit=policy.max_memory_candidates))
@@ -161,7 +160,7 @@ def activate_memory(
 
     return score_and_rank(
         collected,
-        pin_governance=policy.include_governance,
+        pin_governance=True,
         pin_unresolved=policy.include_unresolved,
     )
 

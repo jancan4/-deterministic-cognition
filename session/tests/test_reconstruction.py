@@ -93,7 +93,7 @@ def test_reconstruct_deterministic_same_db(tmp_path):
     _add(db, event_type='governance_rule', title='G1', status='active')
     _add(db, event_type='hypothesis', title='H2', status='unresolved')
 
-    policy = _policy(include_governance=True, include_unresolved=True)
+    policy = _policy(include_unresolved=True)
     r1 = reconstruct(db, policy)
     r2 = reconstruct(db, policy)
 
@@ -113,7 +113,7 @@ def test_reconstruct_deterministic_same_db(tmp_path):
 def test_reconstruct_includes_governance(tmp_path):
     db = _mem_db(tmp_path)
     _add(db, event_type='governance_rule', title='G1', status='active')
-    result = reconstruct(db, _policy(include_governance=True))
+    result = reconstruct(db, _policy())
     ids = [m.memory_id for m in result.context.governance_context]
     assert len(ids) >= 1
     types = [m.event_type for m in result.context.governance_context]
@@ -125,7 +125,7 @@ def test_reconstruct_governance_before_relevant_memory(tmp_path):
     _add(db, event_type='implementation_note', title='N1', confidence=5, status='accepted')
     _add(db, event_type='governance_rule', title='G1', confidence=3, status='active')
 
-    result = reconstruct(db, _policy(include_governance=True))
+    result = reconstruct(db, _policy())
     ctx = result.context
     assert ctx.governance_context  # governance present
     # Rendered output should mention governance before relevant memory
@@ -210,7 +210,7 @@ def test_reconstruct_governance_preserved_under_budget(tmp_path):
         _add(db, event_type='hypothesis', title=f'H{i}',
              summary='x' * 500, status='proposed', confidence=1)
 
-    policy = _policy(max_chars=300, max_entries=999, include_governance=True)
+    policy = _policy(max_chars=300, max_entries=999)
     result = reconstruct(db, policy)
     gov_ids = [m.memory_id for m in result.context.governance_context]
     assert len(gov_ids) >= 1
@@ -238,7 +238,7 @@ def test_reconstruct_render_includes_session_id(tmp_path):
 def test_reconstruct_render_includes_governance_section(tmp_path):
     db = _mem_db(tmp_path)
     _add(db, event_type='governance_rule', title='GovernanceRule1', status='active')
-    result = reconstruct(db, _policy(include_governance=True))
+    result = reconstruct(db, _policy())
     rendered = result.render()
     assert 'ACTIVE GOVERNANCE CONTEXT' in rendered
 
