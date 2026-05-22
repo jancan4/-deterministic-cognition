@@ -164,9 +164,101 @@ This metadata is preserved as lineage context alongside the candidate.
 
 ---
 
-## Future Adapter Path for llama.cpp / Ollama / etc.
+## OllamaAdapter — Implemented Real Inference Adapter
 
-### llama.cpp adapter (sketch)
+`models/ollama_adapter.py` implements `OllamaAdapter`, the first real-inference
+adapter in this system. It calls the Ollama HTTP API (`/api/generate`) on a
+local process and parses the structured JSON response into `LocalModelResponse`.
+
+### Determinism and replay semantics
+
+Ollama inference is **provenance-preserved but NOT bitwise deterministic**.
+
+| Property | Deterministic? | How |
+|---|---|---|
+| `request_id` | Yes | sha256(model_name + NUL + version + NUL + task_type + NUL + input_text)[:16] |
+| Prompt template | Yes | Fixed per task_type in `_PROMPT_TEMPLATES` |
+| `prompt_template_hash` | Yes | sha256(template)[:16] |
+| `request_payload_hash` | Yes | sha256(json.dumps(payload))[:16] |
+| Token sequence | No | Depends on model version, quantization, hardware |
+| Extracted labels / entities / claims | No | Derived from token sequence |
+
+`ModelCapability.deterministic_mode_supported = False` for OllamaAdapter.
+This is an honest declaration: even with `temperature=0` and `seed=42`,
+different Ollama versions or quantisation formats may produce different tokens.
+
+**Canonical truth is the recorded artifact in the semantic ledger**
+(`raw_output_json`, `normalized_result_json`), not a re-query of Ollama.
+Replaying a run means reading the ledger row, not regenerating tokens.
+
+### Provenance metadata
+
+Every `execute()` call populates `LocalModelResponse.metadata` with a complete
+provenance dict:
+
+```json
+{
+  "adapter_name": "ollama",
+  "adapter_version": "1.0.0",
+  "provider": "ollama",
+  "runtime_version": "0.3.0",
+  "model_name": "phi3:mini",
+  "model_digest": "sha256:...",
+  "model_family": "phi3",
+  "temperature": 0.0,
+  "seed": 42,
+  "num_predict": 512,
+  "prompt_template_hash": "a1b2c3d4e5f60708",
+  "request_payload_hash": "b2c3d4e5f6070809",
+  "input_hash": "c3d4e5f607080901",
+  "started_at": "2026-01-01T12:00:00Z",
+  "completed_at": "2026-01-01T12:00:01Z",
+  "duration_ms": 312.5,
+  "ollama_eval_count": 42,
+  "ollama_eval_duration_ns": 1000000,
+  "parse_error": null,
+  "raw_output": {
+    "raw": "<full ollama response text>",
+    "model": "phi3:mini",
+    "done": true,
+    "eval_count": 42,
+    "ollama_response_payload": { ... }
+  }
+}
+```
+
+`raw_output` is passed through to `record_run(raw_output=...)` and
+persisted in `semantic_execution_runs.raw_output_json`.
+
+### Import safety
+
+`models/ollama_adapter.py` is safe to import without `requests` installed.
+`OllamaAdapter` raises `ModelContractError` at **instantiation** (not at import).
+
+### CLI usage
+
+```
+# semantic-run with Ollama
+python -m cli.main semantic-run \
+  --adapter ollama --model phi3:mini \
+  --task-type tagging --input-text "The Fed held rates."
+
+# ingest-file with Ollama semantic enrichment
+python -m cli.main ingest-file /data/article.txt \
+  --semantic-adapter ollama --model phi3:mini [--commit]
+```
+
+### Manual smoke test (requires live Ollama)
+
+```bash
+ollama pull phi3:mini  # one-time pull
+python -m cli.main semantic-run \
+  --adapter ollama --model phi3:mini \
+  --task-type tagging \
+  --input-text "The Federal Reserve held interest rates steady on Wednesday."
+```
+
+### Future adapter path for llama.cpp
 
 ```python
 class LlamaCppAdapter(LocalModelAdapter):
@@ -184,28 +276,6 @@ class LlamaCppAdapter(LocalModelAdapter):
         # 4. Return LocalModelResponse
         ...
 ```
-
-The adapter is responsible for: prompt construction, subprocess
-management, output parsing, and honoring `max_input_chars`.
-
-The governance layer is responsible for: request validation, capability
-checks, response validation, semantic conversion, and candidate creation.
-
-### Ollama adapter (sketch)
-
-```python
-class OllamaAdapter(LocalModelAdapter):
-    NAME = 'ollama'
-    VERSION = '1.0.0'
-
-    def __init__(self, model_tag: str, base_url: str = 'http://localhost:11434'):
-        self._model_tag = model_tag
-        self._base_url = base_url  # local Ollama process; no external network
-```
-
-Note: Ollama adapter makes HTTP calls to a local process. This is still
-considered local execution (no cloud API), but it introduces a network
-dependency that must be declared in the capability metadata.
 
 ---
 

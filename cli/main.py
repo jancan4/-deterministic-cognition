@@ -523,7 +523,17 @@ def build_parser() -> argparse.ArgumentParser:
     if_p.add_argument(
         '--semantic-adapter', default=None, dest='semantic_adapter',
         metavar='ADAPTER',
-        help='Optional: enrich candidates using this semantic adapter (stub|echo)',
+        help='Optional: enrich candidates using this semantic adapter (stub|echo|ollama)',
+    )
+    if_p.add_argument(
+        '--model', default=None, dest='model',
+        metavar='MODEL',
+        help='Ollama model name (required when --semantic-adapter ollama, e.g. phi3:mini)',
+    )
+    if_p.add_argument(
+        '--ollama-url', default='http://localhost:11434', dest='ollama_url',
+        metavar='URL',
+        help='Ollama base URL for ingest-file semantic enrichment (default: http://localhost:11434)',
     )
 
     # semantic-run -------------------------------------------------------
@@ -552,7 +562,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sr2_p.add_argument(
         '--adapter', default='stub', dest='adapter',
-        help='Adapter name (default: stub). Registered: stub, echo',
+        help='Adapter name (default: stub). Built-in: stub, echo, ollama',
+    )
+    sr2_p.add_argument(
+        '--model', default=None, dest='model',
+        metavar='MODEL',
+        help='Ollama model name (required when --adapter ollama, e.g. phi3:mini)',
+    )
+    sr2_p.add_argument(
+        '--ollama-url', default='http://localhost:11434', dest='ollama_url',
+        metavar='URL',
+        help='Ollama base URL (default: http://localhost:11434)',
     )
     sr2_p.add_argument(
         '--format', default='json', dest='format',
@@ -835,8 +855,24 @@ def cmd_ingest_file(args: argparse.Namespace) -> int:
         from memory import service as _mem_service
         promoted_ids: list = []
         try:
-            sem_registry = make_default_registry()
-            sem_adapter = sem_registry.get(semantic_adapter_name)
+            if semantic_adapter_name == 'ollama':
+                model = getattr(args, 'model', None)
+                if not model:
+                    print(
+                        "WARNING: --model is required when --semantic-adapter ollama; "
+                        "skipping semantic enrichment",
+                        file=sys.stderr,
+                    )
+                    raise AdapterRegistryError("missing --model for ollama")
+                from models.ollama_adapter import OllamaAdapter
+                sem_adapter = OllamaAdapter(
+                    model=model,
+                    base_url=getattr(args, 'ollama_url', 'http://localhost:11434'),
+                )
+            else:
+                sem_registry = make_default_registry()
+                sem_adapter = sem_registry.get(semantic_adapter_name)
+
             # enrich_chunks returns List[SemanticPipelineResult] — one per chunk
             pipeline_results = enrich_chunks_with_semantic(result.chunks, sem_adapter)
             semantic_candidates = [c for r in pipeline_results for c in r.candidates]
@@ -844,7 +880,11 @@ def cmd_ingest_file(args: argparse.Namespace) -> int:
             # Always persist to ledger (idempotent; no memory write)
             _init_ledger(args.db)
             for pr in pipeline_results:
-                _record_run(args.db, pr)
+                # Pass raw_output from Ollama adapter metadata when available
+                raw_out = None
+                if pr.execution_result.response and pr.execution_result.response.metadata:
+                    raw_out = pr.execution_result.response.metadata.get('raw_output')
+                _record_run(args.db, pr, raw_output=raw_out)
 
             # On --commit: promote each candidate to memory as status='unresolved'
             if args.commit and pipeline_results:
@@ -989,12 +1029,34 @@ def cmd_semantic_run(args: argparse.Namespace) -> int:
         return 1
 
     # Resolve adapter
-    registry = make_default_registry()
-    try:
-        adapter = registry.get(args.adapter)
-    except AdapterRegistryError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+    adapter_name = args.adapter
+    if adapter_name == 'ollama':
+        model = getattr(args, 'model', None)
+        if not model:
+            print(
+                "ERROR: --model is required when --adapter ollama "
+                "(e.g. --model phi3:mini)",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            from models.ollama_adapter import OllamaAdapter
+            from models.contracts import ModelContractError as _MCE
+            adapter = OllamaAdapter(
+                model=model,
+                base_url=getattr(args, 'ollama_url', 'http://localhost:11434'),
+                timeout_seconds=args.timeout,
+            )
+        except Exception as exc:
+            print(f"ERROR: could not initialise OllamaAdapter: {exc}", file=sys.stderr)
+            return 1
+    else:
+        registry = make_default_registry()
+        try:
+            adapter = registry.get(adapter_name)
+        except AdapterRegistryError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
 
     # Build policy
     try:

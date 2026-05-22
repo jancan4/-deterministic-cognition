@@ -323,6 +323,7 @@ def record_run(
     pipeline_result: 'SemanticPipelineResult',
     execution_policy: Optional[dict] = None,
     model_metadata: Optional[dict] = None,
+    raw_output: Optional[dict] = None,
 ) -> SemanticExecutionRun:
     """
     Persist one SemanticPipelineResult to the ledger.
@@ -334,6 +335,9 @@ def record_run(
     unchanged without any additional writes. Candidates are likewise skipped
     on duplicate candidate_id.
 
+    raw_output: pre-normalisation model output (e.g. raw Ollama response text
+        and response payload). Persisted as raw_output_json. None for stub/echo.
+
     Returns the SemanticExecutionRun (existing or newly inserted).
     """
     er = pipeline_result.execution_result
@@ -344,6 +348,7 @@ def record_run(
     input_hash = _derive_input_hash(task.input_text)
     policy_json = json.dumps(execution_policy or {}, sort_keys=True)
     metadata_json = json.dumps(model_metadata or {}, sort_keys=True)
+    raw_output_json = json.dumps(raw_output, sort_keys=True) if raw_output is not None else None
     normalized_json = json.dumps(sr.to_dict(), sort_keys=True) if sr else json.dumps({})
     source_span_json = (
         json.dumps(task.source_span.to_dict(), sort_keys=True)
@@ -373,7 +378,7 @@ def record_run(
                 input_hash, task.input_text,
                 task.source_id, source_span_json,
                 policy_json, metadata_json,
-                None,  # raw_output_json — reserved for real adapters
+                raw_output_json,
                 normalized_json,
                 len(candidates), 0,
                 run_status,

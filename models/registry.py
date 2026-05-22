@@ -17,6 +17,8 @@ Duplicate handling:
 """
 from typing import Dict, List
 
+from typing import Optional
+
 from .adapters import EchoModelAdapter, LocalModelAdapter, StubModelAdapter
 
 
@@ -124,4 +126,36 @@ def make_default_registry() -> AdapterRegistry:
     registry = AdapterRegistry()
     registry.register(StubModelAdapter())
     registry.register(EchoModelAdapter())
+    return registry
+
+
+def make_ollama_registry(
+    model: str,
+    base_url: str = 'http://localhost:11434',
+    version: str = '1.0.0',
+    timeout_seconds: float = 60.0,
+    temperature: float = 0.0,
+    seed: int = 42,
+    num_predict: int = 512,
+) -> AdapterRegistry:
+    """
+    Return a registry pre-populated with built-in adapters plus an OllamaAdapter.
+
+    Requires 'requests' to be installed and a running Ollama instance.
+    Raises ModelContractError if 'requests' is not available.
+
+    The Ollama adapter is registered under the name 'ollama'. Built-in
+    stub and echo adapters are also registered for fallback use.
+    """
+    from .ollama_adapter import OllamaAdapter
+    registry = make_default_registry()
+    registry.register(OllamaAdapter(
+        model=model,
+        base_url=base_url,
+        version=version,
+        timeout_seconds=timeout_seconds,
+        temperature=temperature,
+        seed=seed,
+        num_predict=num_predict,
+    ))
     return registry
