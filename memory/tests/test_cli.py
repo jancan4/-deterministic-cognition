@@ -2,6 +2,7 @@ import json
 import pytest
 from memory import service
 from memory.cli import main
+from memory.embedding_pins import create_pin
 from memory.embeddings import embed_event
 from models.embedding_adapter import StubEmbeddingAdapter
 
@@ -408,6 +409,16 @@ class TestCliReview:
 
 def _embed(db, event, dimensions=4):
     adapter = StubEmbeddingAdapter(dimensions=dimensions)
+    create_pin(
+        db,
+        adapter_name=adapter.adapter_name,
+        adapter_version=adapter.adapter_version,
+        model_name=adapter.model_name,
+        model_digest=adapter.model_digest,
+        dimensions=adapter.dimensions,
+        provider_name=adapter.provider_name,
+        pinned_by='test-operator',
+    )
     return embed_event(db, event, adapter)
 
 

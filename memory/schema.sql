@@ -109,3 +109,25 @@ CREATE INDEX IF NOT EXISTS idx_embeddings_event_id         ON event_embeddings(m
 CREATE INDEX IF NOT EXISTS idx_embeddings_content_hash     ON event_embeddings(content_hash);
 CREATE INDEX IF NOT EXISTS idx_embeddings_status           ON event_embeddings(status);
 CREATE INDEX IF NOT EXISTS idx_embeddings_producer_version ON event_embeddings(producer_version);
+
+CREATE TABLE IF NOT EXISTS embedding_model_pins (
+    id                               INTEGER PRIMARY KEY AUTOINCREMENT,
+    pin_scope                        TEXT    NOT NULL DEFAULT 'global',
+    adapter_name                     TEXT    NOT NULL,
+    adapter_version                  TEXT    NOT NULL,
+    model_name                       TEXT    NOT NULL,
+    model_digest                     TEXT,
+    dimensions                       INTEGER NOT NULL,
+    embedding_visible_fields_version TEXT    NOT NULL DEFAULT '1',
+    pin_identity                     TEXT    NOT NULL,
+    provider_name                    TEXT    NOT NULL,
+    status                           TEXT    NOT NULL DEFAULT 'active',
+    pinned_at                        TEXT    NOT NULL,
+    pinned_by                        TEXT    NOT NULL,
+    superseded_at                    TEXT,
+    superseded_reason                TEXT,
+    notes                            TEXT
+);
+-- idx_pins_scope_status is created by _migrate_to_v5() in service.py, not here.
+-- This avoids CREATE INDEX failing on v4 DBs before the migration runs.
+-- idx_pins_identity and idx_pins_pinned_at follow the same pattern.

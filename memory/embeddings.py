@@ -32,13 +32,17 @@ from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 from .artifact_governance import (
+    EMBEDDING_VISIBLE_FIELDS_VERSION,
     ArtifactStatus,
     GovernanceInvalidationError,
+    GovernancePinError,
     compute_content_hash,
+    compute_pin_identity,
     mark_active,
     mark_invalidated,
     mark_superseded,
 )
+from .embedding_pins import PinRecord, get_active_pin
 from .models import MemoryEvent
 
 # Live statuses: rows eligible for idempotency checks and invalidation.
@@ -144,6 +148,9 @@ def embed_event(
     db_path: str,
     event: MemoryEvent,
     adapter: Any,
+    *,
+    pin_scope: str = 'global',
+    actor: str = 'operator',
 ) -> int:
     """
     Persist a candidate embedding for a memory event.
@@ -153,6 +160,11 @@ def embed_event(
     adapter.dimensions. Checks for an existing live (candidate or active) row
     with the same (memory_event_id, content_hash, producer_version) — returns
     that row's id without inserting if one exists.
+
+    Pin provenance is recorded softly: the current active pin for pin_scope is
+    looked up and its id is stored in provenance_json. Generation can proceed
+    even when no active pin exists (pin_id=None, generation_validated=False).
+    Hard pin enforcement happens at promotion time in promote_embedding().
 
     Does NOT promote the row to active. Does NOT mutate memory_events.
 
@@ -171,9 +183,21 @@ def embed_event(
 
     vector_json = json.dumps(vector, ensure_ascii=True)
     prov = adapter.get_provenance()
-    provenance_json = json.dumps(prov, sort_keys=True, ensure_ascii=True)
     producer_version = adapter.producer_version
     now = _now_utc()
+
+    # Soft pin provenance: record which pin (if any) was active at generation time.
+    active_pin = get_active_pin(db_path, pin_scope=pin_scope)
+    pin_id = active_pin.id if active_pin is not None else None
+    generation_validated = active_pin is not None
+
+    enriched_prov = dict(prov)
+    enriched_prov['embedding_visible_fields_version'] = EMBEDDING_VISIBLE_FIELDS_VERSION
+    enriched_prov['pin_scope'] = pin_scope
+    enriched_prov['pin_id'] = pin_id
+    enriched_prov['generation_validated'] = generation_validated
+    enriched_prov['actor'] = actor
+    provenance_json = json.dumps(enriched_prov, sort_keys=True, ensure_ascii=True)
 
     with _open(db_path) as conn:
         existing = conn.execute(
@@ -262,6 +286,28 @@ def get_active_embedding(
         conn.close()
 
 
+def _validate_candidate_against_pin(
+    candidate: 'EmbeddingRow',
+    pin: PinRecord,
+) -> bool:
+    """
+    Return True iff the candidate's embedding space matches the given pin.
+
+    Recomputes pin_identity from the candidate's provenance fields and compares
+    to pin.pin_identity. Uses the pin's embedding_visible_fields_version for
+    the comparison, ensuring the identity encodes the same field-set version.
+    """
+    candidate_identity = compute_pin_identity(
+        adapter_name=candidate.adapter_name,
+        adapter_version=candidate.adapter_version,
+        model_name=candidate.model_name,
+        model_digest=candidate.model_digest,
+        dimensions=candidate.dimensions,
+        evfv=pin.embedding_visible_fields_version,
+    )
+    return candidate_identity == pin.pin_identity
+
+
 def promote_embedding(
     db_path: str,
     embedding_id: int,
@@ -276,6 +322,12 @@ def promote_embedding(
     same memory_event_id are superseded via mark_superseded() before the candidate
     is promoted via mark_active(). All mutations happen atomically in one connection.
 
+    Pin validation (hard gate): reads pin_scope from the candidate's provenance_json,
+    fetches the CURRENT active pin for that scope, and validates that the candidate's
+    embedding space matches the pin via compute_pin_identity(). Raises GovernancePinError
+    if no active pin exists for the scope or if the identity does not match.
+    Mismatched candidates remain in 'candidate' status (not auto-invalidated).
+
     Persists promotion audit metadata into provenance_json as a 'promotion' sub-key,
     preserving all existing generation provenance fields.
 
@@ -285,6 +337,8 @@ def promote_embedding(
     Raises ValueError for empty reason or operator.
     Raises GovernanceInvalidationError if the row is not in 'candidate' status,
     or if the row does not exist.
+    Raises GovernancePinError if no active pin exists for the candidate's scope,
+    or if the candidate's embedding space does not match the active pin.
     """
     if not reason or not reason.strip():
         raise ValueError("'reason' must not be empty")
@@ -309,6 +363,32 @@ def promote_embedding(
                 f"Cannot promote embedding id={embedding_id}: "
                 f"current status={candidate.status!r}. "
                 f"Only 'candidate' embeddings may be promoted to 'active'."
+            )
+
+        # Pin validation: hard gate at promotion time.
+        candidate_prov = json.loads(candidate.provenance_json)
+        pin_scope = candidate_prov.get('pin_scope', 'global')
+        active_pin = get_active_pin(db_path, pin_scope=pin_scope)
+        if active_pin is None:
+            raise GovernancePinError(
+                f"Cannot promote embedding id={embedding_id}: "
+                f"no active pin for scope={pin_scope!r}. "
+                f"Create a pin via 'pin-embedding-model' before promoting."
+            )
+        if not _validate_candidate_against_pin(candidate, active_pin):
+            expected_identity = compute_pin_identity(
+                adapter_name=candidate.adapter_name,
+                adapter_version=candidate.adapter_version,
+                model_name=candidate.model_name,
+                model_digest=candidate.model_digest,
+                dimensions=candidate.dimensions,
+                evfv=active_pin.embedding_visible_fields_version,
+            )
+            raise GovernancePinError(
+                f"Cannot promote embedding id={embedding_id}: "
+                f"embedding space identity {expected_identity!r} does not match "
+                f"active pin identity {active_pin.pin_identity!r} for scope={pin_scope!r}. "
+                f"Candidate remains in 'candidate' status."
             )
 
         # Supersede all existing active rows for this memory_event_id.
@@ -338,6 +418,9 @@ def promote_embedding(
             'promoted_embedding_id': embedding_id,
             'memory_event_id': candidate.memory_event_id,
             'previous_active_embedding_ids': previous_active_ids,
+            'pin_id': active_pin.id,
+            'pin_scope': pin_scope,
+            'pin_identity': active_pin.pin_identity,
         }
         updated_prov_json = json.dumps(existing_prov, sort_keys=True, ensure_ascii=True)
         conn.execute(

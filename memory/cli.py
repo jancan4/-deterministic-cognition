@@ -158,7 +158,7 @@ def cmd_export(args: argparse.Namespace) -> None:
 
 def cmd_promote_embedding(args: argparse.Namespace) -> None:
     from .embeddings import promote_embedding
-    from .artifact_governance import GovernanceInvalidationError, GovernanceSchemaError
+    from .artifact_governance import GovernanceInvalidationError, GovernancePinError, GovernanceSchemaError
     try:
         row = promote_embedding(
             db_path=args.db,
@@ -166,9 +166,77 @@ def cmd_promote_embedding(args: argparse.Namespace) -> None:
             reason=args.reason,
             operator=args.operator,
         )
-    except (GovernanceInvalidationError, GovernanceSchemaError, ValueError) as exc:
+    except (GovernancePinError, GovernanceInvalidationError, GovernanceSchemaError, ValueError) as exc:
         _die(str(exc))
     print(json.dumps(row.to_dict(), indent=2, sort_keys=True))
+
+
+def cmd_embed_event(args: argparse.Namespace) -> None:
+    from .embeddings import embed_event
+    from .embedding_pins import get_active_pin
+    from .service import NotFoundError, get_memory_event
+    try:
+        event, _, _ = get_memory_event(args.db, args.id)
+    except NotFoundError as exc:
+        _die(str(exc))
+
+    pin = get_active_pin(args.db, pin_scope=args.pin_scope)
+    if pin is None:
+        _die(
+            f"No active pin for scope={args.pin_scope!r}. "
+            f"Create one with 'pin-embedding-model' first."
+        )
+
+    adapter = _adapter_from_pin(pin)
+    embedding_id = embed_event(
+        args.db,
+        event,
+        adapter,
+        pin_scope=args.pin_scope,
+        actor=args.actor,
+    )
+    print(json.dumps({'embedding_id': embedding_id}, indent=2))
+
+
+def cmd_pin_embedding_model(args: argparse.Namespace) -> None:
+    from .embedding_pins import create_pin
+    model_digest = args.model_digest if args.model_digest else None
+    pin = create_pin(
+        args.db,
+        adapter_name=args.adapter_name,
+        adapter_version=args.adapter_version,
+        model_name=args.model_name,
+        model_digest=model_digest,
+        dimensions=args.dimensions,
+        provider_name=args.provider_name,
+        pinned_by=args.pinned_by,
+        pin_scope=args.pin_scope,
+        notes=args.notes,
+    )
+    print(json.dumps(pin.to_dict(), indent=2, sort_keys=True))
+
+
+def cmd_get_active_pin(args: argparse.Namespace) -> None:
+    from .embedding_pins import get_active_pin
+    pin = get_active_pin(args.db, pin_scope=args.pin_scope)
+    if pin is None:
+        print(json.dumps({'active_pin': None, 'pin_scope': args.pin_scope}, indent=2))
+    else:
+        print(json.dumps(pin.to_dict(), indent=2, sort_keys=True))
+
+
+def _adapter_from_pin(pin) -> object:
+    """Instantiate the appropriate EmbeddingAdapter from a PinRecord."""
+    if pin.provider_name == 'stub':
+        from models.embedding_adapter import StubEmbeddingAdapter
+        return StubEmbeddingAdapter(dimensions=pin.dimensions)
+    if pin.provider_name == 'ollama':
+        from models.ollama_embedding_adapter import OllamaEmbeddingAdapter
+        return OllamaEmbeddingAdapter(
+            pin.model_name,
+            expected_dimensions=pin.dimensions,
+        )
+    _die(f"Unknown provider_name={pin.provider_name!r}. Supported: 'stub', 'ollama'.")
 
 
 def cmd_review(args: argparse.Namespace) -> None:
@@ -204,6 +272,9 @@ _COMMANDS = {
     'export': cmd_export,
     'review': cmd_review,
     'promote-embedding': cmd_promote_embedding,
+    'embed-event': cmd_embed_event,
+    'pin-embedding-model': cmd_pin_embedding_model,
+    'get-active-pin': cmd_get_active_pin,
 }
 
 
@@ -300,6 +371,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_promo.add_argument('--id', required=True, type=int, help='Embedding id')
     p_promo.add_argument('--reason', required=True, help='Reason for promotion')
     p_promo.add_argument('--operator', required=True, help='Operator identifier')
+
+    # embed-event
+    p_embed = sub.add_parser('embed-event', parents=[_db],
+                              help='Generate and persist a candidate embedding for a memory event')
+    p_embed.add_argument('--id', required=True, type=int, help='Memory event id')
+    p_embed.add_argument('--pin-scope', dest='pin_scope', default='global',
+                         help='Pin scope to resolve adapter from (default: global)')
+    p_embed.add_argument('--actor', default='operator',
+                         help='Actor identifier for provenance (default: operator)')
+
+    # pin-embedding-model
+    p_pin = sub.add_parser('pin-embedding-model', parents=[_db],
+                            help='Pin an embedding model as the governed embedding space')
+    p_pin.add_argument('--adapter-name', required=True, dest='adapter_name')
+    p_pin.add_argument('--adapter-version', required=True, dest='adapter_version')
+    p_pin.add_argument('--model-name', required=True, dest='model_name')
+    p_pin.add_argument('--model-digest', dest='model_digest', default=None,
+                       help='Content-addressable model hash (optional)')
+    p_pin.add_argument('--dimensions', required=True, type=int)
+    p_pin.add_argument('--provider-name', required=True, dest='provider_name')
+    p_pin.add_argument('--pinned-by', required=True, dest='pinned_by')
+    p_pin.add_argument('--pin-scope', dest='pin_scope', default='global')
+    p_pin.add_argument('--notes', default=None)
+
+    # get-active-pin
+    p_gap = sub.add_parser('get-active-pin', parents=[_db],
+                            help='Show the active embedding model pin for a scope')
+    p_gap.add_argument('--pin-scope', dest='pin_scope', default='global')
 
     return parser
 

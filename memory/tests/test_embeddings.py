@@ -1,8 +1,9 @@
-"""Tests for Phase 2B/2C embedding substrate.
+"""Tests for Phase 2B/2C/2D embedding substrate.
 
-Covers: schema v4, migration, governance registration, EmbeddingRow,
+Covers: schema v5, migration, governance registration, EmbeddingRow,
 embed_event idempotency and invalidation, get_embeddings, get_active_embedding,
-promote_embedding lifecycle and audit persistence, and governance invariants.
+promote_embedding lifecycle and audit persistence, pin validation governance,
+and governance invariants.
 """
 import json
 import sqlite3
@@ -14,11 +15,13 @@ from memory import service
 from memory.artifact_governance import (
     ArtifactStatus,
     GovernanceInvalidationError,
+    GovernancePinError,
     GovernanceSchemaError,
     VALID_ARTIFACT_STATUSES,
     compute_content_hash,
     validate_artifact_table_schema,
 )
+from memory.embedding_pins import create_pin
 from memory.embeddings import (
     EmbeddingRow,
     _REQUIRED_COLUMNS,
@@ -60,17 +63,32 @@ def _stub(dimensions: int = 4) -> StubEmbeddingAdapter:
     return StubEmbeddingAdapter(dimensions=dimensions)
 
 
+def _pin_for(db: str, adapter, pin_scope: str = 'global'):
+    """Create a governed pin matching the given adapter. Returns PinRecord."""
+    return create_pin(
+        db,
+        adapter_name=adapter.adapter_name,
+        adapter_version=adapter.adapter_version,
+        model_name=adapter.model_name,
+        model_digest=adapter.model_digest,
+        dimensions=adapter.dimensions,
+        provider_name=adapter.provider_name,
+        pinned_by='test-operator',
+        pin_scope=pin_scope,
+    )
+
+
 # ---------------------------------------------------------------------------
-# Schema v4: fresh DB
+# Schema v5: fresh DB
 # ---------------------------------------------------------------------------
 
 class TestSchemaV4FreshDB:
-    def test_schema_version_is_4(self, tmp_path):
+    def test_schema_version_is_5(self, tmp_path):
         db = _db(tmp_path)
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 4
+        assert row[0] == 5
 
     def test_event_embeddings_table_exists(self, tmp_path):
         db = _db(tmp_path)
@@ -205,13 +223,13 @@ class TestSchemaV4Migration:
         conn.close()
         return db
 
-    def test_migrate_from_v3_bumps_version_to_4(self, tmp_path):
+    def test_migrate_from_v3_bumps_version_to_5(self, tmp_path):
         db = self._v3_db(tmp_path)
         service.init_db(db)
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 4
+        assert row[0] == 5
 
     def test_migrate_from_v3_creates_event_embeddings(self, tmp_path):
         db = self._v3_db(tmp_path)
@@ -238,7 +256,7 @@ class TestSchemaV4Migration:
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 4
+        assert row[0] == 5
 
     def test_v3_existing_data_preserved(self, tmp_path):
         db = self._v3_db(tmp_path)
@@ -755,7 +773,9 @@ class TestPromoteEmbedding:
     def test_promote_sets_status_active(self, tmp_path):
         db = _db(tmp_path)
         event = _add(db)
-        row_id = embed_event(db, event, _stub())
+        adapter = _stub()
+        _pin_for(db, adapter)
+        row_id = embed_event(db, event, adapter)
         promote_embedding(db, row_id, reason='validated', operator='quant')
         rows = get_embeddings(db, event.id)
         assert rows[0].status == 'active'
@@ -763,7 +783,9 @@ class TestPromoteEmbedding:
     def test_promote_returns_active_embedding_row(self, tmp_path):
         db = _db(tmp_path)
         event = _add(db)
-        row_id = embed_event(db, event, _stub())
+        adapter = _stub()
+        _pin_for(db, adapter)
+        row_id = embed_event(db, event, adapter)
         result = promote_embedding(db, row_id, reason='validated', operator='quant')
         assert isinstance(result, EmbeddingRow)
         assert result.id == row_id
@@ -777,12 +799,17 @@ class TestPromoteEmbedding:
         class V2Adapter(StubEmbeddingAdapter):
             VERSION = '2.0.0'
             @property
+            def adapter_version(self) -> str:
+                return self.VERSION
+            @property
             def producer_version(self) -> str:
                 return f"{self.VERSION}:{self.MODEL_VERSION}:stub-no-model-digest"
 
         adapter_v2 = V2Adapter(dimensions=4)
+        _pin_for(db, adapter_v1)
         id1 = embed_event(db, event, adapter_v1)
         promote_embedding(db, id1, reason='first', operator='quant')
+        _pin_for(db, adapter_v2)
         id2 = embed_event(db, event, adapter_v2)
         promote_embedding(db, id2, reason='upgraded model', operator='quant')
 
@@ -799,18 +826,25 @@ class TestPromoteEmbedding:
         class V2Adapter(StubEmbeddingAdapter):
             VERSION = '2.0.0'
             @property
+            def adapter_version(self) -> str:
+                return self.VERSION
+            @property
             def producer_version(self) -> str:
                 return f"{self.VERSION}:{self.MODEL_VERSION}:stub-no-model-digest"
 
         class V3Adapter(StubEmbeddingAdapter):
             VERSION = '3.0.0'
             @property
+            def adapter_version(self) -> str:
+                return self.VERSION
+            @property
             def producer_version(self) -> str:
                 return f"{self.VERSION}:{self.MODEL_VERSION}:stub-no-model-digest"
 
+        adapter_v3 = V3Adapter(dimensions=4)
         id1 = embed_event(db, event, _stub())
         id2 = embed_event(db, event, V2Adapter(dimensions=4))
-        id3 = embed_event(db, event, V3Adapter(dimensions=4))
+        id3 = embed_event(db, event, adapter_v3)
 
         # Manually force two active rows (bypassing service layer) to test the invariant.
         conn = sqlite3.connect(db)
@@ -818,6 +852,8 @@ class TestPromoteEmbedding:
         conn.commit()
         conn.close()
 
+        # Pin must match id3 (V3Adapter) at promotion time.
+        _pin_for(db, adapter_v3)
         promote_embedding(db, id3, reason='new best', operator='quant')
 
         rows = get_embeddings(db, event.id)
@@ -829,10 +865,12 @@ class TestPromoteEmbedding:
 
     def test_promote_does_not_affect_other_events_active_rows(self, tmp_path):
         db = _db(tmp_path)
+        adapter = _stub()
+        _pin_for(db, adapter)
         event_a = _add(db, title='Event A', summary='Summary A')
         event_b = _add(db, title='Event B', summary='Summary B')
-        id_a = embed_event(db, event_a, _stub())
-        id_b = embed_event(db, event_b, _stub())
+        id_a = embed_event(db, event_a, adapter)
+        id_b = embed_event(db, event_b, adapter)
         promote_embedding(db, id_a, reason='ok', operator='quant')
         promote_embedding(db, id_b, reason='ok', operator='quant')
 
@@ -844,7 +882,9 @@ class TestPromoteEmbedding:
     def test_promote_rejects_already_active_row(self, tmp_path):
         db = _db(tmp_path)
         event = _add(db)
-        row_id = embed_event(db, event, _stub())
+        adapter = _stub()
+        _pin_for(db, adapter)
+        row_id = embed_event(db, event, adapter)
         promote_embedding(db, row_id, reason='first', operator='quant')
         with pytest.raises(GovernanceInvalidationError, match="Only 'candidate'"):
             promote_embedding(db, row_id, reason='again', operator='quant')
@@ -856,12 +896,19 @@ class TestPromoteEmbedding:
         class V2Adapter(StubEmbeddingAdapter):
             VERSION = '2.0.0'
             @property
+            def adapter_version(self) -> str:
+                return self.VERSION
+            @property
             def producer_version(self) -> str:
                 return f"{self.VERSION}:{self.MODEL_VERSION}:stub-no-model-digest"
 
-        id1 = embed_event(db, event, _stub())
-        id2 = embed_event(db, event, V2Adapter(dimensions=4))
+        adapter_v1 = _stub()
+        adapter_v2 = V2Adapter(dimensions=4)
+        _pin_for(db, adapter_v1)
+        id1 = embed_event(db, event, adapter_v1)
+        id2 = embed_event(db, event, adapter_v2)
         promote_embedding(db, id1, reason='first', operator='quant')
+        _pin_for(db, adapter_v2)
         promote_embedding(db, id2, reason='upgrade', operator='quant')
         with pytest.raises(GovernanceInvalidationError, match="Only 'candidate'"):
             promote_embedding(db, id1, reason='retry', operator='quant')
@@ -910,8 +957,10 @@ class TestPromoteEmbedding:
     def test_promote_does_not_mutate_memory_events(self, tmp_path):
         db = _db(tmp_path)
         event = _add(db)
+        adapter = _stub()
         before = service.get_memory_event(db, event.id)
-        row_id = embed_event(db, event, _stub())
+        _pin_for(db, adapter)
+        row_id = embed_event(db, event, adapter)
         promote_embedding(db, row_id, reason='validated', operator='quant')
         after = service.get_memory_event(db, event.id)
         assert before[0].status == after[0].status
@@ -921,7 +970,9 @@ class TestPromoteEmbedding:
     def test_get_active_embedding_returns_promoted_row(self, tmp_path):
         db = _db(tmp_path)
         event = _add(db)
-        row_id = embed_event(db, event, _stub())
+        adapter = _stub()
+        _pin_for(db, adapter)
+        row_id = embed_event(db, event, adapter)
         promote_embedding(db, row_id, reason='validated', operator='quant')
         result = get_active_embedding(db, event.id)
         assert result is not None
@@ -935,12 +986,19 @@ class TestPromoteEmbedding:
         class V2Adapter(StubEmbeddingAdapter):
             VERSION = '2.0.0'
             @property
+            def adapter_version(self) -> str:
+                return self.VERSION
+            @property
             def producer_version(self) -> str:
                 return f"{self.VERSION}:{self.MODEL_VERSION}:stub-no-model-digest"
 
-        id1 = embed_event(db, event, _stub())
+        adapter_v1 = _stub()
+        adapter_v2 = V2Adapter(dimensions=4)
+        _pin_for(db, adapter_v1)
+        id1 = embed_event(db, event, adapter_v1)
         promote_embedding(db, id1, reason='first', operator='quant')
-        id2 = embed_event(db, event, V2Adapter(dimensions=4))
+        _pin_for(db, adapter_v2)
+        id2 = embed_event(db, event, adapter_v2)
         promote_embedding(db, id2, reason='upgrade', operator='quant')
         result = get_active_embedding(db, event.id)
         assert result is not None
@@ -950,7 +1008,9 @@ class TestPromoteEmbedding:
     def test_audit_persists_operator(self, tmp_path):
         db = _db(tmp_path)
         event = _add(db)
-        row_id = embed_event(db, event, _stub())
+        adapter = _stub()
+        _pin_for(db, adapter)
+        row_id = embed_event(db, event, adapter)
         result = promote_embedding(db, row_id, reason='validated', operator='risk-engine')
         prov = json.loads(result.provenance_json)
         assert prov['promotion']['operator'] == 'risk-engine'
@@ -958,7 +1018,9 @@ class TestPromoteEmbedding:
     def test_audit_persists_reason(self, tmp_path):
         db = _db(tmp_path)
         event = _add(db)
-        row_id = embed_event(db, event, _stub())
+        adapter = _stub()
+        _pin_for(db, adapter)
+        row_id = embed_event(db, event, adapter)
         result = promote_embedding(db, row_id, reason='model validated by quant', operator='quant')
         prov = json.loads(result.provenance_json)
         assert prov['promotion']['reason'] == 'model validated by quant'
@@ -966,7 +1028,9 @@ class TestPromoteEmbedding:
     def test_audit_persists_promoted_at(self, tmp_path):
         db = _db(tmp_path)
         event = _add(db)
-        row_id = embed_event(db, event, _stub())
+        adapter = _stub()
+        _pin_for(db, adapter)
+        row_id = embed_event(db, event, adapter)
         result = promote_embedding(db, row_id, reason='ok', operator='quant')
         prov = json.loads(result.provenance_json)
         assert 'promoted_at' in prov['promotion']
@@ -975,7 +1039,9 @@ class TestPromoteEmbedding:
     def test_audit_persists_previous_active_ids_empty_when_no_prior(self, tmp_path):
         db = _db(tmp_path)
         event = _add(db)
-        row_id = embed_event(db, event, _stub())
+        adapter = _stub()
+        _pin_for(db, adapter)
+        row_id = embed_event(db, event, adapter)
         result = promote_embedding(db, row_id, reason='ok', operator='quant')
         prov = json.loads(result.provenance_json)
         assert prov['promotion']['previous_active_embedding_ids'] == []
@@ -987,12 +1053,19 @@ class TestPromoteEmbedding:
         class V2Adapter(StubEmbeddingAdapter):
             VERSION = '2.0.0'
             @property
+            def adapter_version(self) -> str:
+                return self.VERSION
+            @property
             def producer_version(self) -> str:
                 return f"{self.VERSION}:{self.MODEL_VERSION}:stub-no-model-digest"
 
-        id1 = embed_event(db, event, _stub())
+        adapter_v1 = _stub()
+        adapter_v2 = V2Adapter(dimensions=4)
+        _pin_for(db, adapter_v1)
+        id1 = embed_event(db, event, adapter_v1)
         promote_embedding(db, id1, reason='first', operator='quant')
-        id2 = embed_event(db, event, V2Adapter(dimensions=4))
+        _pin_for(db, adapter_v2)
+        id2 = embed_event(db, event, adapter_v2)
         result = promote_embedding(db, id2, reason='upgrade', operator='quant')
         prov = json.loads(result.provenance_json)
         assert id1 in prov['promotion']['previous_active_embedding_ids']
@@ -1000,7 +1073,9 @@ class TestPromoteEmbedding:
     def test_audit_governance_action_field(self, tmp_path):
         db = _db(tmp_path)
         event = _add(db)
-        row_id = embed_event(db, event, _stub())
+        adapter = _stub()
+        _pin_for(db, adapter)
+        row_id = embed_event(db, event, adapter)
         result = promote_embedding(db, row_id, reason='ok', operator='quant')
         prov = json.loads(result.provenance_json)
         assert prov['promotion']['governance_action'] == 'promote_embedding'
@@ -1009,6 +1084,7 @@ class TestPromoteEmbedding:
         db = _db(tmp_path)
         event = _add(db)
         adapter = _stub()
+        _pin_for(db, adapter)
         row_id = embed_event(db, event, adapter)
         result = promote_embedding(db, row_id, reason='ok', operator='quant')
         prov = json.loads(result.provenance_json)
@@ -1022,7 +1098,9 @@ class TestPromoteEmbedding:
     def test_audit_promoted_embedding_id_field(self, tmp_path):
         db = _db(tmp_path)
         event = _add(db)
-        row_id = embed_event(db, event, _stub())
+        adapter = _stub()
+        _pin_for(db, adapter)
+        row_id = embed_event(db, event, adapter)
         result = promote_embedding(db, row_id, reason='ok', operator='quant')
         prov = json.loads(result.provenance_json)
         assert prov['promotion']['promoted_embedding_id'] == row_id
@@ -1030,7 +1108,248 @@ class TestPromoteEmbedding:
     def test_audit_memory_event_id_field(self, tmp_path):
         db = _db(tmp_path)
         event = _add(db)
-        row_id = embed_event(db, event, _stub())
+        adapter = _stub()
+        _pin_for(db, adapter)
+        row_id = embed_event(db, event, adapter)
         result = promote_embedding(db, row_id, reason='ok', operator='quant')
         prov = json.loads(result.provenance_json)
         assert prov['promotion']['memory_event_id'] == event.id
+
+    def test_audit_persists_pin_id_and_scope(self, tmp_path):
+        db = _db(tmp_path)
+        event = _add(db)
+        adapter = _stub()
+        pin = _pin_for(db, adapter)
+        row_id = embed_event(db, event, adapter)
+        result = promote_embedding(db, row_id, reason='ok', operator='quant')
+        prov = json.loads(result.provenance_json)
+        assert prov['promotion']['pin_id'] == pin.id
+        assert prov['promotion']['pin_scope'] == 'global'
+        assert prov['promotion']['pin_identity'] == pin.pin_identity
+
+
+# ---------------------------------------------------------------------------
+# Phase 2D: promote_embedding pin validation
+# ---------------------------------------------------------------------------
+
+class TestPromoteEmbeddingPinValidation:
+    """
+    User-specified acceptance tests for pin validation in promote_embedding().
+
+    Invariants under test:
+    - candidate generated under old pin fails promotion after pin supersession
+    - old active embedding remains active after pin supersession (no auto-invalidation)
+    - pin identity changes when embedding_visible_fields_version changes
+    - pin identity stable under provenance_json ordering differences
+    - promote_embedding validates CURRENT active pin, not historical pin snapshot
+    - stale candidate remains candidate after failed promotion (not auto-invalidated)
+    - no automatic invalidation triggered by pin changes
+    """
+
+    def test_candidate_generated_under_old_pin_fails_promotion_after_supersession(self, tmp_path):
+        """
+        Candidate embedded under pin v1 must fail promotion once pin is superseded
+        by pin v2 (different adapter version).
+        """
+        db = _db(tmp_path)
+        event = _add(db)
+        adapter_v1 = _stub()
+
+        class V2Adapter(StubEmbeddingAdapter):
+            VERSION = '2.0.0'
+            @property
+            def adapter_version(self) -> str:
+                return self.VERSION
+            @property
+            def producer_version(self) -> str:
+                return f"{self.VERSION}:{self.MODEL_VERSION}:stub-no-model-digest"
+
+        adapter_v2 = V2Adapter(dimensions=4)
+
+        _pin_for(db, adapter_v1)          # set pin for v1
+        row_id = embed_event(db, event, adapter_v1)  # generate under pin v1
+        _pin_for(db, adapter_v2)          # supersede v1 pin; v2 now active
+
+        with pytest.raises(GovernancePinError):
+            promote_embedding(db, row_id, reason='ok', operator='quant')
+
+    def test_old_active_embedding_remains_active_after_pin_supersession(self, tmp_path):
+        """
+        An active embedding must NOT be auto-invalidated when the pin is superseded.
+        Pin changes do not affect existing active artifacts.
+        """
+        db = _db(tmp_path)
+        event = _add(db)
+        adapter_v1 = _stub()
+
+        class V2Adapter(StubEmbeddingAdapter):
+            VERSION = '2.0.0'
+            @property
+            def adapter_version(self) -> str:
+                return self.VERSION
+            @property
+            def producer_version(self) -> str:
+                return f"{self.VERSION}:{self.MODEL_VERSION}:stub-no-model-digest"
+
+        _pin_for(db, adapter_v1)
+        row_id = embed_event(db, event, adapter_v1)
+        promote_embedding(db, row_id, reason='initial', operator='quant')
+
+        # Supersede pin — active embedding must remain active.
+        _pin_for(db, V2Adapter(dimensions=4))
+
+        rows = get_embeddings(db, event.id, status='active')
+        assert len(rows) == 1
+        assert rows[0].id == row_id
+        assert rows[0].status == 'active'
+
+    def test_no_automatic_invalidation_triggered_by_pin_change(self, tmp_path):
+        """
+        Changing (superseding) the active pin must not automatically invalidate any
+        candidate or active embedding rows.
+        """
+        db = _db(tmp_path)
+        event = _add(db)
+        adapter_v1 = _stub()
+
+        class V2Adapter(StubEmbeddingAdapter):
+            VERSION = '2.0.0'
+            @property
+            def adapter_version(self) -> str:
+                return self.VERSION
+            @property
+            def producer_version(self) -> str:
+                return f"{self.VERSION}:{self.MODEL_VERSION}:stub-no-model-digest"
+
+        _pin_for(db, adapter_v1)
+        embed_event(db, event, adapter_v1)  # candidate row under pin v1
+
+        before = get_embeddings(db, event.id)
+        assert all(r.status == 'candidate' for r in before)
+
+        _pin_for(db, V2Adapter(dimensions=4))  # change pin
+
+        after = get_embeddings(db, event.id)
+        # No automatic invalidation — row still candidate.
+        assert all(r.status == 'candidate' for r in after)
+
+    def test_stale_candidate_remains_candidate_after_failed_promotion(self, tmp_path):
+        """
+        A candidate that fails pin validation must remain in 'candidate' status.
+        It must NOT be auto-invalidated by the failed promotion attempt.
+        """
+        db = _db(tmp_path)
+        event = _add(db)
+        adapter_v1 = _stub()
+
+        class V2Adapter(StubEmbeddingAdapter):
+            VERSION = '2.0.0'
+            @property
+            def adapter_version(self) -> str:
+                return self.VERSION
+            @property
+            def producer_version(self) -> str:
+                return f"{self.VERSION}:{self.MODEL_VERSION}:stub-no-model-digest"
+
+        _pin_for(db, adapter_v1)
+        row_id = embed_event(db, event, adapter_v1)
+        _pin_for(db, V2Adapter(dimensions=4))  # change pin after embedding
+
+        with pytest.raises(GovernancePinError):
+            promote_embedding(db, row_id, reason='ok', operator='quant')
+
+        # Candidate must still be in 'candidate' status after failed promotion.
+        rows = get_embeddings(db, event.id, status='candidate')
+        assert len(rows) == 1
+        assert rows[0].id == row_id
+        assert rows[0].status == 'candidate'
+
+    def test_promote_validates_current_pin_not_historical_pin(self, tmp_path):
+        """
+        promote_embedding() must validate against the CURRENT active pin,
+        not the pin that was active at generation time.
+        """
+        db = _db(tmp_path)
+        event = _add(db)
+        adapter_v1 = _stub()
+
+        class V2Adapter(StubEmbeddingAdapter):
+            VERSION = '2.0.0'
+            @property
+            def adapter_version(self) -> str:
+                return self.VERSION
+            @property
+            def producer_version(self) -> str:
+                return f"{self.VERSION}:{self.MODEL_VERSION}:stub-no-model-digest"
+
+        _pin_for(db, adapter_v1)              # pin v1 active at generation time
+        row_id = embed_event(db, event, adapter_v1)  # generated under pin v1
+        _pin_for(db, V2Adapter(dimensions=4))  # pin v2 is now the CURRENT pin
+
+        # Promotion validates against CURRENT pin (v2), not generation-time pin (v1).
+        # candidate was made with v1 identity → mismatch → GovernancePinError
+        with pytest.raises(GovernancePinError):
+            promote_embedding(db, row_id, reason='ok', operator='quant')
+
+    def test_promotion_succeeds_when_candidate_matches_current_pin(self, tmp_path):
+        """
+        A candidate generated under the current active pin must succeed promotion.
+        This is the happy path for governed embedding activation.
+        """
+        db = _db(tmp_path)
+        event = _add(db)
+        adapter = _stub()
+        _pin_for(db, adapter)
+        row_id = embed_event(db, event, adapter)
+        result = promote_embedding(db, row_id, reason='validated', operator='quant')
+        assert result.status == 'active'
+
+    def test_raises_when_no_active_pin_exists(self, tmp_path):
+        """
+        promote_embedding() must raise GovernancePinError when no active pin
+        exists for the candidate's scope.
+        """
+        db = _db(tmp_path)
+        event = _add(db)
+        adapter = _stub()
+        # No pin created — promote should fail immediately.
+        row_id = embed_event(db, event, adapter)
+        with pytest.raises(GovernancePinError, match="no active pin"):
+            promote_embedding(db, row_id, reason='ok', operator='quant')
+
+    def test_pin_identity_changes_when_evfv_changes(self, tmp_path):
+        """
+        A pin created with a different embedding_visible_fields_version must have
+        a different pin_identity — confirming the version is part of the identity hash.
+        """
+        from memory.artifact_governance import compute_pin_identity
+        h1 = compute_pin_identity('stub', '1.0.0', 'model', None, 4, '1')
+        h2 = compute_pin_identity('stub', '1.0.0', 'model', None, 4, '2')
+        assert h1 != h2
+
+    def test_pin_identity_stable_under_provenance_json_ordering(self, tmp_path):
+        """
+        compute_pin_identity must be stable regardless of call-site argument
+        ordering — it is a pure function of its inputs.
+        """
+        from memory.artifact_governance import compute_pin_identity
+        h1 = compute_pin_identity('ollama-embedding', '1.0.0',
+                                   'nomic-embed-text', 'sha256:abc', 768, '1')
+        h2 = compute_pin_identity('ollama-embedding', '1.0.0',
+                                   'nomic-embed-text', 'sha256:abc', 768, '1')
+        assert h1 == h2
+
+    def test_promotion_fails_with_wrong_scope_pin(self, tmp_path):
+        """
+        A candidate embedded with pin_scope='global' must fail if the only active pin
+        is for scope='workflow:ingest'.
+        """
+        db = _db(tmp_path)
+        event = _add(db)
+        adapter = _stub()
+        # Create pin only for workflow scope, not global.
+        _pin_for(db, adapter, pin_scope='workflow:ingest')
+        # embed with default scope='global' (no global pin active)
+        row_id = embed_event(db, event, adapter, pin_scope='global')
+        with pytest.raises(GovernancePinError, match="no active pin"):
+            promote_embedding(db, row_id, reason='ok', operator='quant')

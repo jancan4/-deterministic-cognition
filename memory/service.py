@@ -12,7 +12,7 @@ from .models import (
 )
 
 _SCHEMA = Path(__file__).parent / 'schema.sql'
-_MEMORY_SCHEMA_VERSION = 4
+_MEMORY_SCHEMA_VERSION = 5
 
 
 class ValidationError(ValueError):
@@ -44,6 +44,27 @@ def _validate_confidence(confidence: int) -> None:
         raise ValidationError(
             f"confidence must be {CONFIDENCE_MIN}–{CONFIDENCE_MAX}, got {confidence}"
         )
+
+
+def _migrate_to_v5(conn: sqlite3.Connection) -> None:
+    # embedding_model_pins was added to schema.sql in v5. For all DBs (fresh and
+    # upgraded), executescript() runs before this function and creates the table
+    # via CREATE TABLE IF NOT EXISTS. This function idempotently ensures all three
+    # governance indices exist, mirroring the _migrate_to_v3/_migrate_to_v4 pattern.
+    # Indices are created here (not in schema.sql) so they are never attempted
+    # before the table exists on pre-v5 DBs.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pins_scope_status "
+        "ON embedding_model_pins(pin_scope, status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pins_identity "
+        "ON embedding_model_pins(pin_identity)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pins_pinned_at "
+        "ON embedding_model_pins(pinned_at)"
+    )
 
 
 def _migrate_to_v4(conn: sqlite3.Connection) -> None:
@@ -87,9 +108,11 @@ def init_db(db_path: str) -> None:
             # Fresh DB: schema.sql created retrieval_log with status, but the
             # status index is not in schema.sql (see comment there). Run
             # _migrate_to_v3 to create it idempotently. Run _migrate_to_v4 to
-            # idempotently ensure event_embeddings indices exist.
+            # idempotently ensure event_embeddings indices exist. Run
+            # _migrate_to_v5 to idempotently ensure embedding_model_pins indices exist.
             _migrate_to_v3(conn)
             _migrate_to_v4(conn)
+            _migrate_to_v5(conn)
             conn.execute(
                 'INSERT INTO memory_schema_version (version) VALUES (?)',
                 (_MEMORY_SCHEMA_VERSION,)
@@ -99,6 +122,8 @@ def init_db(db_path: str) -> None:
                 _migrate_to_v3(conn)
             if row['version'] < 4:
                 _migrate_to_v4(conn)
+            if row['version'] < 5:
+                _migrate_to_v5(conn)
             conn.execute(
                 'UPDATE memory_schema_version SET version = ?',
                 (_MEMORY_SCHEMA_VERSION,)

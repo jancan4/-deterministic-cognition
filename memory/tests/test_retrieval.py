@@ -704,14 +704,14 @@ class TestGovernanceOnRetrieval:
 
 
 class TestMemorySchemaVersion:
-    def test_init_db_sets_schema_version_4(self, tmp_path):
+    def test_init_db_sets_schema_version_5(self, tmp_path):
         db = str(tmp_path / 'mem.db')
         service.init_db(db)
         import sqlite3
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 4
+        assert row[0] == 5
 
     def test_init_db_idempotent(self, tmp_path):
         db = str(tmp_path / 'mem.db')
@@ -721,7 +721,7 @@ class TestMemorySchemaVersion:
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 4
+        assert row[0] == 5
 
     def test_migrate_from_v2_adds_status_column(self, tmp_path):
         """Simulate a v2 DB without status column and verify migration adds it."""
@@ -773,7 +773,7 @@ class TestMemorySchemaVersion:
         version_row = conn2.execute('SELECT version FROM memory_schema_version').fetchone()
         conn2.close()
         assert 'status' in cols
-        assert version_row[0] == 4
+        assert version_row[0] == 5
 
     def test_migrate_from_v2_backfills_existing_rows(self, tmp_path):
         """Rows inserted before migration must have status='active' after migration."""
@@ -875,4 +875,4 @@ class TestMemorySchemaVersion:
         conn2 = sqlite3.connect(db)
         row = conn2.execute('SELECT version FROM memory_schema_version').fetchone()
         conn2.close()
-        assert row[0] == 4
+        assert row[0] == 5

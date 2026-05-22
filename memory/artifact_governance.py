@@ -73,8 +73,15 @@ VALID_ARTIFACT_STATUSES: FrozenSet[str] = frozenset({
 # GOVERNANCE INVARIANT: Do NOT expand this set without governance review.
 # Expanding embedding-visible fields silently changes which memory_event
 # revisions trigger embedding invalidation and alters replay semantics.
-# Any expansion requires a producer_version bump in the embedding substrate.
+# Any expansion requires a producer_version bump in the embedding substrate
+# AND an increment to EMBEDDING_VISIBLE_FIELDS_VERSION.
 EMBEDDING_VISIBLE_FIELDS: FrozenSet[str] = frozenset({'title', 'summary'})
+
+# Version token for the embedding-visible field set. Must be incremented
+# whenever EMBEDDING_VISIBLE_FIELDS changes. Stored in every embedding row's
+# provenance_json and in every embedding_model_pins record. Pin identity and
+# candidate validation both depend on this version being stable.
+EMBEDDING_VISIBLE_FIELDS_VERSION: str = '1'
 
 # Allowlist of governed derived artifact table names for invalidation helpers.
 # mark_invalidated() and mark_superseded() refuse to operate on unlisted tables.
@@ -100,6 +107,45 @@ class GovernanceSchemaError(Exception):
 
 class GovernanceInvalidationError(ValueError):
     """Raised when an invalidation attempt violates the append-only state machine."""
+
+
+class GovernancePinError(GovernanceInvalidationError):
+    """Raised when a promotion attempt fails pin validation.
+
+    This occurs when the candidate embedding's computed pin identity does not
+    match the current active pin for its scope, or when no active pin exists
+    for the scope at promotion time.
+    """
+
+
+def compute_pin_identity(
+    adapter_name: str,
+    adapter_version: str,
+    model_name: str,
+    model_digest: Optional[str],
+    dimensions: int,
+    evfv: str,
+) -> str:
+    """
+    Deterministic hash identifying an embedding space configuration.
+
+    Two embedding spaces are equivalent iff their pin_identity matches.
+    model_digest=None is represented as the literal string 'null' so the
+    identity remains stable regardless of Python None hashing behaviour.
+
+    Fields joined with NUL bytes (same anti-collision technique as content_hash).
+    Returns sha256[:16] hex string.
+    """
+    parts = [
+        adapter_name,
+        adapter_version,
+        model_name,
+        model_digest if model_digest is not None else 'null',
+        str(dimensions),
+        evfv,
+    ]
+    raw = '\x00'.join(parts).encode('utf-8')
+    return hashlib.sha256(raw).hexdigest()[:16]
 
 
 def compute_content_hash(title: str, summary: str) -> str:
