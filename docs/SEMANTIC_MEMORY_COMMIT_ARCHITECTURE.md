@@ -17,37 +17,26 @@ introduces:
 
 ---
 
-## KNOWN LIMITATION — Continuity Bundle Portability
+## Continuity Bundle Portability (Resolved — Schema 1.1)
 
-**The continuity bundle exporter (`continuity/exporter.py`) does not yet
-export `semantic_execution_runs` or `semantic_candidate_events`.**
-
-The consequence is:
+**As of the `feature/continuity-semantic-ledger-bundle` milestone, `semantic_execution_runs`
+and `semantic_candidate_events` are fully exported and imported by the continuity bundle layer.**
 
 | Artifact | Portable via bundle | Notes |
 |----------|--------------------|----|
 | Promoted `memory_events` | **Yes** | Row written to `memory_events`; included in bundle |
 | `evidence` string (references run/candidate ID) | **Yes** | Stored in `memory_events.evidence`; preserved in bundle |
 | `memory_revisions` (approval/rejection history) | **Yes** | Included in bundle |
-| `semantic_execution_runs` rows | **No** | Source-system-local only |
-| `semantic_candidate_events` rows | **No** | Source-system-local only |
-| Full semantic provenance (normalized_result, source_span, provenance_json) | **No** | Source-system-local only |
-| Replay of candidate generation | **No** | Requires ledger rows + original adapter |
+| `semantic_execution_runs` rows | **Yes (schema 1.1)** | Exported for promoted candidates only |
+| `semantic_candidate_events` rows | **Yes (schema 1.1)** | Exported for promoted candidates only |
+| Full semantic provenance (normalized_result, source_span, provenance_json) | **Yes (schema 1.1)** | Included in ledger row export |
+| Unpromoted / rejected candidates | **No** | Source-system-local only; never bundled |
 
-**This is an accepted, explicit milestone limitation.** It is not treated as
-complete provenance portability. Ledger bundle support is planned as a
-follow-on milestone.
-
-The evidence string format is designed for future resolution:
+The evidence string remains parseable for resolution on any substrate:
 
 ```
 semantic:local_model:stub:1.0.0 | run:a9e1774d0baea132 | candidate:3f8c1a2b9d4e7f01
 ```
-
-Given only a promoted `memory_event` on a new substrate, an operator can:
-- See the adapter name and version from the evidence string.
-- Know the run_id and candidate_id that would exist in the source system's ledger.
-- Re-run extraction on the original source (if available) to regenerate ledger rows.
 
 ---
 
@@ -220,10 +209,8 @@ initializing the memory schema.
 
 ## Follow-On Work (Not This Milestone)
 
-1. **Ledger bundle export/import** — add `_fetch_semantic_runs()` and
-   `_fetch_semantic_candidates()` to `continuity/exporter.py`; corresponding
-   import logic in `continuity/importer.py`. Until then, ledger provenance is
-   source-system-local.
+1. ~~**Ledger bundle export/import**~~ — **Completed** in `feature/continuity-semantic-ledger-bundle`
+   (schema 1.1). See `docs/CONTINUITY_BUNDLE_ARCHITECTURE.md`.
 
 2. **Real adapter provenance fields** — when Ollama/llama.cpp adapters are
    added, populate `model_metadata_json` with weights checksum, quantization

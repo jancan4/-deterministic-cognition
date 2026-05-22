@@ -24,6 +24,8 @@ def _minimal_bundle() -> dict:
         'source_documents': [],
         'ingestion_runs': [],
         'workflow_references': [],
+        'semantic_execution_runs': [],
+        'semantic_candidate_events': [],
     }
     manifest = build_manifest(
         bundle=bundle,
@@ -58,6 +60,8 @@ def _bundle_with_event(event_id: int = 1) -> dict:
         'source_documents': [],
         'ingestion_runs': [],
         'workflow_references': [],
+        'semantic_execution_runs': [],
+        'semantic_candidate_events': [],
     }
     manifest = build_manifest(
         bundle=bundle,

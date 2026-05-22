@@ -16,9 +16,11 @@ No partial writes are made.
 
 Write order (dependency-safe)
 ------------------------------
-1. source_documents  — no foreign keys
-2. memory_events     — may reference source paths (non-FK, just a string)
-3. ingestion_runs    — references source_id (non-FK in schema, but logical dep)
+1. source_documents           — no foreign keys
+2. memory_events              — may reference source paths (non-FK, just a string)
+3. ingestion_runs             — references source_id (non-FK in schema, but logical dep)
+4. semantic_execution_runs    — references source_id (logical dep, same as ingestion_runs)
+5. semantic_candidate_events  — promoted_memory_id must reference a memory_events row
 
 Memory events are inserted via direct SQL with explicit id preservation,
 bypassing memory.service.add_memory_event(). This is intentional:
@@ -45,10 +47,12 @@ def _ensure_schemas(db_path: str) -> None:
     from memory import service as mem_service
     from sources.registry import init_registry
     from ingestion.runs import init_run_ledger
+    from semantic.ledger import init_ledger
 
     mem_service.init_db(db_path)
     init_registry(db_path)
     init_run_ledger(db_path)
+    init_ledger(db_path)
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +299,152 @@ def _insert_ingestion_runs(conn: sqlite3.Connection, runs: List[dict]) -> int:
     return count
 
 
+def _check_semantic_runs(
+    conn: sqlite3.Connection,
+    runs: List[dict],
+) -> Tuple[List[ImportCollision], List[dict], List[dict]]:
+    """
+    run_id is deterministic (content-addressed). Same run_id → safe skip.
+    """
+    collisions: List[ImportCollision] = []
+    to_insert: List[dict] = []
+    to_skip: List[dict] = []
+
+    for run in runs:
+        row = conn.execute(
+            "SELECT run_id FROM semantic_execution_runs WHERE run_id = ?",
+            (run['run_id'],),
+        ).fetchone()
+
+        if row is None:
+            to_insert.append(run)
+        else:
+            to_skip.append(run)
+
+    return collisions, to_insert, to_skip
+
+
+def _check_semantic_candidates(
+    conn: sqlite3.Connection,
+    candidates: List[dict],
+    incoming_memory_event_ids: set,
+) -> Tuple[List[ImportCollision], List[dict], List[dict]]:
+    """
+    candidate_id is deterministic. Same candidate_id → safe skip.
+
+    Validates that promoted_memory_id references a memory_events row that
+    either already exists in the target DB or is being imported in this bundle.
+    """
+    collisions: List[ImportCollision] = []
+    to_insert: List[dict] = []
+    to_skip: List[dict] = []
+
+    for cand in candidates:
+        row = conn.execute(
+            "SELECT candidate_id FROM semantic_candidate_events WHERE candidate_id = ?",
+            (cand['candidate_id'],),
+        ).fetchone()
+
+        if row is not None:
+            to_skip.append(cand)
+            continue
+
+        # Validate promoted_memory_id reference before inserting
+        pmid = cand.get('promoted_memory_id')
+        if pmid is not None:
+            mem_row = conn.execute(
+                "SELECT id FROM memory_events WHERE id = ?", (pmid,)
+            ).fetchone()
+            if mem_row is None and pmid not in incoming_memory_event_ids:
+                collisions.append(ImportCollision(
+                    record_type='semantic_candidate_event',
+                    identifier=cand['candidate_id'],
+                    reason=(
+                        f"promoted_memory_id={pmid} does not reference any "
+                        f"memory_event in the target database or this bundle"
+                    ),
+                ))
+                continue
+
+        to_insert.append(cand)
+
+    return collisions, to_insert, to_skip
+
+
+def _insert_semantic_runs(conn: sqlite3.Connection, runs: List[dict]) -> int:
+    count = 0
+    for run in runs:
+        conn.execute(
+            """
+            INSERT INTO semantic_execution_runs (
+                run_id, task_id, task_type, adapter_name, adapter_version,
+                input_hash, input_text, source_id, source_span_json,
+                execution_policy_json, model_metadata_json, raw_output_json,
+                normalized_result_json, candidate_count, promoted_count,
+                status, started_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run['run_id'],
+                run['task_id'],
+                run['task_type'],
+                run['adapter_name'],
+                run['adapter_version'],
+                run['input_hash'],
+                run['input_text'],
+                run.get('source_id'),
+                json.dumps(run['source_span'], sort_keys=True) if run.get('source_span') else None,
+                json.dumps(run.get('execution_policy', {}), sort_keys=True),
+                json.dumps(run.get('model_metadata', {}), sort_keys=True),
+                json.dumps(run['raw_output'], sort_keys=True) if run.get('raw_output') is not None else None,
+                json.dumps(run.get('normalized_result', {}), sort_keys=True),
+                run['candidate_count'],
+                run['promoted_count'],
+                run['status'],
+                run['started_at'],
+                run['completed_at'],
+            ),
+        )
+        count += 1
+    return count
+
+
+def _insert_semantic_candidates(conn: sqlite3.Connection, candidates: List[dict]) -> int:
+    count = 0
+    for cand in candidates:
+        conn.execute(
+            """
+            INSERT INTO semantic_candidate_events (
+                candidate_id, semantic_run_id, candidate_index,
+                event_type, title, summary, evidence, source,
+                confidence, source_id, source_span_json, extraction_method,
+                provenance_json, tags_json, status, promoted_memory_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cand['candidate_id'],
+                cand['semantic_run_id'],
+                cand['candidate_index'],
+                cand['event_type'],
+                cand['title'],
+                cand['summary'],
+                cand.get('evidence'),
+                cand['source'],
+                cand['confidence'],
+                cand.get('source_id'),
+                json.dumps(cand['source_span'], sort_keys=True) if cand.get('source_span') else None,
+                cand['extraction_method'],
+                json.dumps(cand.get('provenance', {}), sort_keys=True),
+                json.dumps(cand.get('tags', []), sort_keys=False),
+                cand['status'],
+                cand.get('promoted_memory_id'),
+                cand['created_at'],
+            ),
+        )
+        count += 1
+    return count
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -324,22 +474,34 @@ def import_bundle(
     events = bundle_dict.get('memory_events', [])
     docs = bundle_dict.get('source_documents', [])
     runs = bundle_dict.get('ingestion_runs', [])
+    sem_runs = bundle_dict.get('semantic_execution_runs', [])
+    sem_candidates = bundle_dict.get('semantic_candidate_events', [])
 
     with _connect(db_path) as conn:
         ev_cols, ev_insert, ev_skip = _check_memory_events(conn, events)
         doc_cols, doc_insert, doc_skip = _check_source_documents(conn, docs)
         run_cols, run_insert, run_skip = _check_ingestion_runs(conn, runs)
+        sem_run_cols, sem_run_insert, sem_run_skip = _check_semantic_runs(conn, sem_runs)
+        # Candidates may reference memory events being imported in this bundle
+        incoming_ev_ids = {ev['id'] for ev in ev_insert}
+        sem_cand_cols, sem_cand_insert, sem_cand_skip = _check_semantic_candidates(
+            conn, sem_candidates, incoming_ev_ids
+        )
 
-    all_collisions = ev_cols + doc_cols + run_cols
+    all_collisions = ev_cols + doc_cols + run_cols + sem_run_cols + sem_cand_cols
 
     if dry_run or all_collisions:
         return ImportResult(
             imported_memory_events=len(ev_insert),
             imported_source_documents=len(doc_insert),
             imported_ingestion_runs=len(run_insert),
+            imported_semantic_execution_runs=len(sem_run_insert),
+            imported_semantic_candidate_events=len(sem_cand_insert),
             skipped_memory_events=len(ev_skip),
             skipped_source_documents=len(doc_skip),
             skipped_ingestion_runs=len(run_skip),
+            skipped_semantic_execution_runs=len(sem_run_skip),
+            skipped_semantic_candidate_events=len(sem_cand_skip),
             collisions=all_collisions,
             dry_run=dry_run,
         )
@@ -349,14 +511,20 @@ def import_bundle(
         imported_docs = _insert_source_documents(conn, doc_insert)
         imported_events = _insert_memory_events(conn, ev_insert)
         imported_runs = _insert_ingestion_runs(conn, run_insert)
+        imported_sem_runs = _insert_semantic_runs(conn, sem_run_insert)
+        imported_sem_cands = _insert_semantic_candidates(conn, sem_cand_insert)
 
     return ImportResult(
         imported_memory_events=imported_events,
         imported_source_documents=imported_docs,
         imported_ingestion_runs=imported_runs,
+        imported_semantic_execution_runs=imported_sem_runs,
+        imported_semantic_candidate_events=imported_sem_cands,
         skipped_memory_events=len(ev_skip),
         skipped_source_documents=len(doc_skip),
         skipped_ingestion_runs=len(run_skip),
+        skipped_semantic_execution_runs=len(sem_run_skip),
+        skipped_semantic_candidate_events=len(sem_cand_skip),
         collisions=[],
         dry_run=False,
     )

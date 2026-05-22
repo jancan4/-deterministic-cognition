@@ -9,7 +9,7 @@ import json
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-BUNDLE_SCHEMA_VERSION = '1.0'
+BUNDLE_SCHEMA_VERSION = '1.1'
 
 
 @dataclass
@@ -48,8 +48,9 @@ class ExportFilter:
 @dataclass
 class ImportCollision:
     """A conflict detected during bundle import planning."""
-    record_type: str   # 'memory_event', 'source_document', 'ingestion_run', 'bundle'
-    identifier: str    # id, source_id, run_id, or 'manifest'
+    record_type: str   # 'memory_event', 'source_document', 'ingestion_run',
+                       # 'semantic_execution_run', 'semantic_candidate_event', 'bundle'
+    identifier: str    # id, source_id, run_id, candidate_id, or 'manifest'
     reason: str        # human-readable description
 
     def to_dict(self) -> dict:
@@ -78,9 +79,13 @@ class ImportResult:
     imported_memory_events: int
     imported_source_documents: int
     imported_ingestion_runs: int
+    imported_semantic_execution_runs: int
+    imported_semantic_candidate_events: int
     skipped_memory_events: int
     skipped_source_documents: int
     skipped_ingestion_runs: int
+    skipped_semantic_execution_runs: int
+    skipped_semantic_candidate_events: int
     collisions: List[ImportCollision]
     dry_run: bool
 
@@ -98,9 +103,13 @@ class ImportResult:
             'imported_memory_events': self.imported_memory_events,
             'imported_source_documents': self.imported_source_documents,
             'imported_ingestion_runs': self.imported_ingestion_runs,
+            'imported_semantic_execution_runs': self.imported_semantic_execution_runs,
+            'imported_semantic_candidate_events': self.imported_semantic_candidate_events,
             'skipped_memory_events': self.skipped_memory_events,
             'skipped_source_documents': self.skipped_source_documents,
             'skipped_ingestion_runs': self.skipped_ingestion_runs,
+            'skipped_semantic_execution_runs': self.skipped_semantic_execution_runs,
+            'skipped_semantic_candidate_events': self.skipped_semantic_candidate_events,
             'collision_count': len(self.collisions),
             'collisions': [c.to_dict() for c in self.collisions],
             'success': self.success,

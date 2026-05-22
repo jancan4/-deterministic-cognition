@@ -299,3 +299,145 @@ class TestExportFilterTags:
         f = ExportFilter(tags=['no_such_tag'])
         bundle = export_bundle(db, export_filter=f)
         assert bundle['memory_events'] == []
+
+
+# ---------------------------------------------------------------------------
+# Semantic ledger portability (schema 1.1)
+# ---------------------------------------------------------------------------
+
+def _init_ledger_db(db_path: str) -> None:
+    from memory import service as mem_service
+    from sources.registry import init_registry
+    from ingestion.runs import init_run_ledger
+    from semantic.ledger import init_ledger
+    mem_service.init_db(db_path)
+    init_registry(db_path)
+    init_run_ledger(db_path)
+    init_ledger(db_path)
+
+
+def _promote_one_candidate(db_path: str) -> tuple:
+    """
+    Run a semantic task, record it, promote one candidate.
+    Returns (run_id, candidate_id, memory_event_id).
+    """
+    from models.adapters import StubModelAdapter
+    from semantic.pipeline import run_semantic_task
+    from semantic.ledger import (
+        init_ledger, record_run, derive_candidate_id, promote_candidate
+    )
+    from memory import service as mem_service
+
+    _init_ledger_db(db_path)
+    adapter = StubModelAdapter()
+    pr = run_semantic_task('tagging', 'The Fed held rates steady.', adapter)
+    record_run(db_path, pr)
+
+    run_id = pr.execution_result.request_id
+    cid = derive_candidate_id(run_id, 0)
+    mid = promote_candidate(db_path, cid, approved_by='test-exporter')
+    return run_id, cid, mid
+
+
+class TestExportSemanticSections:
+    def test_schema_version_is_1_1(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        _init_memory_db(db)
+        bundle = export_bundle(db)
+        assert bundle['schema_version'] == '1.1'
+
+    def test_empty_db_has_empty_semantic_sections(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        _init_memory_db(db)
+        bundle = export_bundle(db)
+        assert bundle['semantic_execution_runs'] == []
+        assert bundle['semantic_candidate_events'] == []
+
+    def test_promoted_candidate_exported_with_run(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        run_id, cid, mid = _promote_one_candidate(db)
+        bundle = export_bundle(db)
+        assert len(bundle['semantic_candidate_events']) == 1
+        assert len(bundle['semantic_execution_runs']) == 1
+        assert bundle['semantic_candidate_events'][0]['candidate_id'] == cid
+        assert bundle['semantic_execution_runs'][0]['run_id'] == run_id
+
+    def test_candidate_references_memory_event(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        run_id, cid, mid = _promote_one_candidate(db)
+        bundle = export_bundle(db)
+        cand = bundle['semantic_candidate_events'][0]
+        assert cand['promoted_memory_id'] == mid
+
+    def test_unpromoted_candidate_not_exported(self, tmp_path):
+        """Only promoted candidates (status='promoted') are included."""
+        db = str(tmp_path / 'memory.db')
+        _init_ledger_db(db)
+        from models.adapters import StubModelAdapter
+        from semantic.pipeline import run_semantic_task
+        from semantic.ledger import record_run
+        adapter = StubModelAdapter()
+        pr = run_semantic_task('tagging', 'ECB kept rates unchanged.', adapter)
+        record_run(db_path=db, pipeline_result=pr)
+        # No promotion — candidate stays in 'candidate' status
+        bundle = export_bundle(db)
+        assert bundle['semantic_candidate_events'] == []
+        assert bundle['semantic_execution_runs'] == []
+
+    def test_manifest_semantic_counts_match(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        _promote_one_candidate(db)
+        bundle = export_bundle(db)
+        m = bundle['manifest']
+        assert m['semantic_execution_run_count'] == len(bundle['semantic_execution_runs'])
+        assert m['semantic_candidate_event_count'] == len(bundle['semantic_candidate_events'])
+
+    def test_semantic_bundle_validates(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        _promote_one_candidate(db)
+        bundle = export_bundle(db)
+        validate_bundle(bundle)  # no exception
+
+    def test_semantic_bundle_json_roundtrip(self, tmp_path):
+        import json as _json
+        db = str(tmp_path / 'memory.db')
+        _promote_one_candidate(db)
+        bundle = export_bundle(db)
+        parsed = _json.loads(_json.dumps(bundle, sort_keys=True, indent=2))
+        validate_bundle(parsed)
+
+    def test_run_fields_present(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        _promote_one_candidate(db)
+        bundle = export_bundle(db)
+        run = bundle['semantic_execution_runs'][0]
+        for field in ('run_id', 'task_id', 'task_type', 'adapter_name', 'adapter_version',
+                      'input_hash', 'input_text', 'normalized_result',
+                      'candidate_count', 'promoted_count', 'status', 'started_at', 'completed_at'):
+            assert field in run, f"Missing field: {field}"
+
+    def test_candidate_fields_present(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        _promote_one_candidate(db)
+        bundle = export_bundle(db)
+        cand = bundle['semantic_candidate_events'][0]
+        for field in ('candidate_id', 'semantic_run_id', 'candidate_index',
+                      'event_type', 'title', 'summary', 'source', 'confidence',
+                      'extraction_method', 'provenance', 'tags', 'status',
+                      'promoted_memory_id', 'created_at'):
+            assert field in cand, f"Missing field: {field}"
+
+    def test_filter_excludes_unrelated_candidates(self, tmp_path):
+        """Export with unresolved_only filter: only unresolved memory events → only their candidates."""
+        from continuity.models import ExportFilter
+        db = str(tmp_path / 'memory.db')
+        _promote_one_candidate(db)
+        # Approve the promoted event → becomes 'active'
+        from memory import service as mem_service
+        conn = __import__('sqlite3').connect(db)
+        mid = conn.execute("SELECT id FROM memory_events").fetchone()[0]
+        conn.close()
+        mem_service.update_status(db, mid, 'active', reason='test', created_by='test')
+        # Now export with unresolved_only — active events excluded
+        bundle = export_bundle(db, export_filter=ExportFilter(unresolved_only=True))
+        assert bundle['semantic_candidate_events'] == []
