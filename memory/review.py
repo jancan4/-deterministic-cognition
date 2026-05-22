@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 from typing import List
 
 from .governance import (
+    CANDIDATE_CRITICAL_DAYS,
+    CANDIDATE_WARNING_DAYS,
     GovernanceIssue,
     LOW_CONFIDENCE_ACTIVE_THRESHOLD,
     STALE_WARNING_DAYS,
@@ -11,6 +13,7 @@ from .governance import (
     _cutoff,
     detect_conflicts,
     detect_deprecated_linked,
+    detect_unreviewed_confidence_candidates,
 )
 from .models import MemoryEvent
 
@@ -22,6 +25,7 @@ class ReviewQueue:
     low_confidence_active: List[MemoryEvent] = field(default_factory=list)
     deprecated_linked: List[MemoryEvent] = field(default_factory=list)
     conflicts: List[GovernanceIssue] = field(default_factory=list)
+    confidence_candidates: List[GovernanceIssue] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -33,7 +37,7 @@ class ReviewQueue:
             + self.deprecated_linked
         ):
             seen.add(ev.id)
-        return len(seen) + len(self.conflicts)
+        return len(seen) + len(self.conflicts) + len(self.confidence_candidates)
 
     def is_empty(self) -> bool:
         return (
@@ -42,6 +46,7 @@ class ReviewQueue:
             and not self.low_confidence_active
             and not self.deprecated_linked
             and not self.conflicts
+            and not self.confidence_candidates
         )
 
     def to_dict(self) -> dict:
@@ -52,6 +57,7 @@ class ReviewQueue:
             'low_confidence_active': [e.to_dict() for e in self.low_confidence_active],
             'deprecated_linked': [e.to_dict() for e in self.deprecated_linked],
             'conflicts': [i.to_dict() for i in self.conflicts],
+            'confidence_candidates': [i.to_dict() for i in self.confidence_candidates],
         }
 
 
@@ -149,6 +155,8 @@ def get_review_queue(
     unresolved_aging_days: int = UNRESOLVED_WARNING_DAYS,
     max_confidence: int = LOW_CONFIDENCE_ACTIVE_THRESHOLD,
     limit: int = 50,
+    candidate_warning_days: int = CANDIDATE_WARNING_DAYS,
+    candidate_critical_days: int = CANDIDATE_CRITICAL_DAYS,
 ) -> ReviewQueue:
     """Build a combined deterministic review queue from all active review categories."""
     return ReviewQueue(
@@ -159,4 +167,9 @@ def get_review_queue(
         ),
         deprecated_linked=review_deprecated_linked(db_path, limit=limit),
         conflicts=review_conflicts(db_path),
+        confidence_candidates=detect_unreviewed_confidence_candidates(
+            db_path,
+            warning_days=candidate_warning_days,
+            critical_days=candidate_critical_days,
+        ),
     )

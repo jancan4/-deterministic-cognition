@@ -21,6 +21,8 @@ from memory.service import (
     NotFoundError,
     ValidationError,
     add_memory_event,
+    approve_confidence_revision,
+    get_confidence_revision,
     get_effective_confidence,
     get_effective_confidence_batch,
     init_db,
@@ -673,3 +675,336 @@ class TestActivationEffectiveConfidence:
         mem = next((m for m in activated if m.memory_id == ev.id), None)
         assert mem is not None
         assert mem.confidence == 5
+
+
+# ---------------------------------------------------------------------------
+# approve_confidence_revision
+# ---------------------------------------------------------------------------
+
+class TestApproveConfidenceRevision:
+    def test_approve_creates_active_operator_revision(self, tmp_path):
+        db = _db(tmp_path)
+        ev = _add(db, confidence=3)
+        cand = revise_confidence(db, ev.id, 5, 'model', 'auto', revision_type='candidate')
+        op = approve_confidence_revision(db, cand.id, 'analyst', 'validated')
+        assert op.revision_type == 'operator'
+        assert op.status == 'active'
+        assert op.confidence_after == 5
+        assert op.revised_by == 'analyst'
+
+    def test_approve_provenance_links_to_candidate(self, tmp_path):
+        db = _db(tmp_path)
+        ev = _add(db, confidence=3)
+        cand = revise_confidence(db, ev.id, 5, 'model', 'auto', revision_type='candidate')
+        op = approve_confidence_revision(db, cand.id, 'analyst', 'validated')
+        prov = json.loads(op.provenance_json)
+        assert prov['governance_action'] == 'approve_confidence_revision'
+        assert prov['approved_candidate_revision_id'] == cand.id
+        assert prov['operator'] == 'analyst'
+        assert prov['reason'] == 'validated'
+        assert prov['candidate_confidence_before'] == cand.confidence_before
+        assert prov['candidate_confidence_after'] == cand.confidence_after
+
+    def test_approve_does_not_mutate_candidate_row(self, tmp_path):
+        db = _db(tmp_path)
+        ev = _add(db, confidence=3)
+        cand = revise_confidence(db, ev.id, 5, 'model', 'auto', revision_type='candidate')
+        approve_confidence_revision(db, cand.id, 'analyst', 'validated')
+        row = _raw(db, 'SELECT * FROM confidence_revisions WHERE id = ?', (cand.id,))
+        assert row['status'] == 'proposed'
+        assert row['revision_type'] == 'candidate'
+        assert row['rejected_at'] is None
+
+    def test_approve_makes_effective_confidence_active(self, tmp_path):
+        db = _db(tmp_path)
+        ev = _add(db, confidence=3)
+        cand = revise_confidence(db, ev.id, 5, 'model', 'auto', revision_type='candidate')
+        approve_confidence_revision(db, cand.id, 'analyst', 'validated')
+        assert get_effective_confidence(db, ev.id) == 5
+
+    def test_approve_supersedes_prior_active_operator(self, tmp_path):
+        db = _db(tmp_path)
+        ev = _add(db, confidence=3)
+        op1 = revise_confidence(db, ev.id, 4, 'analyst', 'first', revision_type='operator')
+        cand = revise_confidence(db, ev.id, 5, 'model', 'auto', revision_type='candidate')
+        approve_confidence_revision(db, cand.id, 'analyst', 'validated')
+        row = _raw(db, 'SELECT status FROM confidence_revisions WHERE id = ?', (op1.id,))
+        assert row['status'] == 'superseded'
+
+    def test_approve_raises_on_operator_revision(self, tmp_path):
+        db = _db(tmp_path)
+        ev = _add(db, confidence=3)
+        op = revise_confidence(db, ev.id, 4, 'analyst', 'op', revision_type='operator')
+        with pytest.raises(ValidationError):
+            approve_confidence_revision(db, op.id, 'analyst', 'cannot approve operator')
+
+    def test_approve_raises_on_already_rejected(self, tmp_path):
+        db = _db(tmp_path)
+        ev = _add(db, confidence=3)
+        cand = revise_confidence(db, ev.id, 5, 'model', 'auto', revision_type='candidate')
+        reject_candidate_revision(db, cand.id, 'analyst', 'not valid')
+        with pytest.raises(ValidationError):
+            approve_confidence_revision(db, cand.id, 'analyst', 'too late')
+
+    def test_approve_raises_on_empty_operator(self, tmp_path):
+        db = _db(tmp_path)
+        ev = _add(db, confidence=3)
+        cand = revise_confidence(db, ev.id, 5, 'model', 'auto', revision_type='candidate')
+        with pytest.raises(ValidationError):
+            approve_confidence_revision(db, cand.id, '', 'reason')
+
+    def test_approve_raises_on_empty_reason(self, tmp_path):
+        db = _db(tmp_path)
+        ev = _add(db, confidence=3)
+        cand = revise_confidence(db, ev.id, 5, 'model', 'auto', revision_type='candidate')
+        with pytest.raises(ValidationError):
+            approve_confidence_revision(db, cand.id, 'analyst', '')
+
+    def test_approve_raises_on_unknown_revision(self, tmp_path):
+        db = _db(tmp_path)
+        with pytest.raises(NotFoundError):
+            approve_confidence_revision(db, 9999, 'analyst', 'reason')
+
+
+# ---------------------------------------------------------------------------
+# get_confidence_revision
+# ---------------------------------------------------------------------------
+
+class TestGetConfidenceRevision:
+    def test_returns_revision_by_id(self, tmp_path):
+        db = _db(tmp_path)
+        ev = _add(db, confidence=3)
+        rev = revise_confidence(db, ev.id, 4, 'analyst', 'reason')
+        fetched = get_confidence_revision(db, rev.id)
+        assert fetched.id == rev.id
+        assert fetched.confidence_after == 4
+
+    def test_raises_on_unknown_revision(self, tmp_path):
+        db = _db(tmp_path)
+        with pytest.raises(NotFoundError):
+            get_confidence_revision(db, 9999)
+
+
+# ---------------------------------------------------------------------------
+# CLI commands
+# ---------------------------------------------------------------------------
+
+class TestCLIConfidenceRevisions:
+    """Integration tests driving the CLI command functions directly."""
+
+    def _db(self, tmp_path) -> str:
+        path = str(tmp_path / 'cli_test.db')
+        init_db(path)
+        return path
+
+    def _parse(self, argv):
+        from memory.cli import build_parser
+        return build_parser().parse_args(argv)
+
+    def test_revise_confidence_creates_operator_revision(self, tmp_path):
+        from memory.cli import cmd_revise_confidence
+        db = self._db(tmp_path)
+        ev = _add(db, confidence=3)
+        args = self._parse([
+            'revise-confidence', '--db', db,
+            '--id', str(ev.id),
+            '--confidence', '5',
+            '--operator', 'analyst',
+            '--reason', 'validated',
+        ])
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cmd_revise_confidence(args)
+        result = json.loads(buf.getvalue())
+        assert result['revision_type'] == 'operator'
+        assert result['status'] == 'active'
+        assert result['confidence_after'] == 5
+
+    def test_revise_confidence_empty_operator_dies(self, tmp_path, capsys):
+        from memory.cli import cmd_revise_confidence
+        db = self._db(tmp_path)
+        ev = _add(db, confidence=3)
+        args = self._parse([
+            'revise-confidence', '--db', db,
+            '--id', str(ev.id),
+            '--confidence', '4',
+            '--operator', '  ',
+            '--reason', 'reason',
+        ])
+        with pytest.raises(SystemExit):
+            cmd_revise_confidence(args)
+
+    def test_revise_confidence_empty_reason_dies(self, tmp_path, capsys):
+        from memory.cli import cmd_revise_confidence
+        db = self._db(tmp_path)
+        ev = _add(db, confidence=3)
+        args = self._parse([
+            'revise-confidence', '--db', db,
+            '--id', str(ev.id),
+            '--confidence', '4',
+            '--operator', 'analyst',
+            '--reason', '',
+        ])
+        with pytest.raises(SystemExit):
+            cmd_revise_confidence(args)
+
+    def test_approve_confidence_revision_creates_operator(self, tmp_path):
+        from memory.cli import cmd_approve_confidence_revision
+        db = self._db(tmp_path)
+        ev = _add(db, confidence=3)
+        cand = revise_confidence(db, ev.id, 5, 'model', 'auto', revision_type='candidate')
+        args = self._parse([
+            'approve-confidence-revision', '--db', db,
+            '--id', str(cand.id),
+            '--operator', 'analyst',
+            '--reason', 'validated',
+        ])
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cmd_approve_confidence_revision(args)
+        result = json.loads(buf.getvalue())
+        assert result['revision_type'] == 'operator'
+        assert result['status'] == 'active'
+        assert result['confidence_after'] == 5
+
+    def test_approve_confidence_revision_provenance_present(self, tmp_path):
+        from memory.cli import cmd_approve_confidence_revision
+        db = self._db(tmp_path)
+        ev = _add(db, confidence=3)
+        cand = revise_confidence(db, ev.id, 5, 'model', 'auto', revision_type='candidate')
+        args = self._parse([
+            'approve-confidence-revision', '--db', db,
+            '--id', str(cand.id),
+            '--operator', 'analyst',
+            '--reason', 'validated',
+        ])
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cmd_approve_confidence_revision(args)
+        result = json.loads(buf.getvalue())
+        prov = json.loads(result['provenance_json'])
+        assert prov['governance_action'] == 'approve_confidence_revision'
+        assert prov['approved_candidate_revision_id'] == cand.id
+
+    def test_approve_confidence_revision_empty_operator_dies(self, tmp_path, capsys):
+        from memory.cli import cmd_approve_confidence_revision
+        db = self._db(tmp_path)
+        ev = _add(db, confidence=3)
+        cand = revise_confidence(db, ev.id, 5, 'model', 'auto', revision_type='candidate')
+        args = self._parse([
+            'approve-confidence-revision', '--db', db,
+            '--id', str(cand.id),
+            '--operator', '',
+            '--reason', 'reason',
+        ])
+        with pytest.raises(SystemExit):
+            cmd_approve_confidence_revision(args)
+
+    def test_reject_confidence_revision_cli(self, tmp_path):
+        from memory.cli import cmd_reject_confidence_revision
+        db = self._db(tmp_path)
+        ev = _add(db, confidence=3)
+        cand = revise_confidence(db, ev.id, 2, 'model', 'auto', revision_type='candidate')
+        args = self._parse([
+            'reject-confidence-revision', '--db', db,
+            '--id', str(cand.id),
+            '--operator', 'analyst',
+            '--reason', 'not valid',
+        ])
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cmd_reject_confidence_revision(args)
+        result = json.loads(buf.getvalue())
+        assert result['status'] == 'rejected'
+        assert result['rejected_by'] == 'analyst'
+        assert result['rejected_reason'] == 'not valid'
+
+    def test_reject_confidence_revision_empty_operator_dies(self, tmp_path, capsys):
+        from memory.cli import cmd_reject_confidence_revision
+        db = self._db(tmp_path)
+        ev = _add(db, confidence=3)
+        cand = revise_confidence(db, ev.id, 2, 'model', 'auto', revision_type='candidate')
+        args = self._parse([
+            'reject-confidence-revision', '--db', db,
+            '--id', str(cand.id),
+            '--operator', '',
+            '--reason', 'reason',
+        ])
+        with pytest.raises(SystemExit):
+            cmd_reject_confidence_revision(args)
+
+    def test_list_confidence_revisions_cli_returns_json(self, tmp_path):
+        from memory.cli import cmd_list_confidence_revisions
+        db = self._db(tmp_path)
+        ev = _add(db, confidence=3)
+        revise_confidence(db, ev.id, 4, 'analyst', 'first', revision_type='operator')
+        revise_confidence(db, ev.id, 5, 'analyst', 'second', revision_type='operator')
+        args = self._parse([
+            'list-confidence-revisions', '--db', db,
+            '--memory-id', str(ev.id),
+        ])
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cmd_list_confidence_revisions(args)
+        result = json.loads(buf.getvalue())
+        assert isinstance(result, list)
+        assert len(result) == 2
+        ids = [r['id'] for r in result]
+        assert ids == sorted(ids)
+
+    def test_list_confidence_revisions_filter_type(self, tmp_path):
+        from memory.cli import cmd_list_confidence_revisions
+        db = self._db(tmp_path)
+        ev = _add(db, confidence=3)
+        revise_confidence(db, ev.id, 4, 'analyst', 'op', revision_type='operator')
+        revise_confidence(db, ev.id, 2, 'model', 'cand', revision_type='candidate')
+        args = self._parse([
+            'list-confidence-revisions', '--db', db,
+            '--type', 'candidate',
+        ])
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cmd_list_confidence_revisions(args)
+        result = json.loads(buf.getvalue())
+        assert all(r['revision_type'] == 'candidate' for r in result)
+        assert len(result) == 1
+
+    def test_show_confidence_revision_cli(self, tmp_path):
+        from memory.cli import cmd_show_confidence_revision
+        db = self._db(tmp_path)
+        ev = _add(db, confidence=3)
+        rev = revise_confidence(db, ev.id, 4, 'analyst', 'reason')
+        args = self._parse([
+            'show-confidence-revision', '--db', db,
+            '--id', str(rev.id),
+        ])
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cmd_show_confidence_revision(args)
+        result = json.loads(buf.getvalue())
+        assert result['id'] == rev.id
+        assert result['confidence_after'] == 4
+
+    def test_show_confidence_revision_unknown_dies(self, tmp_path, capsys):
+        from memory.cli import cmd_show_confidence_revision
+        db = self._db(tmp_path)
+        args = self._parse([
+            'show-confidence-revision', '--db', db,
+            '--id', '9999',
+        ])
+        with pytest.raises(SystemExit):
+            cmd_show_confidence_revision(args)

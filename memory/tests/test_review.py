@@ -16,6 +16,7 @@ from memory.review import (
     review_stale,
     review_unresolved,
 )
+from memory.service import revise_confidence
 
 
 def _add(db, **kw):
@@ -335,6 +336,7 @@ class TestReviewQueue:
         assert 'low_confidence_active' in d
         assert 'deprecated_linked' in d
         assert 'conflicts' in d
+        assert 'confidence_candidates' in d
 
     def test_conflicts_included(self, tmp_path):
         db = str(tmp_path / 'mem.db')
@@ -405,3 +407,93 @@ class TestDeterministicOrdering:
         r1 = [i.memory_id for i in review_conflicts(db)]
         r2 = [i.memory_id for i in review_conflicts(db)]
         assert r1 == r2
+
+
+# ---------------------------------------------------------------------------
+# ReviewQueue.confidence_candidates
+# ---------------------------------------------------------------------------
+
+class TestReviewQueueConfidenceCandidates:
+    def _db(self, tmp_path) -> str:
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        return db
+
+    def test_empty_when_no_candidates(self, tmp_path):
+        db = self._db(tmp_path)
+        queue = get_review_queue(db, candidate_warning_days=-1, candidate_critical_days=-1)
+        assert queue.confidence_candidates == []
+
+    def test_pending_candidate_appears_in_queue(self, tmp_path):
+        db = self._db(tmp_path)
+        ev = _add(db, status='active', confidence=3)
+        revise_confidence(db, ev.id, 2, 'model', 'auto', revision_type='candidate')
+        queue = get_review_queue(db, candidate_warning_days=-1, candidate_critical_days=-1)
+        assert len(queue.confidence_candidates) == 1
+        issue = queue.confidence_candidates[0]
+        assert issue.issue_type == 'unreviewed_confidence_candidate'
+        assert issue.memory_id == ev.id
+
+    def test_rejected_candidate_excluded(self, tmp_path):
+        db = self._db(tmp_path)
+        ev = _add(db, status='active', confidence=3)
+        rev = revise_confidence(db, ev.id, 2, 'model', 'auto', revision_type='candidate')
+        service.reject_candidate_revision(db, rev.id, 'analyst', 'not valid')
+        queue = get_review_queue(db, candidate_warning_days=-1, candidate_critical_days=-1)
+        assert queue.confidence_candidates == []
+
+    def test_fresh_candidates_excluded_by_threshold(self, tmp_path):
+        db = self._db(tmp_path)
+        ev = _add(db, status='active', confidence=3)
+        revise_confidence(db, ev.id, 2, 'model', 'auto', revision_type='candidate')
+        queue = get_review_queue(db, candidate_warning_days=36500, candidate_critical_days=36500)
+        assert queue.confidence_candidates == []
+
+    def test_confidence_candidates_in_total(self, tmp_path):
+        db = self._db(tmp_path)
+        ev = _add(db, status='active', confidence=3)
+        revise_confidence(db, ev.id, 2, 'model', 'auto', revision_type='candidate')
+        queue = get_review_queue(db, candidate_warning_days=-1, candidate_critical_days=-1)
+        assert queue.total >= 1
+
+    def test_not_empty_when_candidates_pending(self, tmp_path):
+        db = self._db(tmp_path)
+        ev = _add(db, status='active', confidence=3)
+        revise_confidence(db, ev.id, 2, 'model', 'auto', revision_type='candidate')
+        queue = get_review_queue(db, candidate_warning_days=-1, candidate_critical_days=-1)
+        assert not queue.is_empty()
+
+    def test_to_dict_includes_confidence_candidates(self, tmp_path):
+        db = self._db(tmp_path)
+        ev = _add(db, status='active', confidence=3)
+        revise_confidence(db, ev.id, 2, 'model', 'auto', revision_type='candidate')
+        queue = get_review_queue(db, candidate_warning_days=-1, candidate_critical_days=-1)
+        d = queue.to_dict()
+        assert 'confidence_candidates' in d
+        assert len(d['confidence_candidates']) == 1
+        assert d['confidence_candidates'][0]['issue_type'] == 'unreviewed_confidence_candidate'
+
+    def test_multiple_candidates_ordered_by_memory_id(self, tmp_path):
+        db = self._db(tmp_path)
+        ev1 = _add(db, title='First', status='active', confidence=3)
+        ev2 = _add(db, title='Second', status='active', confidence=3)
+        revise_confidence(db, ev2.id, 2, 'model', 'auto', revision_type='candidate')
+        revise_confidence(db, ev1.id, 2, 'model', 'auto', revision_type='candidate')
+        queue = get_review_queue(db, candidate_warning_days=-1, candidate_critical_days=-1)
+        ids = [i.memory_id for i in queue.confidence_candidates]
+        assert ids == sorted(ids)
+
+    def test_severity_critical_threshold(self, tmp_path):
+        db = self._db(tmp_path)
+        ev = _add(db, status='active', confidence=3)
+        revise_confidence(db, ev.id, 2, 'model', 'auto', revision_type='candidate')
+        queue = get_review_queue(db, candidate_warning_days=-1, candidate_critical_days=-1)
+        assert queue.confidence_candidates[0].severity == 'critical'
+
+    def test_deterministic_repeated_calls_with_candidates(self, tmp_path):
+        db = self._db(tmp_path)
+        ev = _add(db, status='active', confidence=3)
+        revise_confidence(db, ev.id, 2, 'model', 'auto', revision_type='candidate')
+        q1 = get_review_queue(db, candidate_warning_days=-1, candidate_critical_days=-1)
+        q2 = get_review_queue(db, candidate_warning_days=-1, candidate_critical_days=-1)
+        assert q1.to_dict() == q2.to_dict()

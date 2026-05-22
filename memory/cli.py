@@ -298,6 +298,7 @@ def _adapter_from_pin(pin) -> object:
 
 
 def cmd_review(args: argparse.Namespace) -> None:
+    from .governance import detect_unreviewed_confidence_candidates
     try:
         events = service.review_memory(
             db_path=args.db,
@@ -308,11 +309,99 @@ def cmd_review(args: argparse.Namespace) -> None:
         _die(str(exc))
     if not events:
         print("No memory events pending review.")
-        return
-    label = 'event' if len(events) == 1 else 'events'
-    print(f"{len(events)} memory {label} pending review:\n")
-    for ev in events:
-        _print_event(ev)
+    else:
+        label = 'event' if len(events) == 1 else 'events'
+        print(f"{len(events)} memory {label} pending review:\n")
+        for ev in events:
+            _print_event(ev)
+
+    candidates = detect_unreviewed_confidence_candidates(args.db)
+    if candidates:
+        clabel = 'revision' if len(candidates) == 1 else 'revisions'
+        print(f"{len(candidates)} confidence {clabel} pending review:\n")
+        for issue in candidates:
+            meta = issue.metadata or {}
+            print(
+                f"  [rev:{meta.get('revision_id')}] mem:{meta.get('memory_event_id')} "
+                f"| {meta.get('confidence_before')} → {meta.get('confidence_after')} "
+                f"| severity={issue.severity} | by={meta.get('revised_by')}"
+            )
+            print(f"    {issue.rationale}")
+            print()
+
+
+def cmd_revise_confidence(args: argparse.Namespace) -> None:
+    if not args.operator or not args.operator.strip():
+        _die("--operator must not be empty")
+    if not args.reason or not args.reason.strip():
+        _die("--reason must not be empty")
+    try:
+        rev = service.revise_confidence(
+            db_path=args.db,
+            memory_id=args.id,
+            confidence_after=args.confidence,
+            revised_by=args.operator,
+            reason=args.reason,
+            revision_type='operator',
+        )
+    except (service.ValidationError, service.NotFoundError) as exc:
+        _die(str(exc))
+    print(json.dumps(rev.to_dict(), indent=2, sort_keys=True))
+
+
+def cmd_approve_confidence_revision(args: argparse.Namespace) -> None:
+    if not args.operator or not args.operator.strip():
+        _die("--operator must not be empty")
+    if not args.reason or not args.reason.strip():
+        _die("--reason must not be empty")
+    try:
+        rev = service.approve_confidence_revision(
+            db_path=args.db,
+            revision_id=args.id,
+            operator=args.operator,
+            reason=args.reason,
+        )
+    except (service.ValidationError, service.NotFoundError) as exc:
+        _die(str(exc))
+    print(json.dumps(rev.to_dict(), indent=2, sort_keys=True))
+
+
+def cmd_reject_confidence_revision(args: argparse.Namespace) -> None:
+    if not args.operator or not args.operator.strip():
+        _die("--operator must not be empty")
+    if not args.reason or not args.reason.strip():
+        _die("--reason must not be empty")
+    try:
+        rev = service.reject_candidate_revision(
+            db_path=args.db,
+            revision_id=args.id,
+            rejected_by=args.operator,
+            reason=args.reason,
+        )
+    except (service.ValidationError, service.NotFoundError) as exc:
+        _die(str(exc))
+    print(json.dumps(rev.to_dict(), indent=2, sort_keys=True))
+
+
+def cmd_list_confidence_revisions(args: argparse.Namespace) -> None:
+    try:
+        revs = service.list_confidence_revisions(
+            db_path=args.db,
+            memory_event_id=args.memory_id,
+            revision_type=args.type,
+            status=args.status,
+        )
+    except service.ValidationError as exc:
+        _die(str(exc))
+    print(json.dumps([r.to_dict() for r in revs], indent=2, sort_keys=True))
+
+
+def cmd_show_confidence_revision(args: argparse.Namespace) -> None:
+    try:
+        rev = service.get_confidence_revision(args.db, args.id)
+    except service.NotFoundError as exc:
+        _die(str(exc))
+    print(json.dumps(rev.to_dict(), indent=2, sort_keys=True))
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +423,11 @@ _COMMANDS = {
     'pin-embedding-model': cmd_pin_embedding_model,
     'get-active-pin': cmd_get_active_pin,
     'retrieve': cmd_retrieve,
+    'revise-confidence': cmd_revise_confidence,
+    'approve-confidence-revision': cmd_approve_confidence_revision,
+    'reject-confidence-revision': cmd_reject_confidence_revision,
+    'list-confidence-revisions': cmd_list_confidence_revisions,
+    'show-confidence-revision': cmd_show_confidence_revision,
 }
 
 
@@ -476,6 +570,45 @@ def build_parser() -> argparse.ArgumentParser:
                        help='Persist retrieval to log for auditability')
     p_ret.add_argument('--actor', default='system',
                        help='Actor identifier for retrieval log (default: system)')
+
+    # revise-confidence
+    p_rc = sub.add_parser('revise-confidence', parents=[_db],
+                          help='Create an operator confidence revision for a memory event')
+    p_rc.add_argument('--id', required=True, type=int, help='Memory event id')
+    p_rc.add_argument('--confidence', required=True, type=int,
+                      choices=list(range(CONFIDENCE_MIN, CONFIDENCE_MAX + 1)),
+                      help='New confidence value (1–5)')
+    p_rc.add_argument('--operator', required=True, help='Operator identifier')
+    p_rc.add_argument('--reason', required=True, help='Reason for revision')
+
+    # approve-confidence-revision
+    p_ac = sub.add_parser('approve-confidence-revision', parents=[_db],
+                          help='Approve a proposed candidate confidence revision')
+    p_ac.add_argument('--id', required=True, type=int, help='Candidate revision id')
+    p_ac.add_argument('--operator', required=True, help='Operator identifier')
+    p_ac.add_argument('--reason', required=True, help='Reason for approval')
+
+    # reject-confidence-revision
+    p_rjc = sub.add_parser('reject-confidence-revision', parents=[_db],
+                           help='Reject a proposed candidate confidence revision')
+    p_rjc.add_argument('--id', required=True, type=int, help='Candidate revision id')
+    p_rjc.add_argument('--operator', required=True, help='Operator identifier')
+    p_rjc.add_argument('--reason', required=True, help='Reason for rejection')
+
+    # list-confidence-revisions
+    p_lcr = sub.add_parser('list-confidence-revisions', parents=[_db],
+                           help='List confidence revisions with optional filters (JSON output)')
+    p_lcr.add_argument('--memory-id', dest='memory_id', type=int, default=None,
+                       help='Filter by memory event id')
+    p_lcr.add_argument('--type', dest='type', choices=['operator', 'candidate'], default=None,
+                       help='Filter by revision type')
+    p_lcr.add_argument('--status', choices=['active', 'proposed', 'superseded', 'rejected'],
+                       default=None, help='Filter by status')
+
+    # show-confidence-revision
+    p_scr = sub.add_parser('show-confidence-revision', parents=[_db],
+                           help='Show one confidence revision by id (JSON output)')
+    p_scr.add_argument('--id', required=True, type=int, help='Confidence revision id')
 
     return parser
 

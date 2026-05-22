@@ -728,6 +728,73 @@ def list_confidence_revisions(
         return [ConfidenceRevision.from_row(r) for r in rows]
 
 
+def approve_confidence_revision(
+    db_path: str,
+    revision_id: int,
+    operator: str,
+    reason: str,
+) -> 'ConfidenceRevision':
+    """Approve a proposed candidate revision by inserting a new active operator revision.
+
+    The candidate row is not mutated (status remains 'proposed').
+    The new operator revision's provenance_json records the governance action
+    and links back to the approved candidate revision id for a durable audit trail.
+    """
+    if not operator or not operator.strip():
+        raise ValidationError("'operator' must not be empty")
+    if not reason or not reason.strip():
+        raise ValidationError("'reason' must not be empty")
+
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            'SELECT * FROM confidence_revisions WHERE id = ?', (revision_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"Confidence revision {revision_id} not found")
+        if row['revision_type'] != 'candidate':
+            raise ValidationError(
+                f"Revision {revision_id} has revision_type '{row['revision_type']}'; "
+                "only 'candidate' revisions can be approved"
+            )
+        if row['status'] != 'proposed':
+            raise ValidationError(
+                f"Revision {revision_id} has status '{row['status']}'; "
+                "only 'proposed' revisions can be approved"
+            )
+        memory_event_id = row['memory_event_id']
+        candidate_confidence_before = row['confidence_before']
+        candidate_confidence_after = row['confidence_after']
+
+    provenance = {
+        'governance_action': 'approve_confidence_revision',
+        'approved_candidate_revision_id': revision_id,
+        'operator': operator,
+        'reason': reason,
+        'candidate_confidence_before': candidate_confidence_before,
+        'candidate_confidence_after': candidate_confidence_after,
+    }
+
+    return revise_confidence(
+        db_path,
+        memory_event_id,
+        candidate_confidence_after,
+        operator,
+        reason,
+        revision_type='operator',
+        provenance=provenance,
+    )
+
+
+def get_confidence_revision(db_path: str, revision_id: int) -> 'ConfidenceRevision':
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            'SELECT * FROM confidence_revisions WHERE id = ?', (revision_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"Confidence revision {revision_id} not found")
+        return ConfidenceRevision.from_row(row)
+
+
 def review_memory(
     db_path: str,
     status: Optional[str] = None,
