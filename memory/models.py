@@ -120,6 +120,14 @@ class MemoryLink:
     target_id: int
     relationship: str
     created_at: str
+    created_by: Optional[str] = None
+    reason: Optional[str] = None
+    link_confidence: Optional[int] = None
+    link_metadata_json: Optional[str] = None
+    status: str = 'active'
+    retracted_at: Optional[str] = None
+    retracted_reason: Optional[str] = None
+    retracted_by: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -128,14 +136,36 @@ class MemoryLink:
             'target_id': self.target_id,
             'relationship': self.relationship,
             'created_at': self.created_at,
+            'created_by': self.created_by,
+            'reason': self.reason,
+            'link_confidence': self.link_confidence,
+            'link_metadata_json': self.link_metadata_json,
+            'status': self.status,
+            'retracted_at': self.retracted_at,
+            'retracted_reason': self.retracted_reason,
+            'retracted_by': self.retracted_by,
         }
 
     @classmethod
     def from_row(cls, row) -> 'MemoryLink':
+        def _get(key, default=None):
+            try:
+                return row[key]
+            except IndexError:
+                return default
+
         return cls(
             id=row['id'],
             source_id=row['source_id'],
             target_id=row['target_id'],
             relationship=row['relationship'],
             created_at=row['created_at'],
+            created_by=_get('created_by'),
+            reason=_get('reason'),
+            link_confidence=_get('link_confidence'),
+            link_metadata_json=_get('link_metadata_json'),
+            status=_get('status', 'active'),
+            retracted_at=_get('retracted_at'),
+            retracted_reason=_get('retracted_reason'),
+            retracted_by=_get('retracted_by'),
         )

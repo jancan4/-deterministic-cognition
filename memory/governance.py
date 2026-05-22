@@ -34,6 +34,7 @@ class GovernanceIssue:
     title: str
     rationale: str
     recommended_action: str
+    metadata: Optional[Dict] = None
 
     def to_dict(self) -> dict:
         return {
@@ -43,6 +44,7 @@ class GovernanceIssue:
             'title': self.title,
             'rationale': self.rationale,
             'recommended_action': self.recommended_action,
+            'metadata': self.metadata,
         }
 
 
@@ -180,20 +182,24 @@ def detect_stale_memory(
 
 
 def detect_conflicts(db_path: str) -> List[GovernanceIssue]:
-    """Events connected by a contradicts link where both sides are active or accepted."""
+    """Events connected by an active contradicts link where both sides are active or accepted."""
     issues: List[GovernanceIssue] = []
     conn = _connect(db_path)
     try:
         rows = conn.execute(
             """
             SELECT
+                ml.id AS link_id,
                 ml.source_id, ml.target_id,
+                ml.created_by, ml.reason, ml.link_confidence,
+                ml.link_metadata_json, ml.created_at AS link_created_at,
                 e1.title AS src_title, e1.status AS src_status,
                 e2.title AS tgt_title, e2.status AS tgt_status
             FROM memory_links ml
             JOIN memory_events e1 ON e1.id = ml.source_id
             JOIN memory_events e2 ON e2.id = ml.target_id
             WHERE ml.relationship = 'contradicts'
+              AND ml.status = 'active'
               AND e1.status IN ('active', 'accepted')
               AND e2.status IN ('active', 'accepted')
             ORDER BY ml.source_id ASC, ml.target_id ASC
@@ -203,6 +209,18 @@ def detect_conflicts(db_path: str) -> List[GovernanceIssue]:
         conn.close()
 
     for row in rows:
+        metadata: Dict = {
+            'link_id': row['link_id'],
+            'source_id': row['source_id'],
+            'target_id': row['target_id'],
+            'created_by': row['created_by'],
+            'reason': row['reason'],
+            'link_confidence': row['link_confidence'],
+            'created_at': row['link_created_at'],
+        }
+        if row['link_metadata_json'] is not None:
+            metadata['link_metadata_json'] = row['link_metadata_json']
+
         issues.append(GovernanceIssue(
             issue_type='conflicting_active',
             severity='critical',
@@ -217,6 +235,7 @@ def detect_conflicts(db_path: str) -> List[GovernanceIssue]:
                 'Resolve the contradiction: supersede one event, reject one, '
                 'or update both to reflect the reconciled position.'
             ),
+            metadata=metadata,
         ))
     return issues
 

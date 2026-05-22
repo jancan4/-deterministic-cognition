@@ -12,7 +12,7 @@ from .models import (
 )
 
 _SCHEMA = Path(__file__).parent / 'schema.sql'
-_MEMORY_SCHEMA_VERSION = 6
+_MEMORY_SCHEMA_VERSION = 8
 
 
 class ValidationError(ValueError):
@@ -44,6 +44,59 @@ def _validate_confidence(confidence: int) -> None:
         raise ValidationError(
             f"confidence must be {CONFIDENCE_MIN}–{CONFIDENCE_MAX}, got {confidence}"
         )
+
+
+def _migrate_to_v8(conn: sqlite3.Connection) -> None:
+    # Add provenance and lifecycle columns to memory_links (Phase 4A).
+    # All new columns are nullable except status which gets DEFAULT 'active'.
+    # Existing rows are backfilled with status='active' by SQLite's ALTER TABLE default.
+    existing_cols = {row[1] for row in conn.execute('PRAGMA table_info(memory_links)')}
+    for col_sql in (
+        "ALTER TABLE memory_links ADD COLUMN created_by TEXT",
+        "ALTER TABLE memory_links ADD COLUMN reason TEXT",
+        "ALTER TABLE memory_links ADD COLUMN link_confidence INTEGER",
+        "ALTER TABLE memory_links ADD COLUMN link_metadata_json TEXT",
+        "ALTER TABLE memory_links ADD COLUMN retracted_at TEXT",
+        "ALTER TABLE memory_links ADD COLUMN retracted_reason TEXT",
+        "ALTER TABLE memory_links ADD COLUMN retracted_by TEXT",
+    ):
+        col_name = col_sql.split()[-2]
+        if col_name not in existing_cols:
+            conn.execute(col_sql)
+    if 'status' not in existing_cols:
+        conn.execute(
+            "ALTER TABLE memory_links ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_links_status ON memory_links(status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_links_contradicts "
+        "ON memory_links(relationship, status)"
+    )
+
+
+def _migrate_to_v7(conn: sqlite3.Connection) -> None:
+    # context_assembly_log was added to schema.sql in v7. The table is created
+    # by executescript() via CREATE TABLE IF NOT EXISTS. This function
+    # idempotently ensures all four governance indices exist, following the
+    # same pattern as _migrate_to_v5 for embedding_model_pins.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_assembly_hash "
+        "ON context_assembly_log(assembly_hash)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_assembly_session "
+        "ON context_assembly_log(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_assembly_status "
+        "ON context_assembly_log(status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_assembly_at "
+        "ON context_assembly_log(assembled_at)"
+    )
 
 
 def _migrate_to_v6(conn: sqlite3.Connection) -> None:
@@ -127,6 +180,8 @@ def init_db(db_path: str) -> None:
             _migrate_to_v4(conn)
             _migrate_to_v5(conn)
             _migrate_to_v6(conn)
+            _migrate_to_v7(conn)
+            _migrate_to_v8(conn)
             conn.execute(
                 'INSERT INTO memory_schema_version (version) VALUES (?)',
                 (_MEMORY_SCHEMA_VERSION,)
@@ -140,6 +195,10 @@ def init_db(db_path: str) -> None:
                 _migrate_to_v5(conn)
             if row['version'] < 6:
                 _migrate_to_v6(conn)
+            if row['version'] < 7:
+                _migrate_to_v7(conn)
+            if row['version'] < 8:
+                _migrate_to_v8(conn)
             conn.execute(
                 'UPDATE memory_schema_version SET version = ?',
                 (_MEMORY_SCHEMA_VERSION,)
@@ -372,6 +431,107 @@ def export_memory(db_path: str) -> dict:
         'memory_revisions': [r.to_dict() for r in revisions],
         'memory_links': [lnk.to_dict() for lnk in links],
     }
+
+
+def create_contradiction_link(
+    db_path: str,
+    source_id: int,
+    target_id: int,
+    created_by: str,
+    reason: str,
+    link_confidence: int,
+    link_metadata: Optional[dict] = None,
+) -> MemoryLink:
+    if not created_by or not created_by.strip():
+        raise ValidationError("'created_by' must not be empty")
+    if not reason or not reason.strip():
+        raise ValidationError("'reason' must not be empty")
+    _validate_confidence(link_confidence)
+
+    link_metadata_json = json.dumps(link_metadata) if link_metadata is not None else None
+    now = _now()
+
+    with _connect(db_path) as conn:
+        for mid in (source_id, target_id):
+            ev_row = conn.execute(
+                'SELECT id, status FROM memory_events WHERE id = ?', (mid,)
+            ).fetchone()
+            if ev_row is None:
+                raise NotFoundError(f"Memory event {mid} not found")
+            if ev_row['status'] not in ('active', 'accepted'):
+                raise ValidationError(
+                    f"Memory event {mid} has status '{ev_row['status']}'; "
+                    "both events must be active or accepted to create a contradiction link"
+                )
+
+        existing = conn.execute(
+            "SELECT id, status FROM memory_links "
+            "WHERE source_id = ? AND target_id = ? AND relationship = 'contradicts'",
+            (source_id, target_id),
+        ).fetchone()
+        if existing is not None:
+            if existing['status'] == 'active':
+                raise ValidationError(
+                    f"An active contradicts link already exists between "
+                    f"{source_id} and {target_id}"
+                )
+            else:
+                raise ValidationError(
+                    f"A retracted contradicts link (id={existing['id']}) exists between "
+                    f"{source_id} and {target_id}; cannot re-assert while a retracted link exists"
+                )
+
+        cur = conn.execute(
+            'INSERT INTO memory_links'
+            ' (source_id, target_id, relationship, created_at,'
+            '  created_by, reason, link_confidence, link_metadata_json, status)'
+            ' VALUES (?,?,?,?,?,?,?,?,?)',
+            (source_id, target_id, 'contradicts', now,
+             created_by, reason, link_confidence, link_metadata_json, 'active'),
+        )
+        row = conn.execute(
+            'SELECT * FROM memory_links WHERE id = ?', (cur.lastrowid,)
+        ).fetchone()
+        return MemoryLink.from_row(row)
+
+
+def retract_contradiction_link(
+    db_path: str,
+    link_id: int,
+    retracted_by: str,
+    reason: str,
+) -> MemoryLink:
+    if not retracted_by or not retracted_by.strip():
+        raise ValidationError("'retracted_by' must not be empty")
+    if not reason or not reason.strip():
+        raise ValidationError("'reason' must not be empty")
+
+    now = _now()
+
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            'SELECT * FROM memory_links WHERE id = ?', (link_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFoundError(f"Memory link {link_id} not found")
+        if row['relationship'] != 'contradicts':
+            raise ValidationError(
+                f"Link {link_id} has relationship '{row['relationship']}'; "
+                "only 'contradicts' links can be retracted"
+            )
+        if row['status'] == 'retracted':
+            raise ValidationError(f"Link {link_id} is already retracted")
+
+        conn.execute(
+            "UPDATE memory_links "
+            "SET status = 'retracted', retracted_at = ?, retracted_by = ?, retracted_reason = ? "
+            "WHERE id = ?",
+            (now, retracted_by, reason, link_id),
+        )
+        row = conn.execute(
+            'SELECT * FROM memory_links WHERE id = ?', (link_id,)
+        ).fetchone()
+        return MemoryLink.from_row(row)
 
 
 def review_memory(

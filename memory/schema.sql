@@ -39,18 +39,27 @@ CREATE TABLE IF NOT EXISTS memory_revisions (
 );
 
 CREATE TABLE IF NOT EXISTS memory_links (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_id    INTEGER NOT NULL,
-    target_id    INTEGER NOT NULL,
-    relationship TEXT    NOT NULL CHECK (relationship IN (
-                     'supports','contradicts','supersedes','refines',
-                     'derived_from','related_to','blocks','depends_on'
-                 )),
-    created_at   TEXT    NOT NULL,
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id          INTEGER NOT NULL,
+    target_id          INTEGER NOT NULL,
+    relationship       TEXT    NOT NULL CHECK (relationship IN (
+                           'supports','contradicts','supersedes','refines',
+                           'derived_from','related_to','blocks','depends_on'
+                       )),
+    created_at         TEXT    NOT NULL,
+    created_by         TEXT,
+    reason             TEXT,
+    link_confidence    INTEGER,
+    link_metadata_json TEXT,
+    status             TEXT    NOT NULL DEFAULT 'active',
+    retracted_at       TEXT,
+    retracted_reason   TEXT,
+    retracted_by       TEXT,
     FOREIGN KEY (source_id) REFERENCES memory_events(id),
     FOREIGN KEY (target_id) REFERENCES memory_events(id),
     UNIQUE (source_id, target_id, relationship)
 );
+-- idx_links_status and idx_links_contradicts are created by _migrate_to_v8() in service.py.
 
 CREATE INDEX IF NOT EXISTS idx_events_type   ON memory_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_events_status ON memory_events(status);
@@ -133,3 +142,27 @@ CREATE TABLE IF NOT EXISTS embedding_model_pins (
 -- idx_pins_scope_status is created by _migrate_to_v5() in service.py, not here.
 -- This avoids CREATE INDEX failing on v4 DBs before the migration runs.
 -- idx_pins_identity and idx_pins_pinned_at follow the same pattern.
+
+CREATE TABLE IF NOT EXISTS context_assembly_log (
+    id                           INTEGER PRIMARY KEY AUTOINCREMENT,
+    assembly_hash                TEXT    NOT NULL UNIQUE,
+    session_id                   TEXT    NOT NULL,
+    assembly_version             TEXT    NOT NULL,
+    assembled_at                 TEXT    NOT NULL,
+    db_path                      TEXT    NOT NULL,
+    policy_json                  TEXT    NOT NULL,
+    query_vector_hash            TEXT,
+    query_vector_provenance_json TEXT,
+    entries_accepted             INTEGER NOT NULL,
+    entries_rejected_budget      INTEGER NOT NULL DEFAULT 0,
+    entries_rejected_filter      INTEGER NOT NULL DEFAULT 0,
+    char_budget_used             INTEGER NOT NULL,
+    char_budget_limit            INTEGER NOT NULL,
+    compression_mode             TEXT    NOT NULL DEFAULT 'none',
+    assembly_snapshot_json       TEXT    NOT NULL,
+    status                       TEXT    NOT NULL DEFAULT 'active',
+    superseded_at                TEXT,
+    superseded_reason            TEXT
+);
+-- Indices for context_assembly_log are created by _migrate_to_v7() in service.py.
+-- This follows the same pattern as embedding_model_pins / retrieval_log status index.
