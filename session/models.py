@@ -20,6 +20,17 @@ CONTEXT_ASSEMBLY_VERSION = '1.1.0'
 CHAR_BUDGET_DEFAULT = 12000
 ENTRY_BUDGET_DEFAULT = 60
 
+# ---------------------------------------------------------------------------
+# Cognition session constants
+# ---------------------------------------------------------------------------
+
+VALID_TRANSITION_TYPES = frozenset({
+    'session_start', 'memory_drift', 'confidence_revision',
+    'contradiction_change', 'operator_rebuild', 'policy_update', 'session_close',
+})
+
+VALID_SESSION_STATUSES = frozenset({'active', 'closed', 'abandoned'})
+
 
 # ---------------------------------------------------------------------------
 # Contradiction pair
@@ -467,3 +478,221 @@ def _render_section(title: str, items: List[str]) -> str:
     header = f"## {title}"
     body = '\n\n'.join(items)
     return f"{header}\n\n{body}"
+
+
+# ---------------------------------------------------------------------------
+# Cognition session
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CognitionSession:
+    """
+    A durable lifecycle container for a sequence of context assemblies.
+
+    session_key is the policy fingerprint (same value as context_assembly_log.session_id)
+    and is used to join back to the assembly log. Multiple active sessions with the
+    same session_key are permitted at the schema level; governance detects duplicates.
+
+    Lifecycle: active → closed (explicit) | active → abandoned (governance-detected).
+    Transitions are append-only in assembly_transition_log; no backward state changes.
+    """
+    id: int
+    session_key: str
+    status: str
+    started_at: str
+    closed_at: Optional[str]
+    closed_reason: Optional[str]
+    initial_assembly_id: Optional[int]
+    latest_assembly_id: Optional[int]
+    assembly_count: int
+    db_path: str
+    policy_fingerprint_json: str
+    metadata_json: Optional[str]
+
+    def to_dict(self) -> dict:
+        return {
+            'id': self.id,
+            'session_key': self.session_key,
+            'status': self.status,
+            'started_at': self.started_at,
+            'closed_at': self.closed_at,
+            'closed_reason': self.closed_reason,
+            'initial_assembly_id': self.initial_assembly_id,
+            'latest_assembly_id': self.latest_assembly_id,
+            'assembly_count': self.assembly_count,
+            'db_path': self.db_path,
+            'policy_fingerprint_json': self.policy_fingerprint_json,
+            'metadata_json': self.metadata_json,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'CognitionSession':
+        return cls(
+            id=d['id'],
+            session_key=d['session_key'],
+            status=d['status'],
+            started_at=d['started_at'],
+            closed_at=d.get('closed_at'),
+            closed_reason=d.get('closed_reason'),
+            initial_assembly_id=d.get('initial_assembly_id'),
+            latest_assembly_id=d.get('latest_assembly_id'),
+            assembly_count=d['assembly_count'],
+            db_path=d['db_path'],
+            policy_fingerprint_json=d['policy_fingerprint_json'],
+            metadata_json=d.get('metadata_json'),
+        )
+
+    @classmethod
+    def from_row(cls, row) -> 'CognitionSession':
+        def _get(key, default=None):
+            try:
+                return row[key]
+            except (IndexError, KeyError):
+                return default
+        return cls(
+            id=row['id'],
+            session_key=row['session_key'],
+            status=row['status'],
+            started_at=row['started_at'],
+            closed_at=_get('closed_at'),
+            closed_reason=_get('closed_reason'),
+            initial_assembly_id=_get('initial_assembly_id'),
+            latest_assembly_id=_get('latest_assembly_id'),
+            assembly_count=row['assembly_count'],
+            db_path=row['db_path'],
+            policy_fingerprint_json=row['policy_fingerprint_json'],
+            metadata_json=_get('metadata_json'),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Assembly transition
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AssemblyTransition:
+    """
+    One step in a cognition session's assembly chronology.
+
+    Append-only: rows are never updated or deleted.
+    sequence_index is strictly monotonic within a cognition_session_id.
+    from_assembly_id is NULL for the first transition (session_start).
+    """
+    id: int
+    cognition_session_id: int
+    sequence_index: int
+    from_assembly_id: Optional[int]
+    to_assembly_id: int
+    transition_type: str
+    transition_reason: str
+    triggered_by: str
+    transitioned_at: str
+    triggering_retrieval_ids_json: Optional[str]
+    triggering_confidence_revision_ids_json: Optional[str]
+    triggering_contradiction_link_ids_json: Optional[str]
+    provenance_json: Optional[str]
+
+    def to_dict(self) -> dict:
+        return {
+            'id': self.id,
+            'cognition_session_id': self.cognition_session_id,
+            'sequence_index': self.sequence_index,
+            'from_assembly_id': self.from_assembly_id,
+            'to_assembly_id': self.to_assembly_id,
+            'transition_type': self.transition_type,
+            'transition_reason': self.transition_reason,
+            'triggered_by': self.triggered_by,
+            'transitioned_at': self.transitioned_at,
+            'triggering_retrieval_ids_json': self.triggering_retrieval_ids_json,
+            'triggering_confidence_revision_ids_json': self.triggering_confidence_revision_ids_json,
+            'triggering_contradiction_link_ids_json': self.triggering_contradiction_link_ids_json,
+            'provenance_json': self.provenance_json,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'AssemblyTransition':
+        return cls(
+            id=d['id'],
+            cognition_session_id=d['cognition_session_id'],
+            sequence_index=d['sequence_index'],
+            from_assembly_id=d.get('from_assembly_id'),
+            to_assembly_id=d['to_assembly_id'],
+            transition_type=d['transition_type'],
+            transition_reason=d['transition_reason'],
+            triggered_by=d['triggered_by'],
+            transitioned_at=d['transitioned_at'],
+            triggering_retrieval_ids_json=d.get('triggering_retrieval_ids_json'),
+            triggering_confidence_revision_ids_json=d.get(
+                'triggering_confidence_revision_ids_json'
+            ),
+            triggering_contradiction_link_ids_json=d.get(
+                'triggering_contradiction_link_ids_json'
+            ),
+            provenance_json=d.get('provenance_json'),
+        )
+
+    @classmethod
+    def from_row(cls, row) -> 'AssemblyTransition':
+        def _get(key, default=None):
+            try:
+                return row[key]
+            except (IndexError, KeyError):
+                return default
+        return cls(
+            id=row['id'],
+            cognition_session_id=row['cognition_session_id'],
+            sequence_index=row['sequence_index'],
+            from_assembly_id=_get('from_assembly_id'),
+            to_assembly_id=row['to_assembly_id'],
+            transition_type=row['transition_type'],
+            transition_reason=row['transition_reason'],
+            triggered_by=row['triggered_by'],
+            transitioned_at=row['transitioned_at'],
+            triggering_retrieval_ids_json=_get('triggering_retrieval_ids_json'),
+            triggering_confidence_revision_ids_json=_get(
+                'triggering_confidence_revision_ids_json'
+            ),
+            triggering_contradiction_link_ids_json=_get(
+                'triggering_contradiction_link_ids_json'
+            ),
+            provenance_json=_get('provenance_json'),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Session timeline divergence report
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SessionTimelineDivergenceReport:
+    """
+    Aggregated divergence report for a full cognition session timeline.
+
+    assembly_reports is ordered by sequence_index ascending (same order as
+    the transitions that produced them). diverged=True if any assembly report
+    has diverged=True.
+    """
+    cognition_session_id: int
+    diverged: bool
+    assembly_reports: List['AssemblyDivergenceReport']
+
+    def to_dict(self) -> dict:
+        return {
+            'cognition_session_id': self.cognition_session_id,
+            'diverged': self.diverged,
+            'assembly_reports': [
+                {
+                    'assembly_id': r.assembly_id,
+                    'assembly_hash': r.assembly_hash,
+                    'diverged': r.diverged,
+                    'events_added_since_assembly': r.events_added_since_assembly,
+                    'events_removed_since_assembly': r.events_removed_since_assembly,
+                    'events_rescored_since_assembly': r.events_rescored_since_assembly,
+                    'contradictions_added_since_assembly': r.contradictions_added_since_assembly,
+                    'contradictions_retracted_since_assembly': (
+                        r.contradictions_retracted_since_assembly
+                    ),
+                }
+                for r in self.assembly_reports
+            ],
+        }

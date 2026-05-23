@@ -187,3 +187,39 @@ CREATE TABLE IF NOT EXISTS confidence_revisions (
     FOREIGN KEY (memory_event_id) REFERENCES memory_events(id)
 );
 -- Indices for confidence_revisions are created by _migrate_to_v9() in service.py.
+
+CREATE TABLE IF NOT EXISTS cognition_session (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_key             TEXT    NOT NULL,
+    status                  TEXT    NOT NULL DEFAULT 'active',
+    started_at              TEXT    NOT NULL,
+    closed_at               TEXT,
+    closed_reason           TEXT,
+    initial_assembly_id     INTEGER,
+    latest_assembly_id      INTEGER,
+    assembly_count          INTEGER NOT NULL DEFAULT 0,
+    db_path                 TEXT    NOT NULL,
+    policy_fingerprint_json TEXT    NOT NULL,
+    metadata_json           TEXT
+);
+
+CREATE TABLE IF NOT EXISTS assembly_transition_log (
+    id                                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    cognition_session_id                    INTEGER NOT NULL,
+    sequence_index                          INTEGER NOT NULL,
+    from_assembly_id                        INTEGER,
+    to_assembly_id                          INTEGER NOT NULL,
+    transition_type                         TEXT    NOT NULL,
+    transition_reason                       TEXT    NOT NULL,
+    triggered_by                            TEXT    NOT NULL,
+    transitioned_at                         TEXT    NOT NULL,
+    triggering_retrieval_ids_json           TEXT,
+    triggering_confidence_revision_ids_json TEXT,
+    triggering_contradiction_link_ids_json  TEXT,
+    provenance_json                         TEXT,
+    UNIQUE (cognition_session_id, sequence_index),
+    FOREIGN KEY (cognition_session_id) REFERENCES cognition_session(id),
+    FOREIGN KEY (to_assembly_id) REFERENCES context_assembly_log(id)
+);
+-- Indices for cognition_session and assembly_transition_log are created by
+-- _migrate_to_v10() in service.py.

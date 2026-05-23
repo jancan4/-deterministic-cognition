@@ -52,12 +52,12 @@ def _raw(db, sql, params=()):
 # Schema v9 migration
 # ---------------------------------------------------------------------------
 
-class TestSchemaV9Migration:
-    def test_fresh_db_has_schema_version_9(self, db):
+class TestSchemaV10Migration:
+    def test_fresh_db_has_schema_version_10(self, db):
         conn = sqlite3.connect(db)
         version = conn.execute('SELECT version FROM memory_schema_version').fetchone()[0]
         conn.close()
-        assert version == 9
+        assert version == 10
 
     def test_fresh_db_memory_links_has_v8_columns(self, db):
         conn = sqlite3.connect(db)
@@ -159,7 +159,7 @@ class TestSchemaV9Migration:
         indices = {r[1] for r in conn.execute('PRAGMA index_list(memory_links)')}
         conn.close()
 
-        assert version == 9
+        assert version == 10
         assert 'status' in cols
         assert 'created_by' in cols
         assert 'idx_links_status' in indices
@@ -170,7 +170,7 @@ class TestSchemaV9Migration:
         conn = sqlite3.connect(db)
         version = conn.execute('SELECT version FROM memory_schema_version').fetchone()[0]
         conn.close()
-        assert version == 9
+        assert version == 10
 
     def test_existing_links_backfilled_active(self, tmp_path):
         """Links created before v8 migration must have status='active' after migration."""

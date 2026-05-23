@@ -12,7 +12,7 @@ from .models import (
 )
 
 _SCHEMA = Path(__file__).parent / 'schema.sql'
-_MEMORY_SCHEMA_VERSION = 9
+_MEMORY_SCHEMA_VERSION = 10
 
 
 class ValidationError(ValueError):
@@ -44,6 +44,36 @@ def _validate_confidence(confidence: int) -> None:
         raise ValidationError(
             f"confidence must be {CONFIDENCE_MIN}–{CONFIDENCE_MAX}, got {confidence}"
         )
+
+
+def _migrate_to_v10(conn: sqlite3.Connection) -> None:
+    # cognition_session and assembly_transition_log were added to schema.sql in v10.
+    # Both tables are created by executescript() via CREATE TABLE IF NOT EXISTS.
+    # This function idempotently ensures all governance indices exist.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cog_session_key "
+        "ON cognition_session(session_key)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cog_session_status "
+        "ON cognition_session(status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cog_session_started_at "
+        "ON cognition_session(started_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_atl_session "
+        "ON assembly_transition_log(cognition_session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_atl_to_assembly "
+        "ON assembly_transition_log(to_assembly_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_atl_type "
+        "ON assembly_transition_log(transition_type)"
+    )
 
 
 def _migrate_to_v9(conn: sqlite3.Connection) -> None:
@@ -201,6 +231,7 @@ def init_db(db_path: str) -> None:
             _migrate_to_v7(conn)
             _migrate_to_v8(conn)
             _migrate_to_v9(conn)
+            _migrate_to_v10(conn)
             conn.execute(
                 'INSERT INTO memory_schema_version (version) VALUES (?)',
                 (_MEMORY_SCHEMA_VERSION,)
@@ -220,6 +251,8 @@ def init_db(db_path: str) -> None:
                 _migrate_to_v8(conn)
             if row['version'] < 9:
                 _migrate_to_v9(conn)
+            if row['version'] < 10:
+                _migrate_to_v10(conn)
             conn.execute(
                 'UPDATE memory_schema_version SET version = ?',
                 (_MEMORY_SCHEMA_VERSION,)

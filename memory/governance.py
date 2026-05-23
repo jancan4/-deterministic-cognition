@@ -639,6 +639,179 @@ def detect_unreviewed_confidence_candidates(
 
 
 # ---------------------------------------------------------------------------
+# Cognition session governance
+# ---------------------------------------------------------------------------
+
+SESSION_STALE_WARNING_DAYS = 30
+SESSION_STALE_CRITICAL_DAYS = 90
+SESSION_ABANDONED_THRESHOLD_DAYS = 7
+
+
+def _cognition_session_table_exists(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cognition_session'"
+    ).fetchone() is not None
+
+
+def detect_stale_sessions(
+    db_path: str,
+    warning_days: int = SESSION_STALE_WARNING_DAYS,
+    critical_days: int = SESSION_STALE_CRITICAL_DAYS,
+) -> List[GovernanceIssue]:
+    """Active cognition sessions open longer than warning_days."""
+    warning_cutoff = _cutoff(warning_days)
+    critical_cutoff = _cutoff(critical_days)
+    issues: List[GovernanceIssue] = []
+
+    conn = _connect(db_path)
+    try:
+        if not _cognition_session_table_exists(conn):
+            return issues
+        rows = conn.execute(
+            "SELECT id, session_key, started_at, assembly_count FROM cognition_session"
+            " WHERE status = 'active' AND started_at < ?"
+            " ORDER BY id ASC",
+            (warning_cutoff,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        if row['started_at'] < critical_cutoff:
+            severity = 'critical'
+            days_label = f'more than {critical_days} days'
+        else:
+            severity = 'warning'
+            days_label = f'more than {warning_days} days'
+        issues.append(GovernanceIssue(
+            issue_type='stale_cognition_session',
+            severity=severity,
+            memory_id=0,
+            title=f"Stale session: {row['session_key']}",
+            rationale=(
+                f"Cognition session [{row['id']}] (key: {row['session_key']}) "
+                f"has been active for {days_label}. "
+                f"Started: {row['started_at']}. Assembly count: {row['assembly_count']}."
+            ),
+            recommended_action=(
+                'Close the session if cognition is complete, or investigate why it remains open.'
+            ),
+            metadata={
+                'session_id': row['id'],
+                'session_key': row['session_key'],
+                'started_at': row['started_at'],
+                'assembly_count': row['assembly_count'],
+            },
+        ))
+    return issues
+
+
+def detect_abandoned_sessions(
+    db_path: str,
+    threshold_days: int = SESSION_ABANDONED_THRESHOLD_DAYS,
+) -> List[GovernanceIssue]:
+    """Active cognition sessions with no transition activity for threshold_days."""
+    threshold_cutoff = _cutoff(threshold_days)
+    issues: List[GovernanceIssue] = []
+
+    conn = _connect(db_path)
+    try:
+        if not _cognition_session_table_exists(conn):
+            return issues
+        rows = conn.execute(
+            """
+            SELECT cs.id, cs.session_key, cs.started_at, cs.assembly_count,
+                   COALESCE(MAX(atl.transitioned_at), cs.started_at) AS last_activity_at
+            FROM cognition_session cs
+            LEFT JOIN assembly_transition_log atl ON atl.cognition_session_id = cs.id
+            WHERE cs.status = 'active'
+            GROUP BY cs.id
+            HAVING last_activity_at < ?
+            ORDER BY cs.id ASC
+            """,
+            (threshold_cutoff,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        issues.append(GovernanceIssue(
+            issue_type='abandoned_cognition_session',
+            severity='warning',
+            memory_id=0,
+            title=f"Abandoned session: {row['session_key']}",
+            rationale=(
+                f"Cognition session [{row['id']}] (key: {row['session_key']}) "
+                f"is active but has had no assembly transitions for more than "
+                f"{threshold_days} days. "
+                f"Last activity: {row['last_activity_at']}. "
+                f"Assembly count: {row['assembly_count']}."
+            ),
+            recommended_action=(
+                'Close or explicitly abandon this session if cognition is no longer in progress.'
+            ),
+            metadata={
+                'session_id': row['id'],
+                'session_key': row['session_key'],
+                'started_at': row['started_at'],
+                'last_activity_at': row['last_activity_at'],
+                'assembly_count': row['assembly_count'],
+            },
+        ))
+    return issues
+
+
+def detect_duplicate_active_sessions(db_path: str) -> List[GovernanceIssue]:
+    """Session keys with more than one active cognition_session row."""
+    issues: List[GovernanceIssue] = []
+
+    conn = _connect(db_path)
+    try:
+        if not _cognition_session_table_exists(conn):
+            return issues
+
+        dup_keys = conn.execute(
+            "SELECT session_key FROM cognition_session"
+            " WHERE status = 'active'"
+            " GROUP BY session_key HAVING COUNT(*) > 1"
+            " ORDER BY session_key ASC",
+        ).fetchall()
+
+        for key_row in dup_keys:
+            session_key = key_row['session_key']
+            id_rows = conn.execute(
+                "SELECT id FROM cognition_session"
+                " WHERE session_key = ? AND status = 'active'"
+                " ORDER BY id ASC",
+                (session_key,),
+            ).fetchall()
+            session_ids = [r['id'] for r in id_rows]
+            issues.append(GovernanceIssue(
+                issue_type='duplicate_active_cognition_session',
+                severity='warning',
+                memory_id=0,
+                title=f"Duplicate active sessions: {session_key}",
+                rationale=(
+                    f"Session key '{session_key}' has {len(session_ids)} active "
+                    f"cognition_session rows (ids: {session_ids}). "
+                    f"Only one session should be active per key at a time."
+                ),
+                recommended_action=(
+                    'Close all but the intended active session for this session key.'
+                ),
+                metadata={
+                    'session_key': session_key,
+                    'session_ids': session_ids,
+                    'active_count': len(session_ids),
+                },
+            ))
+    finally:
+        conn.close()
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
 # Governance report
 # ---------------------------------------------------------------------------
 
@@ -656,6 +829,9 @@ def build_governance_report(
     max_fanout: int = MAX_RELATED_FANOUT,
     candidate_warning_days: int = CANDIDATE_WARNING_DAYS,
     candidate_critical_days: int = CANDIDATE_CRITICAL_DAYS,
+    session_stale_warning_days: int = SESSION_STALE_WARNING_DAYS,
+    session_stale_critical_days: int = SESSION_STALE_CRITICAL_DAYS,
+    session_abandoned_threshold_days: int = SESSION_ABANDONED_THRESHOLD_DAYS,
 ) -> GovernanceReport:
     """Run all governance checks and return a deterministically sorted report.
 
@@ -680,6 +856,9 @@ def build_governance_report(
     issues.extend(detect_excessive_fanout(db_path, max_fanout))
     issues.extend(detect_adaptation_lineage_gap(db_path))
     issues.extend(detect_unreviewed_confidence_candidates(db_path, candidate_warning_days, candidate_critical_days))
+    issues.extend(detect_stale_sessions(db_path, session_stale_warning_days, session_stale_critical_days))
+    issues.extend(detect_abandoned_sessions(db_path, session_abandoned_threshold_days))
+    issues.extend(detect_duplicate_active_sessions(db_path))
 
     issues.sort(key=lambda i: (_SEVERITY_ORDER[i.severity], i.issue_type, i.memory_id))
 

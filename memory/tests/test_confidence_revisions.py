@@ -71,12 +71,12 @@ def _raw(db, sql, params=()):
 # ---------------------------------------------------------------------------
 
 class TestSchemaV9Migration:
-    def test_fresh_db_schema_version_9(self, tmp_path):
+    def test_fresh_db_schema_version_10(self, tmp_path):
         db = _db(tmp_path)
         conn = sqlite3.connect(db)
         version = conn.execute('SELECT version FROM memory_schema_version').fetchone()[0]
         conn.close()
-        assert version == 9
+        assert version == 10
 
     def test_confidence_revisions_table_exists(self, tmp_path):
         db = _db(tmp_path)
@@ -107,7 +107,7 @@ class TestSchemaV9Migration:
         assert 'idx_conf_rev_type_status' in indices
         assert 'idx_conf_rev_created_at' in indices
 
-    def test_v8_db_migrates_to_v9(self, tmp_path):
+    def test_v8_db_migrates_to_v10(self, tmp_path):
         """A DB at v8 should be upgraded to v9 by init_db()."""
         from memory.service import _connect
         db_path = str(tmp_path / 'v8.db')
@@ -190,7 +190,7 @@ class TestSchemaV9Migration:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         conn.close()
 
-        assert version == 9
+        assert version == 10
         assert 'confidence_revisions' in tables
 
     def test_migration_idempotent(self, tmp_path):
@@ -199,7 +199,7 @@ class TestSchemaV9Migration:
         conn = sqlite3.connect(db)
         version = conn.execute('SELECT version FROM memory_schema_version').fetchone()[0]
         conn.close()
-        assert version == 9
+        assert version == 10
 
 
 # ---------------------------------------------------------------------------

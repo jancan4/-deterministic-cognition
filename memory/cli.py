@@ -405,6 +405,119 @@ def cmd_show_confidence_revision(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Session commands
+# ---------------------------------------------------------------------------
+
+def cmd_open_session(args: argparse.Namespace) -> None:
+    from session.models import ContextActivationPolicy
+    from session.reconstruction import open_cognition_session
+    try:
+        policy_dict = json.loads(args.policy_json) if args.policy_json else {}
+    except json.JSONDecodeError as exc:
+        _die(f"Invalid --policy-json: {exc}")
+    policy = ContextActivationPolicy.from_dict(policy_dict)
+    metadata = None
+    if args.metadata_json:
+        try:
+            metadata = json.loads(args.metadata_json)
+        except json.JSONDecodeError as exc:
+            _die(f"Invalid --metadata-json: {exc}")
+    if not args.triggered_by or not args.triggered_by.strip():
+        _die("--triggered-by must not be empty")
+    try:
+        sess = open_cognition_session(args.db, policy, args.triggered_by, metadata=metadata)
+    except ValueError as exc:
+        _die(str(exc))
+    print(json.dumps(sess.to_dict(), indent=2, sort_keys=True))
+
+
+def cmd_close_session(args: argparse.Namespace) -> None:
+    from session.reconstruction import close_cognition_session
+    if not args.triggered_by or not args.triggered_by.strip():
+        _die("--triggered-by must not be empty")
+    if not args.reason or not args.reason.strip():
+        _die("--reason must not be empty")
+    try:
+        sess = close_cognition_session(args.db, args.id, args.reason, args.triggered_by)
+    except ValueError as exc:
+        _die(str(exc))
+    print(json.dumps(sess.to_dict(), indent=2, sort_keys=True))
+
+
+def cmd_log_transition(args: argparse.Namespace) -> None:
+    from session.reconstruction import log_assembly_transition
+
+    def _parse_int_list(raw: Optional[str]) -> Optional[List[int]]:
+        if not raw:
+            return None
+        try:
+            return [int(x.strip()) for x in raw.split(',') if x.strip()]
+        except ValueError:
+            _die(f"Expected comma-separated integers, got: {raw!r}")
+
+    if not args.triggered_by or not args.triggered_by.strip():
+        _die("--triggered-by must not be empty")
+    if not args.reason or not args.reason.strip():
+        _die("--reason must not be empty")
+
+    provenance = None
+    if args.provenance_json:
+        try:
+            provenance = json.loads(args.provenance_json)
+        except json.JSONDecodeError as exc:
+            _die(f"Invalid --provenance-json: {exc}")
+
+    try:
+        transition = log_assembly_transition(
+            db_path=args.db,
+            cognition_session_id=args.session_id,
+            to_assembly_id=args.assembly_id,
+            transition_type=args.type,
+            triggered_by=args.triggered_by,
+            reason=args.reason,
+            from_assembly_id=args.from_assembly_id,
+            triggering_retrieval_ids=_parse_int_list(args.retrieval_ids),
+            triggering_confidence_revision_ids=_parse_int_list(args.confidence_revision_ids),
+            triggering_contradiction_link_ids=_parse_int_list(args.contradiction_link_ids),
+            provenance=provenance,
+        )
+    except ValueError as exc:
+        _die(str(exc))
+    print(json.dumps(transition.to_dict(), indent=2, sort_keys=True))
+
+
+def cmd_list_sessions(args: argparse.Namespace) -> None:
+    from session.reconstruction import list_cognition_sessions
+    sessions = list_cognition_sessions(args.db, status=args.status, limit=args.limit)
+    print(json.dumps([s.to_dict() for s in sessions], indent=2, sort_keys=True))
+
+
+def cmd_show_session(args: argparse.Namespace) -> None:
+    from session.reconstruction import get_cognition_session, get_session_assemblies
+    try:
+        sess = get_cognition_session(args.db, args.id)
+        assemblies = get_session_assemblies(args.id, args.db)
+    except ValueError as exc:
+        _die(str(exc))
+    print(json.dumps(
+        {'session': sess.to_dict(), 'assemblies': assemblies},
+        indent=2, sort_keys=True,
+    ))
+
+
+def cmd_replay_session_timeline(args: argparse.Namespace) -> None:
+    from session.reconstruction import replay_session_timeline
+    try:
+        reconstructions = replay_session_timeline(args.id, args.db)
+    except ValueError as exc:
+        _die(str(exc))
+    print(json.dumps(
+        [r.to_dict() for r in reconstructions],
+        indent=2, sort_keys=True,
+    ))
+
+
+# ---------------------------------------------------------------------------
 # parser
 # ---------------------------------------------------------------------------
 
@@ -428,6 +541,12 @@ _COMMANDS = {
     'reject-confidence-revision': cmd_reject_confidence_revision,
     'list-confidence-revisions': cmd_list_confidence_revisions,
     'show-confidence-revision': cmd_show_confidence_revision,
+    'open-session': cmd_open_session,
+    'close-session': cmd_close_session,
+    'log-transition': cmd_log_transition,
+    'list-sessions': cmd_list_sessions,
+    'show-session': cmd_show_session,
+    'replay-session-timeline': cmd_replay_session_timeline,
 }
 
 
@@ -609,6 +728,67 @@ def build_parser() -> argparse.ArgumentParser:
     p_scr = sub.add_parser('show-confidence-revision', parents=[_db],
                            help='Show one confidence revision by id (JSON output)')
     p_scr.add_argument('--id', required=True, type=int, help='Confidence revision id')
+
+    # open-session
+    from session.models import VALID_TRANSITION_TYPES, VALID_SESSION_STATUSES
+    p_os = sub.add_parser('open-session', parents=[_db],
+                          help='Open a new cognition session')
+    p_os.add_argument('--triggered-by', required=True, dest='triggered_by',
+                      help='Actor opening the session')
+    p_os.add_argument('--policy-json', dest='policy_json', default=None,
+                      help='ContextActivationPolicy as JSON object (optional; defaults apply)')
+    p_os.add_argument('--metadata-json', dest='metadata_json', default=None,
+                      help='Arbitrary metadata dict as JSON (optional)')
+
+    # close-session
+    p_cs = sub.add_parser('close-session', parents=[_db],
+                          help='Close an active cognition session')
+    p_cs.add_argument('--id', required=True, type=int, help='Cognition session id')
+    p_cs.add_argument('--reason', required=True, help='Reason for closing')
+    p_cs.add_argument('--triggered-by', required=True, dest='triggered_by',
+                      help='Actor closing the session')
+
+    # log-transition
+    p_lt = sub.add_parser('log-transition', parents=[_db],
+                          help='Append an assembly transition to a cognition session')
+    p_lt.add_argument('--session-id', required=True, type=int, dest='session_id',
+                      help='Cognition session id')
+    p_lt.add_argument('--assembly-id', required=True, type=int, dest='assembly_id',
+                      help='Target assembly id (context_assembly_log.id)')
+    p_lt.add_argument('--type', required=True, dest='type',
+                      choices=sorted(VALID_TRANSITION_TYPES),
+                      help='Transition type')
+    p_lt.add_argument('--triggered-by', required=True, dest='triggered_by',
+                      help='Actor triggering the transition')
+    p_lt.add_argument('--reason', required=True, help='Reason for transition')
+    p_lt.add_argument('--from-assembly-id', dest='from_assembly_id', type=int, default=None,
+                      help='Prior assembly id (inferred from session state if omitted)')
+    p_lt.add_argument('--retrieval-ids', dest='retrieval_ids', default=None,
+                      help='Comma-separated retrieval log ids that triggered this transition')
+    p_lt.add_argument('--confidence-revision-ids', dest='confidence_revision_ids', default=None,
+                      help='Comma-separated confidence revision ids that triggered this transition')
+    p_lt.add_argument('--contradiction-link-ids', dest='contradiction_link_ids', default=None,
+                      help='Comma-separated contradiction link ids that triggered this transition')
+    p_lt.add_argument('--provenance-json', dest='provenance_json', default=None,
+                      help='Arbitrary provenance dict as JSON (optional)')
+
+    # list-sessions
+    p_ls = sub.add_parser('list-sessions', parents=[_db],
+                          help='List cognition sessions (JSON output)')
+    p_ls.add_argument('--status', choices=sorted(VALID_SESSION_STATUSES), default=None,
+                      help='Filter by status')
+    p_ls.add_argument('--limit', type=int, default=50,
+                      help='Max sessions to return (default: 50)')
+
+    # show-session
+    p_ss = sub.add_parser('show-session', parents=[_db],
+                          help='Show one cognition session and its assembly timeline (JSON output)')
+    p_ss.add_argument('--id', required=True, type=int, help='Cognition session id')
+
+    # replay-session-timeline
+    p_rst = sub.add_parser('replay-session-timeline', parents=[_db],
+                           help='Replay all assemblies in a cognition session (JSON output)')
+    p_rst.add_argument('--id', required=True, type=int, help='Cognition session id')
 
     return parser
 

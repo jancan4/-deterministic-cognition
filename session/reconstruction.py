@@ -27,13 +27,17 @@ from .activation import activate_memory, partition_by_section
 from .context_window import apply_context_budget
 from .models import (
     AssemblyDivergenceReport,
+    AssemblyTransition,
     ActiveWorkflow,
+    CognitionSession,
     ConflictingPair,
     CONTEXT_ASSEMBLY_VERSION,
     ContextActivationPolicy,
     RuntimeSnapshot,
     SessionContext,
     SessionReconstruction,
+    SessionTimelineDivergenceReport,
+    VALID_TRANSITION_TYPES,
 )
 
 
@@ -643,4 +647,408 @@ def verify_assembly_against_current_db(
         events_rescored_since_assembly=rescored,
         contradictions_added_since_assembly=contradictions_added,
         contradictions_retracted_since_assembly=contradictions_retracted,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cognition session lifecycle
+# ---------------------------------------------------------------------------
+
+def open_cognition_session(
+    db_path: str,
+    policy: ContextActivationPolicy,
+    triggered_by: str,
+    *,
+    metadata: Optional[dict] = None,
+) -> CognitionSession:
+    """
+    Open a new cognition session for the given activation policy.
+
+    Creates a cognition_session row with status='active' and assembly_count=0.
+    The session_key is the policy fingerprint (same derivation as session_id in
+    context_assembly_log). Multiple active sessions with the same session_key
+    are permitted; governance detects duplicates via detect_duplicate_active_sessions().
+
+    Raises ValueError if triggered_by is empty.
+    """
+    if not triggered_by or not triggered_by.strip():
+        raise ValueError("'triggered_by' must not be empty")
+
+    session_key = _make_session_id(db_path, policy)
+    now = _now_utc()
+
+    policy_fingerprint = {
+        'tags': sorted(policy.tags),
+        'min_confidence': policy.min_confidence,
+        'compression_mode': policy.compression_mode,
+    }
+    policy_fingerprint_json = _json.dumps(policy_fingerprint, sort_keys=True)
+    metadata_json = _json.dumps(metadata, sort_keys=True) if metadata is not None else None
+
+    conn = _mem_connect(db_path)
+    try:
+        with conn:
+            cur = conn.execute(
+                """INSERT INTO cognition_session
+                   (session_key, status, started_at, db_path,
+                    policy_fingerprint_json, metadata_json)
+                   VALUES (?,?,?,?,?,?)""",
+                (session_key, 'active', now, db_path,
+                 policy_fingerprint_json, metadata_json),
+            )
+            row = conn.execute(
+                'SELECT * FROM cognition_session WHERE id = ?', (cur.lastrowid,)
+            ).fetchone()
+            return CognitionSession.from_row(row)
+    finally:
+        conn.close()
+
+
+def log_assembly_transition(
+    db_path: str,
+    cognition_session_id: int,
+    to_assembly_id: int,
+    transition_type: str,
+    triggered_by: str,
+    reason: str,
+    *,
+    from_assembly_id: Optional[int] = None,
+    triggering_retrieval_ids: Optional[List[int]] = None,
+    triggering_confidence_revision_ids: Optional[List[int]] = None,
+    triggering_contradiction_link_ids: Optional[List[int]] = None,
+    provenance: Optional[dict] = None,
+) -> AssemblyTransition:
+    """
+    Record an assembly transition in the chronological log.
+
+    Appends to assembly_transition_log and updates cognition_session
+    (assembly_count, latest_assembly_id, initial_assembly_id on first append).
+
+    from_assembly_id is inferred from session.latest_assembly_id if not provided
+    and the session already has assemblies. Pass from_assembly_id=None explicitly
+    for session_start transitions.
+
+    Provenance id arrays are sorted for determinism. Empty arrays are stored as NULL.
+
+    Raises ValueError if:
+    - cognition_session_id not found
+    - session is not 'active'
+    - to_assembly_id not found in context_assembly_log
+    - transition_type is not a valid VALID_TRANSITION_TYPES member
+    - triggered_by or reason is empty
+    """
+    if transition_type not in VALID_TRANSITION_TYPES:
+        raise ValueError(
+            f"Invalid transition_type '{transition_type}'. "
+            f"Valid: {sorted(VALID_TRANSITION_TYPES)}"
+        )
+    if not triggered_by or not triggered_by.strip():
+        raise ValueError("'triggered_by' must not be empty")
+    if not reason or not reason.strip():
+        raise ValueError("'reason' must not be empty")
+
+    now = _now_utc()
+
+    conn = _mem_connect(db_path)
+    try:
+        with conn:
+            sess_row = conn.execute(
+                'SELECT * FROM cognition_session WHERE id = ?', (cognition_session_id,)
+            ).fetchone()
+            if sess_row is None:
+                raise ValueError(f"Cognition session {cognition_session_id} not found")
+            if sess_row['status'] != 'active':
+                raise ValueError(
+                    f"Cognition session {cognition_session_id} has status "
+                    f"'{sess_row['status']}'; only 'active' sessions accept new transitions"
+                )
+
+            asm_row = conn.execute(
+                'SELECT id FROM context_assembly_log WHERE id = ?', (to_assembly_id,)
+            ).fetchone()
+            if asm_row is None:
+                raise ValueError(
+                    f"Assembly {to_assembly_id} not found in context_assembly_log"
+                )
+
+            # sequence_index: one beyond current max, or 0 for first
+            seq_row = conn.execute(
+                'SELECT MAX(sequence_index) FROM assembly_transition_log '
+                'WHERE cognition_session_id = ?',
+                (cognition_session_id,),
+            ).fetchone()
+            max_seq = seq_row[0]
+            sequence_index = 0 if max_seq is None else max_seq + 1
+
+            # Auto-infer from_assembly_id from session state when not provided
+            if from_assembly_id is None and sess_row['latest_assembly_id'] is not None:
+                from_assembly_id = sess_row['latest_assembly_id']
+
+            # Normalize provenance arrays — NULL when empty
+            retr_json = (
+                _json.dumps(sorted(triggering_retrieval_ids))
+                if triggering_retrieval_ids else None
+            )
+            conf_json = (
+                _json.dumps(sorted(triggering_confidence_revision_ids))
+                if triggering_confidence_revision_ids else None
+            )
+            contra_json = (
+                _json.dumps(sorted(triggering_contradiction_link_ids))
+                if triggering_contradiction_link_ids else None
+            )
+            prov_json = (
+                _json.dumps(provenance, sort_keys=True)
+                if provenance is not None else None
+            )
+
+            cur = conn.execute(
+                """INSERT INTO assembly_transition_log
+                   (cognition_session_id, sequence_index, from_assembly_id,
+                    to_assembly_id, transition_type, transition_reason,
+                    triggered_by, transitioned_at,
+                    triggering_retrieval_ids_json,
+                    triggering_confidence_revision_ids_json,
+                    triggering_contradiction_link_ids_json,
+                    provenance_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (cognition_session_id, sequence_index, from_assembly_id,
+                 to_assembly_id, transition_type, reason, triggered_by, now,
+                 retr_json, conf_json, contra_json, prov_json),
+            )
+
+            # Update session: increment count and pointers
+            new_count = sess_row['assembly_count'] + 1
+            if sess_row['initial_assembly_id'] is None:
+                conn.execute(
+                    """UPDATE cognition_session
+                       SET assembly_count = ?,
+                           latest_assembly_id = ?,
+                           initial_assembly_id = ?
+                       WHERE id = ?""",
+                    (new_count, to_assembly_id, to_assembly_id, cognition_session_id),
+                )
+            else:
+                conn.execute(
+                    """UPDATE cognition_session
+                       SET assembly_count = ?, latest_assembly_id = ?
+                       WHERE id = ?""",
+                    (new_count, to_assembly_id, cognition_session_id),
+                )
+
+            row = conn.execute(
+                'SELECT * FROM assembly_transition_log WHERE id = ?', (cur.lastrowid,)
+            ).fetchone()
+            return AssemblyTransition.from_row(row)
+    finally:
+        conn.close()
+
+
+def close_cognition_session(
+    db_path: str,
+    cognition_session_id: int,
+    reason: str,
+    triggered_by: str,
+) -> CognitionSession:
+    """
+    Close an active cognition session.
+
+    Sets status='closed', closed_at, closed_reason. After close, no new
+    transitions can be appended. Existing rows in assembly_transition_log
+    are not affected.
+
+    Raises ValueError if session not found or status is not 'active'.
+    """
+    if not triggered_by or not triggered_by.strip():
+        raise ValueError("'triggered_by' must not be empty")
+    if not reason or not reason.strip():
+        raise ValueError("'reason' must not be empty")
+
+    now = _now_utc()
+
+    conn = _mem_connect(db_path)
+    try:
+        with conn:
+            row = conn.execute(
+                'SELECT * FROM cognition_session WHERE id = ?', (cognition_session_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Cognition session {cognition_session_id} not found")
+            if row['status'] != 'active':
+                raise ValueError(
+                    f"Cognition session {cognition_session_id} has status "
+                    f"'{row['status']}'; only 'active' sessions can be closed"
+                )
+
+            conn.execute(
+                """UPDATE cognition_session
+                   SET status = 'closed', closed_at = ?, closed_reason = ?
+                   WHERE id = ?""",
+                (now, reason, cognition_session_id),
+            )
+            row = conn.execute(
+                'SELECT * FROM cognition_session WHERE id = ?', (cognition_session_id,)
+            ).fetchone()
+            return CognitionSession.from_row(row)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Cognition session read and replay
+# ---------------------------------------------------------------------------
+
+def list_cognition_sessions(
+    db_path: str,
+    status: Optional[str] = None,
+    limit: int = 50,
+) -> List[CognitionSession]:
+    """List cognition sessions ordered by id ASC, optionally filtered by status."""
+    clauses: List[str] = []
+    params: list = []
+    if status is not None:
+        clauses.append('status = ?')
+        params.append(status)
+    where = f'WHERE {" AND ".join(clauses)}' if clauses else ''
+    params.append(limit)
+
+    conn = _mem_connect(db_path)
+    try:
+        rows = conn.execute(
+            f'SELECT * FROM cognition_session {where} ORDER BY id ASC LIMIT ?',
+            params,
+        ).fetchall()
+        return [CognitionSession.from_row(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_cognition_session(db_path: str, cognition_session_id: int) -> CognitionSession:
+    """Fetch one cognition session by id. Raises ValueError if not found."""
+    conn = _mem_connect(db_path)
+    try:
+        row = conn.execute(
+            'SELECT * FROM cognition_session WHERE id = ?', (cognition_session_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Cognition session {cognition_session_id} not found")
+        return CognitionSession.from_row(row)
+    finally:
+        conn.close()
+
+
+def replay_session_timeline(
+    cognition_session_id: int,
+    db_path: str,
+) -> List[SessionReconstruction]:
+    """
+    Replay all assemblies in a cognition session in chronological order.
+
+    Pure snapshot replay: loads assembly_snapshot_json for each transition's
+    to_assembly_id via replay_assembly(). Does not call reconstruct(), activate_memory(),
+    or any retrieval function. Returns List[SessionReconstruction] with replayed=True.
+
+    Raises ValueError if cognition_session_id not found.
+    """
+    conn = _mem_connect(db_path)
+    try:
+        row = conn.execute(
+            'SELECT id FROM cognition_session WHERE id = ?', (cognition_session_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Cognition session {cognition_session_id} not found")
+
+        transitions = conn.execute(
+            """SELECT to_assembly_id FROM assembly_transition_log
+               WHERE cognition_session_id = ?
+               ORDER BY sequence_index ASC""",
+            (cognition_session_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    return [replay_assembly(t['to_assembly_id'], db_path) for t in transitions]
+
+
+def get_session_assemblies(
+    cognition_session_id: int,
+    db_path: str,
+) -> List[dict]:
+    """
+    Return transition rows enriched with assembly fields, ordered by sequence_index ASC.
+
+    Pure read — no reconstruction. Returns plain dicts with all assembly_transition_log
+    columns plus assembly_hash, assembly_version, assembled_at, entries_accepted,
+    char_budget_used, char_budget_limit, assembly_status from context_assembly_log.
+
+    Raises ValueError if cognition_session_id not found.
+    """
+    conn = _mem_connect(db_path)
+    try:
+        sess_row = conn.execute(
+            'SELECT id FROM cognition_session WHERE id = ?', (cognition_session_id,)
+        ).fetchone()
+        if sess_row is None:
+            raise ValueError(f"Cognition session {cognition_session_id} not found")
+
+        rows = conn.execute(
+            """SELECT
+                   atl.*,
+                   cal.assembly_hash,
+                   cal.assembly_version,
+                   cal.assembled_at,
+                   cal.entries_accepted,
+                   cal.char_budget_used,
+                   cal.char_budget_limit,
+                   cal.status AS assembly_status
+               FROM assembly_transition_log atl
+               JOIN context_assembly_log cal ON cal.id = atl.to_assembly_id
+               WHERE atl.cognition_session_id = ?
+               ORDER BY atl.sequence_index ASC""",
+            (cognition_session_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def verify_session_timeline(
+    cognition_session_id: int,
+    db_path: str,
+) -> SessionTimelineDivergenceReport:
+    """
+    Run verify_assembly_against_current_db() for each assembly in the session.
+
+    Returns a SessionTimelineDivergenceReport ordered by sequence_index ASC.
+    diverged=True if any individual assembly report has diverged=True.
+
+    This re-runs reconstruct() for each assembly — it is verification, not replay.
+    Raises ValueError if cognition_session_id not found.
+    """
+    conn = _mem_connect(db_path)
+    try:
+        sess_row = conn.execute(
+            'SELECT id FROM cognition_session WHERE id = ?', (cognition_session_id,)
+        ).fetchone()
+        if sess_row is None:
+            raise ValueError(f"Cognition session {cognition_session_id} not found")
+
+        transitions = conn.execute(
+            """SELECT to_assembly_id FROM assembly_transition_log
+               WHERE cognition_session_id = ?
+               ORDER BY sequence_index ASC""",
+            (cognition_session_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    reports = [
+        verify_assembly_against_current_db(t['to_assembly_id'], db_path)
+        for t in transitions
+    ]
+
+    return SessionTimelineDivergenceReport(
+        cognition_session_id=cognition_session_id,
+        diverged=any(r.diverged for r in reports),
+        assembly_reports=reports,
     )
