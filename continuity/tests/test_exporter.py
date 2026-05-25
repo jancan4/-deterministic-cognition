@@ -340,11 +340,11 @@ def _promote_one_candidate(db_path: str) -> tuple:
 
 
 class TestExportSemanticSections:
-    def test_schema_version_is_1_1(self, tmp_path):
+    def test_schema_version_is_1_2(self, tmp_path):
         db = str(tmp_path / 'memory.db')
         _init_memory_db(db)
         bundle = export_bundle(db)
-        assert bundle['schema_version'] == '1.1'
+        assert bundle['schema_version'] == '1.2'
 
     def test_empty_db_has_empty_semantic_sections(self, tmp_path):
         db = str(tmp_path / 'memory.db')
@@ -441,3 +441,181 @@ class TestExportSemanticSections:
         # Now export with unresolved_only — active events excluded
         bundle = export_bundle(db, export_filter=ExportFilter(unresolved_only=True))
         assert bundle['semantic_candidate_events'] == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 9B: v1.2 manifest metadata
+# ---------------------------------------------------------------------------
+
+class TestV12ManifestInExport:
+    def test_exported_db_schema_version_populated(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        _init_memory_db(db)
+        bundle = export_bundle(db)
+        # memory.service.init_db sets schema version; must be an int
+        assert isinstance(bundle['manifest']['exported_db_schema_version'], int)
+        assert bundle['manifest']['exported_db_schema_version'] > 0
+
+    def test_exported_db_schema_version_is_none_on_bare_db(self, tmp_path):
+        db = str(tmp_path / 'bare.db')
+        conn = sqlite3.connect(db)
+        conn.close()
+        bundle = export_bundle(db)
+        assert bundle['manifest']['exported_db_schema_version'] is None
+
+    def test_compression_proposed_excluded_flag_default_true(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        _init_memory_db(db)
+        bundle = export_bundle(db)
+        assert bundle['manifest']['compression_derived_proposed_excluded'] is True
+
+    def test_compression_proposed_excluded_flag_false_when_opted_in(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        _init_memory_db(db)
+        bundle = export_bundle(db, include_compression_derived_proposed=True)
+        assert bundle['manifest']['compression_derived_proposed_excluded'] is False
+
+    def test_compression_excluded_count_zero_with_no_proposed(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        _init_full_db(db)
+        _add_event(db, status='accepted')
+        bundle = export_bundle(db)
+        assert bundle['manifest']['compression_derived_proposed_excluded_count'] == 0
+
+    def test_compression_excluded_count_for_proposed_events(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        _init_memory_db(db)
+        # Directly insert compression-derived proposed events
+        conn = sqlite3.connect(db)
+        now = '2026-01-01T00:00:00Z'
+        for i in range(3):
+            conn.execute(
+                """INSERT INTO memory_events
+                   (event_type, title, summary, source, confidence, status,
+                    tags_json, related_ids_json, created_by, created_at, updated_at, version)
+                   VALUES (?, ?, ?, ?, 3, 'proposed', '[]', '[]', 'test', ?, ?, 1)""",
+                ('hypothesis', f'Compr {i}', 'summary',
+                 f'compression_artifact:{i+1}', now, now),
+            )
+        conn.commit()
+        conn.close()
+        bundle = export_bundle(db)
+        assert bundle['manifest']['compression_derived_proposed_excluded_count'] == 3
+        assert bundle['manifest']['compression_derived_proposed_excluded'] is True
+        # The excluded events must not appear in the bundle
+        assert len(bundle['memory_events']) == 0
+
+    def test_include_compression_proposed_includes_them(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        _init_memory_db(db)
+        conn = sqlite3.connect(db)
+        now = '2026-01-01T00:00:00Z'
+        conn.execute(
+            """INSERT INTO memory_events
+               (event_type, title, summary, source, confidence, status,
+                tags_json, related_ids_json, created_by, created_at, updated_at, version)
+               VALUES (?, ?, ?, ?, 3, 'proposed', '[]', '[]', 'test', ?, ?, 1)""",
+            ('hypothesis', 'Compr event', 'summary', 'compression_artifact:7', now, now),
+        )
+        conn.commit()
+        conn.close()
+        bundle = export_bundle(db, include_compression_derived_proposed=True)
+        assert bundle['manifest']['compression_derived_proposed_excluded'] is False
+        assert bundle['manifest']['compression_derived_proposed_excluded_count'] == 0
+        assert len(bundle['memory_events']) == 1
+
+    def test_dangling_compression_source_count(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        _init_memory_db(db)
+        conn = sqlite3.connect(db)
+        now = '2026-01-01T00:00:00Z'
+        # An active event with compression_artifact source (dangling)
+        conn.execute(
+            """INSERT INTO memory_events
+               (event_type, title, summary, source, confidence, status,
+                tags_json, related_ids_json, created_by, created_at, updated_at, version)
+               VALUES (?, ?, ?, ?, 3, 'active', '[]', '[]', 'test', ?, ?, 1)""",
+            ('hypothesis', 'Active compr', 'summary', 'compression_artifact:5', now, now),
+        )
+        # A normal event (not dangling)
+        conn.execute(
+            """INSERT INTO memory_events
+               (event_type, title, summary, source, confidence, status,
+                tags_json, related_ids_json, created_by, created_at, updated_at, version)
+               VALUES (?, ?, ?, ?, 3, 'active', '[]', '[]', 'test', ?, ?, 1)""",
+            ('hypothesis', 'Normal', 'summary', '/data/file.txt', now, now),
+        )
+        conn.commit()
+        conn.close()
+        bundle = export_bundle(db)
+        assert bundle['manifest']['dangling_compression_source_count'] == 1
+        assert len(bundle['memory_events']) == 2  # both exported
+
+    def test_lineage_integrity_not_checked_by_default(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        _init_memory_db(db)
+        bundle = export_bundle(db)
+        assert bundle['manifest']['lineage_integrity_checked'] is False
+        assert bundle['manifest']['lineage_integrity_all_ok'] is None
+        assert bundle['manifest']['lineage_integrity_broken_count'] == 0
+
+    def test_lineage_integrity_checked_when_flag_set(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        _init_memory_db(db)
+        bundle = export_bundle(db, include_lineage_integrity=True)
+        assert bundle['manifest']['lineage_integrity_checked'] is True
+        assert bundle['manifest']['lineage_integrity_all_ok'] is True
+        assert bundle['manifest']['lineage_integrity_broken_count'] == 0
+
+    def test_recovery_metadata_deterministic(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        _init_full_db(db)
+        _add_event(db, title='Stable')
+        b1 = export_bundle(db, exported_by='test')
+        b2 = export_bundle(db, exported_by='test')
+        for field in (
+            'exported_db_schema_version',
+            'compression_derived_proposed_excluded',
+            'compression_derived_proposed_excluded_count',
+            'dangling_compression_source_count',
+            'lineage_integrity_checked',
+            'lineage_integrity_all_ok',
+            'lineage_integrity_broken_count',
+        ):
+            assert b1['manifest'][field] == b2['manifest'][field], f"field {field!r} not deterministic"
+
+    def test_v1_2_bundle_validates(self, tmp_path):
+        db = str(tmp_path / 'memory.db')
+        _init_memory_db(db)
+        bundle = export_bundle(db)
+        validate_bundle(bundle)  # no exception
+
+    def test_total_events_in_db_via_excluded_count(self, tmp_path):
+        """Verify total_events_in_db = exported + excluded_proposed."""
+        db = str(tmp_path / 'memory.db')
+        _init_memory_db(db)
+        conn = sqlite3.connect(db)
+        now = '2026-01-01T00:00:00Z'
+        # 2 active, 3 proposed-compression
+        for i in range(2):
+            conn.execute(
+                """INSERT INTO memory_events
+                   (event_type, title, summary, source, confidence, status,
+                    tags_json, related_ids_json, created_by, created_at, updated_at, version)
+                   VALUES (?, ?, ?, ?, 3, 'active', '[]', '[]', 'test', ?, ?, 1)""",
+                ('hypothesis', f'Active {i}', 'summary', '/data/x.txt', now, now),
+            )
+        for i in range(3):
+            conn.execute(
+                """INSERT INTO memory_events
+                   (event_type, title, summary, source, confidence, status,
+                    tags_json, related_ids_json, created_by, created_at, updated_at, version)
+                   VALUES (?, ?, ?, ?, 3, 'proposed', '[]', '[]', 'test', ?, ?, 1)""",
+                ('hypothesis', f'Compr {i}', 'summary', f'compression_artifact:{i}', now, now),
+            )
+        conn.commit()
+        conn.close()
+        bundle = export_bundle(db)
+        m = bundle['manifest']
+        assert m['memory_event_count'] == 2
+        assert m['compression_derived_proposed_excluded_count'] == 3

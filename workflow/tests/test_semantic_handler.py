@@ -9,7 +9,7 @@ inference is required. The full test surface covers:
 3. execute_semantic_node — success, failure, idempotency, partial recovery
 4. Governance — committed=True creates unresolved memory only
 5. Replay contract — lineage metadata is correct; adapter not re-called
-6. Continuity bundle round-trip — promoted memory exported in schema 1.1
+6. Continuity bundle round-trip — promoted memory exported in current schema
 7. Ollama path — mocked HTTP only, no live network
 """
 import json
@@ -405,7 +405,7 @@ class TestContinuityBundleAfterWorkflow:
     def test_bundle_includes_promoted_semantic_lineage(self, tmp_path):
         """
         Acceptance test 6: after a committed workflow run, export_bundle()
-        returns a schema 1.1 bundle containing semantic_execution_runs and
+        returns the current schema bundle containing semantic_execution_runs and
         semantic_candidate_events for the promoted candidate.
         """
         db = _db(tmp_path)
@@ -417,7 +417,7 @@ class TestContinuityBundleAfterWorkflow:
         from continuity.manifest import BUNDLE_SCHEMA_VERSION, validate_bundle
 
         bundle = export_bundle(db)
-        assert bundle['schema_version'] == '1.1'
+        assert bundle['schema_version'] == BUNDLE_SCHEMA_VERSION
 
         # Promoted memory events should be in the bundle
         assert len(bundle['memory_events']) > 0

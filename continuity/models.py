@@ -9,7 +9,7 @@ import json
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-BUNDLE_SCHEMA_VERSION = '1.1'
+BUNDLE_SCHEMA_VERSION = '1.2'
 
 
 @dataclass
@@ -88,6 +88,7 @@ class ImportResult:
     skipped_semantic_candidate_events: int
     collisions: List[ImportCollision]
     dry_run: bool
+    warnings: List[str] = field(default_factory=list)
 
     @property
     def has_collisions(self) -> bool:
@@ -113,4 +114,6 @@ class ImportResult:
             'collision_count': len(self.collisions),
             'collisions': [c.to_dict() for c in self.collisions],
             'success': self.success,
+            'warning_count': len(self.warnings),
+            'warnings': list(self.warnings),
         }

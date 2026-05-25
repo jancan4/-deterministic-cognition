@@ -886,6 +886,16 @@ def build_parser() -> argparse.ArgumentParser:
         help='Optional workflow database path for workflow_references section',
     )
     eb_p.add_argument('--exported-by', default='fx-orchestration-system', dest='exported_by')
+    eb_p.add_argument(
+        '--include-compression-proposed', action='store_true', default=False,
+        dest='include_compression_proposed',
+        help='Include compression-derived proposed events (excluded by default per Phase 6D policy)',
+    )
+    eb_p.add_argument(
+        '--include-lineage-integrity', action='store_true', default=False,
+        dest='include_lineage_integrity',
+        help='Run FK integrity check and include result in manifest',
+    )
 
     # import-bundle ------------------------------------------------------
     ib_p = sub.add_parser(
@@ -898,6 +908,22 @@ def build_parser() -> argparse.ArgumentParser:
     ib_p.add_argument(
         '--dry-run', action='store_true', default=False, dest='dry_run',
         help='Validate and plan import without writing anything',
+    )
+
+    # bundle-inspect ------------------------------------------------------
+    bi_p = sub.add_parser(
+        'bundle-inspect',
+        help='Inspect a continuity bundle manifest without importing (read-only)',
+    )
+    bi_p.set_defaults(command='bundle-inspect')
+    bi_p.add_argument('path', help='Path to bundle JSON file')
+    bi_p.add_argument(
+        '--db', default=None, dest='db',
+        help='Optional target DB path for schema-version and artifact checks (read-only)',
+    )
+    bi_p.add_argument(
+        '--format', choices=['text', 'json'], default='text',
+        help='Output format (default: text)',
     )
 
     # semantic-workflow --------------------------------------------------
@@ -1899,6 +1925,8 @@ def cmd_export_bundle(args: argparse.Namespace) -> int:
             export_filter=export_filter,
             workflow_db_path=args.workflow_db,
             exported_by=args.exported_by,
+            include_compression_derived_proposed=args.include_compression_proposed,
+            include_lineage_integrity=args.include_lineage_integrity,
         )
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -1910,10 +1938,15 @@ def cmd_export_bundle(args: argparse.Namespace) -> int:
             fh.write(serialized)
             fh.write('\n')
         manifest = bundle['manifest']
+        db_schema = manifest.get('exported_db_schema_version', '—')
+        dangling = manifest.get('dangling_compression_source_count', 0)
+        excl_count = manifest.get('compression_derived_proposed_excluded_count', 0)
         print(
             f"Exported bundle {manifest['bundle_id']!r}: "
             f"{manifest['memory_event_count']} events, "
-            f"{manifest['source_count']} sources → {args.out}"
+            f"{manifest['source_count']} sources "
+            f"(db_schema=v{db_schema}, dangling_compression={dangling}, "
+            f"excluded_proposed={excl_count}) → {args.out}"
         )
     else:
         print(serialized)
@@ -1952,6 +1985,10 @@ def cmd_import_bundle(args: argparse.Namespace) -> int:
         )
         return 1
 
+    # Print warnings to stderr (do not affect exit code for dry-run)
+    for w in result.warnings:
+        print(f"WARNING: {w}", file=sys.stderr)
+
     if args.dry_run:
         print(
             f"\nDry-run complete: would import "
@@ -1960,14 +1997,107 @@ def cmd_import_bundle(args: argparse.Namespace) -> int:
             f"{result.imported_ingestion_runs} runs. "
             f"No writes made."
         )
-    else:
-        print(
-            f"\nImported: "
-            f"{result.imported_memory_events} events, "
-            f"{result.imported_source_documents} sources, "
-            f"{result.imported_ingestion_runs} runs. "
-            f"Skipped: {result.skipped_memory_events} events."
-        )
+        return 0  # dry-run always exits 0 regardless of warnings
+
+    print(
+        f"\nImported: "
+        f"{result.imported_memory_events} events, "
+        f"{result.imported_source_documents} sources, "
+        f"{result.imported_ingestion_runs} runs. "
+        f"Skipped: {result.skipped_memory_events} events."
+    )
+
+    # Exit 2 when import succeeded but warnings exist
+    return 2 if result.warnings else 0
+
+
+def cmd_bundle_inspect(args: argparse.Namespace) -> int:
+    """Read a bundle file, validate it, and print manifest summary. Read-only."""
+    import json
+    import sqlite3
+    from continuity.manifest import BundleValidationError, validate_bundle
+
+    try:
+        with open(args.path) as fh:
+            bundle_dict = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"ERROR reading bundle: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        validate_bundle(bundle_dict)
+    except BundleValidationError as exc:
+        print(f"INVALID: {exc}", file=sys.stderr)
+        return 1
+
+    manifest = bundle_dict.get('manifest', {})
+
+    if args.format == 'json':
+        print(json.dumps(manifest, indent=2, sort_keys=True))
+        return 0
+
+    # Text format
+    print(f"bundle_id            : {manifest.get('bundle_id', '—')}")
+    print(f"schema_version       : {manifest.get('schema_version', '—')}")
+    print(f"exported_at          : {manifest.get('exported_at', '—')}")
+    print(f"exported_by          : {manifest.get('exported_by', '—')}")
+    db_sv = manifest.get('exported_db_schema_version')
+    print(f"exported_db_schema   : {db_sv if db_sv is not None else '—'}")
+    print(f"memory_events        : {manifest.get('memory_event_count', 0)}")
+    print(f"source_documents     : {manifest.get('source_count', 0)}")
+    print(f"ingestion_runs       : {manifest.get('ingestion_run_count', 0)}")
+    print(f"semantic_runs        : {manifest.get('semantic_execution_run_count', 0)}")
+    print(f"semantic_candidates  : {manifest.get('semantic_candidate_event_count', 0)}")
+
+    excl = manifest.get('compression_derived_proposed_excluded')
+    if excl is not None:
+        excl_count = manifest.get('compression_derived_proposed_excluded_count', 0)
+        print(f"compression_excl     : {excl} (excluded_count={excl_count})")
+
+    dangling = manifest.get('dangling_compression_source_count')
+    if dangling is not None:
+        print(f"dangling_compression : {dangling}")
+
+    li_checked = manifest.get('lineage_integrity_checked')
+    if li_checked is not None:
+        if li_checked:
+            li_ok = manifest.get('lineage_integrity_all_ok')
+            li_broken = manifest.get('lineage_integrity_broken_count', 0)
+            li_status = 'OK' if li_ok else 'BROKEN'
+            print(f"lineage_integrity    : {li_status} (broken={li_broken})")
+        else:
+            print(f"lineage_integrity    : not checked")
+
+    print(f"\nchecksum_sha256      : {manifest.get('checksum_sha256', '—')}")
+    print("VALID")
+
+    # Optional target DB checks (read-only, degrade gracefully)
+    if args.db:
+        print(f"\n--- Target DB: {args.db} ---")
+        try:
+            conn = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    'SELECT version FROM memory_schema_version'
+                ).fetchone()
+                target_schema = row[0] if row else None
+            except Exception:
+                target_schema = None
+
+            if target_schema is not None and db_sv is not None:
+                if int(target_schema) == int(db_sv):
+                    print(f"schema_match         : OK (v{target_schema})")
+                else:
+                    print(
+                        f"schema_match         : MISMATCH "
+                        f"(bundle=v{db_sv}, target=v{target_schema})"
+                    )
+            else:
+                print(f"target_schema        : {target_schema if target_schema is not None else '—'}")
+            conn.close()
+        except Exception as exc:
+            print(f"target_db_error      : {exc}", file=sys.stderr)
 
     return 0
 
@@ -1991,6 +2121,7 @@ def main(argv: List[str] = None) -> int:
         'ingestion-run-show': cmd_ingestion_run_show,
         'export-bundle': cmd_export_bundle,
         'import-bundle': cmd_import_bundle,
+        'bundle-inspect': cmd_bundle_inspect,
         'semantic-run': cmd_semantic_run,
         'semantic-candidates': cmd_semantic_candidates,
         'memory-review': cmd_memory_review,

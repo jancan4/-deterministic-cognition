@@ -198,3 +198,169 @@ class TestValidateBundle:
     def test_not_a_dict(self):
         with pytest.raises(BundleValidationError, match='dict'):
             validate_bundle([])
+
+
+# ---------------------------------------------------------------------------
+# Schema version backward compatibility (Phase 9B)
+# ---------------------------------------------------------------------------
+
+def _v1_0_bundle() -> dict:
+    """Minimal structurally-valid v1.0 bundle (no semantic sections, no recovery metadata)."""
+    import hashlib, json as _json
+    events: list = []
+    manifest = {
+        'bundle_id': 'abc123deadbeef',
+        'schema_version': '1.0',
+        'exported_at': '2024-01-01T00:00:00Z',
+        'exported_by': 'test',
+        'filters': {},
+        'source_count': 0,
+        'memory_event_count': 0,
+        'ingestion_run_count': 0,
+        'workflow_reference_count': 0,
+        'checksum_sha256': '',
+    }
+    bundle = {
+        'schema_version': '1.0',
+        'manifest': manifest,
+        'memory_events': [],
+        'source_documents': [],
+        'ingestion_runs': [],
+        'workflow_references': [],
+    }
+    manifest['checksum_sha256'] = compute_bundle_checksum(bundle)
+    return bundle
+
+
+def _v1_1_bundle() -> dict:
+    """Minimal structurally-valid v1.1 bundle (semantic sections, no recovery metadata)."""
+    manifest = {
+        'bundle_id': 'abc123deadbeef',
+        'schema_version': '1.1',
+        'exported_at': '2024-01-01T00:00:00Z',
+        'exported_by': 'test',
+        'filters': {},
+        'source_count': 0,
+        'memory_event_count': 0,
+        'ingestion_run_count': 0,
+        'workflow_reference_count': 0,
+        'semantic_execution_run_count': 0,
+        'semantic_candidate_event_count': 0,
+        'checksum_sha256': '',
+    }
+    bundle = {
+        'schema_version': '1.1',
+        'manifest': manifest,
+        'memory_events': [],
+        'source_documents': [],
+        'ingestion_runs': [],
+        'workflow_references': [],
+        'semantic_execution_runs': [],
+        'semantic_candidate_events': [],
+    }
+    manifest['checksum_sha256'] = compute_bundle_checksum(bundle)
+    return bundle
+
+
+class TestBackwardCompatibility:
+    def test_v1_0_bundle_validates(self):
+        validate_bundle(_v1_0_bundle())  # no exception
+
+    def test_v1_1_bundle_validates(self):
+        validate_bundle(_v1_1_bundle())  # no exception
+
+    def test_v1_2_bundle_validates(self):
+        validate_bundle(_minimal_bundle())  # no exception — _minimal_bundle() produces v1.2
+
+    def test_v1_2_missing_recovery_field_raises(self):
+        b = _minimal_bundle()
+        del b['manifest']['exported_db_schema_version']
+        with pytest.raises(BundleValidationError, match='Manifest missing'):
+            validate_bundle(b)
+
+    def test_v1_2_missing_lineage_field_raises(self):
+        b = _minimal_bundle()
+        del b['manifest']['lineage_integrity_checked']
+        with pytest.raises(BundleValidationError, match='Manifest missing'):
+            validate_bundle(b)
+
+    def test_v1_0_does_not_require_recovery_fields(self):
+        b = _v1_0_bundle()
+        # v1.0 bundles must NOT require v1.2 manifest keys
+        validate_bundle(b)  # no exception despite missing recovery fields
+
+    def test_v1_1_does_not_require_recovery_fields(self):
+        b = _v1_1_bundle()
+        validate_bundle(b)  # no exception despite missing recovery fields
+
+
+class TestV12ManifestFields:
+    def test_build_manifest_populates_recovery_fields(self):
+        b = _minimal_bundle()
+        m = b['manifest']
+        assert 'exported_db_schema_version' in m
+        assert 'compression_derived_proposed_excluded' in m
+        assert 'compression_derived_proposed_excluded_count' in m
+        assert 'dangling_compression_source_count' in m
+        assert 'lineage_integrity_checked' in m
+        assert 'lineage_integrity_all_ok' in m
+        assert 'lineage_integrity_broken_count' in m
+
+    def test_default_values_are_conservative(self):
+        b = _minimal_bundle()
+        m = b['manifest']
+        assert m['exported_db_schema_version'] is None
+        assert m['compression_derived_proposed_excluded'] is False
+        assert m['compression_derived_proposed_excluded_count'] == 0
+        assert m['dangling_compression_source_count'] == 0
+        assert m['lineage_integrity_checked'] is False
+        assert m['lineage_integrity_all_ok'] is None
+        assert m['lineage_integrity_broken_count'] == 0
+
+    def test_recovery_fields_covered_by_checksum(self):
+        b = _minimal_bundle()
+        stored = b['manifest']['checksum_sha256']
+
+        # Mutate a recovery field
+        b_copy = copy.deepcopy(b)
+        b_copy['manifest']['exported_db_schema_version'] = 999
+        assert compute_bundle_checksum(b_copy) != stored
+
+    def test_restoring_recovery_field_restores_checksum(self):
+        b = _minimal_bundle()
+        stored = compute_bundle_checksum(b)
+
+        b_mut = copy.deepcopy(b)
+        b_mut['manifest']['dangling_compression_source_count'] = 42
+        assert compute_bundle_checksum(b_mut) != stored
+
+        b_mut['manifest']['dangling_compression_source_count'] = 0
+        assert compute_bundle_checksum(b_mut) == stored
+
+    def test_explicit_recovery_values_preserved(self):
+        bundle = {
+            'schema_version': BUNDLE_SCHEMA_VERSION,
+            'memory_events': [],
+            'source_documents': [],
+            'ingestion_runs': [],
+            'workflow_references': [],
+            'semantic_execution_runs': [],
+            'semantic_candidate_events': [],
+        }
+        m = build_manifest(
+            bundle, '2026-01-01T00:00:00Z', 'tester', {},
+            exported_db_schema_version=16,
+            compression_derived_proposed_excluded=True,
+            compression_derived_proposed_excluded_count=3,
+            dangling_compression_source_count=1,
+            lineage_integrity_checked=True,
+            lineage_integrity_all_ok=True,
+            lineage_integrity_broken_count=0,
+        )
+        assert m['exported_db_schema_version'] == 16
+        assert m['compression_derived_proposed_excluded'] is True
+        assert m['compression_derived_proposed_excluded_count'] == 3
+        assert m['dangling_compression_source_count'] == 1
+        assert m['lineage_integrity_checked'] is True
+        assert m['lineage_integrity_all_ok'] is True
+        assert m['lineage_integrity_broken_count'] == 0

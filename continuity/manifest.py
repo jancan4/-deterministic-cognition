@@ -12,10 +12,22 @@ Checksum computation is deterministic:
 bundle_id derivation:
   sha256( exported_at + NUL + str(sorted(event_ids)) )[:16]
   Stable for the same export of the same set of events.
+
+Schema version history:
+  1.0 — initial bundle format (memory_events, source_documents, ingestion_runs,
+         workflow_references).
+  1.1 — adds semantic_execution_runs and semantic_candidate_events sections.
+  1.2 — adds recovery metadata to manifest: exported_db_schema_version,
+         compression_derived_proposed_excluded,
+         compression_derived_proposed_excluded_count,
+         dangling_compression_source_count,
+         lineage_integrity_checked,
+         lineage_integrity_all_ok,
+         lineage_integrity_broken_count.
 """
 import hashlib
 import json
-from typing import List
+from typing import List, Optional
 
 from .models import BUNDLE_SCHEMA_VERSION
 
@@ -36,9 +48,12 @@ def compute_bundle_checksum(bundle_dict: dict) -> str:
     The manifest.checksum_sha256 field is excluded so the checksum can be
     stored inside the manifest without a circularity problem.
 
-    Schema 1.1 bundles include semantic_execution_runs and
+    Schema 1.1 and 1.2 bundles include semantic_execution_runs and
     semantic_candidate_events in the checksum. Schema 1.0 bundles do not,
     preserving backward compatibility with existing bundle files.
+
+    Schema 1.2 bundles also cover the new recovery metadata manifest fields
+    (they are included automatically via manifest_without_checksum).
     """
     schema_version = bundle_dict.get('schema_version', '1.0')
     manifest_without_checksum = {
@@ -54,7 +69,7 @@ def compute_bundle_checksum(bundle_dict: dict) -> str:
         'ingestion_runs': bundle_dict.get('ingestion_runs', []),
         'workflow_references': bundle_dict.get('workflow_references', []),
     }
-    if schema_version == '1.1':
+    if schema_version in ('1.1', '1.2'):
         content['semantic_execution_runs'] = bundle_dict.get('semantic_execution_runs', [])
         content['semantic_candidate_events'] = bundle_dict.get('semantic_candidate_events', [])
     canonical = json.dumps(content, sort_keys=True, ensure_ascii=True)
@@ -66,11 +81,21 @@ def build_manifest(
     exported_at: str,
     exported_by: str,
     filters: dict,
+    *,
+    exported_db_schema_version: Optional[int] = None,
+    compression_derived_proposed_excluded: bool = False,
+    compression_derived_proposed_excluded_count: int = 0,
+    dangling_compression_source_count: int = 0,
+    lineage_integrity_checked: bool = False,
+    lineage_integrity_all_ok: Optional[bool] = None,
+    lineage_integrity_broken_count: int = 0,
 ) -> dict:
     """
     Construct the manifest dict for a bundle, including checksum.
 
     The returned dict is ready to be inserted as bundle['manifest'].
+    New keyword-only parameters populate v1.2 recovery metadata fields.
+    All parameters default to safe values so existing callers are not broken.
     """
     event_ids = [e['id'] for e in bundle.get('memory_events', [])]
     bundle_id = _generate_bundle_id(exported_at, event_ids)
@@ -87,6 +112,14 @@ def build_manifest(
         'workflow_reference_count': len(bundle.get('workflow_references', [])),
         'semantic_execution_run_count': len(bundle.get('semantic_execution_runs', [])),
         'semantic_candidate_event_count': len(bundle.get('semantic_candidate_events', [])),
+        # v1.2 recovery metadata
+        'exported_db_schema_version': exported_db_schema_version,
+        'compression_derived_proposed_excluded': compression_derived_proposed_excluded,
+        'compression_derived_proposed_excluded_count': compression_derived_proposed_excluded_count,
+        'dangling_compression_source_count': dangling_compression_source_count,
+        'lineage_integrity_checked': lineage_integrity_checked,
+        'lineage_integrity_all_ok': lineage_integrity_all_ok,
+        'lineage_integrity_broken_count': lineage_integrity_broken_count,
         'checksum_sha256': '',  # placeholder; filled after checksum computed
     }
 
@@ -96,7 +129,7 @@ def build_manifest(
     return manifest
 
 
-_SUPPORTED_SCHEMA_VERSIONS = ('1.0', '1.1')
+_SUPPORTED_SCHEMA_VERSIONS = ('1.0', '1.1', '1.2')
 
 _REQUIRED_BUNDLE_KEYS_V1_0 = frozenset({
     'schema_version', 'manifest',
@@ -105,6 +138,7 @@ _REQUIRED_BUNDLE_KEYS_V1_0 = frozenset({
 _REQUIRED_BUNDLE_KEYS_V1_1 = _REQUIRED_BUNDLE_KEYS_V1_0 | {
     'semantic_execution_runs', 'semantic_candidate_events',
 }
+_REQUIRED_BUNDLE_KEYS_V1_2 = _REQUIRED_BUNDLE_KEYS_V1_1  # same top-level structure
 
 _REQUIRED_MANIFEST_KEYS_V1_0 = frozenset({
     'bundle_id', 'schema_version', 'exported_at', 'exported_by',
@@ -114,18 +148,27 @@ _REQUIRED_MANIFEST_KEYS_V1_0 = frozenset({
 _REQUIRED_MANIFEST_KEYS_V1_1 = _REQUIRED_MANIFEST_KEYS_V1_0 | {
     'semantic_execution_run_count', 'semantic_candidate_event_count',
 }
+_REQUIRED_MANIFEST_KEYS_V1_2 = _REQUIRED_MANIFEST_KEYS_V1_1 | {
+    'exported_db_schema_version',
+    'compression_derived_proposed_excluded',
+    'compression_derived_proposed_excluded_count',
+    'dangling_compression_source_count',
+    'lineage_integrity_checked',
+    'lineage_integrity_all_ok',
+    'lineage_integrity_broken_count',
+}
 
 # Keep singular names pointing to the latest version for external use
-_REQUIRED_BUNDLE_KEYS = _REQUIRED_BUNDLE_KEYS_V1_1
-_REQUIRED_MANIFEST_KEYS = _REQUIRED_MANIFEST_KEYS_V1_1
+_REQUIRED_BUNDLE_KEYS = _REQUIRED_BUNDLE_KEYS_V1_2
+_REQUIRED_MANIFEST_KEYS = _REQUIRED_MANIFEST_KEYS_V1_2
 
 
 def validate_bundle(bundle_dict: dict) -> None:
     """
     Validate structure, counts, and checksum of a bundle dict.
 
-    Accepts schema versions 1.0 and 1.1. Raises BundleValidationError on any
-    problem. Does not write to any database.
+    Accepts schema versions 1.0, 1.1, and 1.2. Raises BundleValidationError on
+    any problem. Does not write to any database.
     """
     if not isinstance(bundle_dict, dict):
         raise BundleValidationError("Bundle must be a JSON object (dict)")
@@ -139,8 +182,15 @@ def validate_bundle(bundle_dict: dict) -> None:
         )
 
     # Version-specific required keys
-    req_bundle = _REQUIRED_BUNDLE_KEYS_V1_1 if schema_version == '1.1' else _REQUIRED_BUNDLE_KEYS_V1_0
-    req_manifest = _REQUIRED_MANIFEST_KEYS_V1_1 if schema_version == '1.1' else _REQUIRED_MANIFEST_KEYS_V1_0
+    if schema_version == '1.2':
+        req_bundle = _REQUIRED_BUNDLE_KEYS_V1_2
+        req_manifest = _REQUIRED_MANIFEST_KEYS_V1_2
+    elif schema_version == '1.1':
+        req_bundle = _REQUIRED_BUNDLE_KEYS_V1_1
+        req_manifest = _REQUIRED_MANIFEST_KEYS_V1_1
+    else:
+        req_bundle = _REQUIRED_BUNDLE_KEYS_V1_0
+        req_manifest = _REQUIRED_MANIFEST_KEYS_V1_0
 
     # Required top-level keys
     missing = req_bundle - set(bundle_dict.keys())
@@ -164,7 +214,7 @@ def validate_bundle(bundle_dict: dict) -> None:
     _check_count(manifest, 'source_count', bundle_dict['source_documents'])
     _check_count(manifest, 'ingestion_run_count', bundle_dict['ingestion_runs'])
     _check_count(manifest, 'workflow_reference_count', bundle_dict['workflow_references'])
-    if schema_version == '1.1':
+    if schema_version in ('1.1', '1.2'):
         _check_count(manifest, 'semantic_execution_run_count', bundle_dict['semantic_execution_runs'])
         _check_count(manifest, 'semantic_candidate_event_count', bundle_dict['semantic_candidate_events'])
 

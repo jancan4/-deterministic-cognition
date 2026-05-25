@@ -446,6 +446,88 @@ def _insert_semantic_candidates(conn: sqlite3.Connection, candidates: List[dict]
 
 
 # ---------------------------------------------------------------------------
+# Warning detection helpers
+# ---------------------------------------------------------------------------
+
+def _detect_import_warnings(
+    bundle_dict: dict,
+    conn: sqlite3.Connection,
+    events_to_import: List[dict],
+) -> List[str]:
+    """
+    Return ordered list of import warnings. Warnings do not block the import.
+
+    Detects:
+      1. Schema version mismatch between bundle and target DB.
+      2. Compression-derived proposed exclusion disclosure.
+      3. Dangling compression artifact provenance in events being imported.
+    """
+    warnings: List[str] = []
+    manifest = bundle_dict.get('manifest', {})
+
+    # 1. Schema version mismatch
+    exported_schema = manifest.get('exported_db_schema_version')
+    if exported_schema is not None:
+        try:
+            row = conn.execute(
+                'SELECT version FROM memory_schema_version'
+            ).fetchone()
+            if row is not None and int(row[0]) != int(exported_schema):
+                warnings.append(
+                    f"Bundle was exported from schema v{exported_schema}; "
+                    f"target is schema v{row[0]}. "
+                    f"Review column additions before proceeding."
+                )
+        except Exception:
+            pass
+
+    # 2. Compression-derived proposed exclusion disclosure
+    if (
+        manifest.get('compression_derived_proposed_excluded') is True
+        and manifest.get('compression_derived_proposed_excluded_count', 0) > 0
+    ):
+        n = manifest['compression_derived_proposed_excluded_count']
+        warnings.append(
+            f"Bundle excludes {n} compression-derived proposed event(s) "
+            f"per Phase 6D policy. Re-export with "
+            f"include_compression_derived_proposed=True to include them."
+        )
+
+    # 3. Dangling compression artifact provenance
+    has_artifacts_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='compression_artifacts'"
+    ).fetchone() is not None
+
+    for ev in events_to_import:
+        src = ev.get('source', '')
+        if not src.startswith('compression_artifact:'):
+            continue
+        if not has_artifacts_table:
+            warnings.append(
+                f"Event id={ev['id']} source={src!r}: compression artifact table "
+                f"absent in target — provenance preserved as string, "
+                f"artifact not reconstructable."
+            )
+        else:
+            try:
+                artifact_id = int(src.split(':', 1)[1])
+                row = conn.execute(
+                    'SELECT id FROM compression_artifacts WHERE id = ?',
+                    (artifact_id,),
+                ).fetchone()
+                if row is None:
+                    warnings.append(
+                        f"Event id={ev['id']} source={src!r}: compression artifact "
+                        f"not present in target — provenance preserved as string, "
+                        f"artifact not reconstructable."
+                    )
+            except (ValueError, IndexError):
+                pass
+
+    return warnings
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -487,6 +569,8 @@ def import_bundle(
         sem_cand_cols, sem_cand_insert, sem_cand_skip = _check_semantic_candidates(
             conn, sem_candidates, incoming_ev_ids
         )
+        # Warnings: schema mismatch, compression provenance, policy disclosure
+        import_warnings = _detect_import_warnings(bundle_dict, conn, ev_insert)
 
     all_collisions = ev_cols + doc_cols + run_cols + sem_run_cols + sem_cand_cols
 
@@ -504,6 +588,7 @@ def import_bundle(
             skipped_semantic_candidate_events=len(sem_cand_skip),
             collisions=all_collisions,
             dry_run=dry_run,
+            warnings=import_warnings,
         )
 
     # Atomic write — all within a single connection/transaction
@@ -527,4 +612,5 @@ def import_bundle(
         skipped_semantic_candidate_events=len(sem_cand_skip),
         collisions=[],
         dry_run=False,
+        warnings=import_warnings,
     )

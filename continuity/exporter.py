@@ -39,6 +39,15 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     ).fetchone() is not None
 
 
+def _fetch_db_schema_version(conn: sqlite3.Connection) -> Optional[int]:
+    """Read the memory substrate schema version. Returns None if table absent."""
+    try:
+        row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
+        return int(row[0]) if row else None
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Section fetchers (all read-only)
 # ---------------------------------------------------------------------------
@@ -311,6 +320,8 @@ def export_bundle(
     export_filter: Optional[ExportFilter] = None,
     workflow_db_path: Optional[str] = None,
     exported_by: str = 'fx-orchestration-system',
+    include_compression_derived_proposed: bool = False,
+    include_lineage_integrity: bool = False,
 ) -> dict:
     """
     Assemble and return a deterministic continuity bundle from the database.
@@ -320,19 +331,58 @@ def export_bundle(
 
     Read-only: issues no writes against any database.
     Deterministic: same database state + same filter = same bundle checksum.
+
+    Phase 6D policy: compression-derived proposed events are excluded by default.
+    Pass include_compression_derived_proposed=True to include them.
+
+    Pass include_lineage_integrity=True to run a deterministic FK integrity check
+    and include its result in the manifest. No governance report or replay
+    verification is performed.
     """
     exported_at = _now()
 
     with _connect(db_path) as conn:
-        memory_events = _fetch_memory_events(conn, export_filter)
+        db_schema_version = _fetch_db_schema_version(conn)
+        all_memory_events = _fetch_memory_events(conn, export_filter)
+
+        # Phase 6D: exclude compression-derived proposed events by default
+        if not include_compression_derived_proposed:
+            memory_events = [
+                e for e in all_memory_events
+                if not (
+                    e['source'].startswith('compression_artifact:')
+                    and e['status'] == 'proposed'
+                )
+            ]
+            compression_excluded_count = len(all_memory_events) - len(memory_events)
+        else:
+            memory_events = all_memory_events
+            compression_excluded_count = 0
+
         source_documents = _fetch_source_documents(conn, memory_events, export_filter)
         ingestion_runs = _fetch_ingestion_runs(conn, source_documents)
         semantic_candidates = _fetch_semantic_candidates(conn, memory_events)
         semantic_runs = _fetch_semantic_runs(conn, semantic_candidates)
 
+    # Count events with compression artifact provenance (artifact rows never bundled)
+    dangling_compression_source_count = sum(
+        1 for e in memory_events if e['source'].startswith('compression_artifact:')
+    )
+
     workflow_references: List[dict] = []
     if workflow_db_path:
         workflow_references = _fetch_workflow_references(workflow_db_path)
+
+    # Optional lineage integrity check (deterministic, read-only, no model calls)
+    lineage_integrity_checked = False
+    lineage_integrity_all_ok: Optional[bool] = None
+    lineage_integrity_broken_count = 0
+    if include_lineage_integrity:
+        from memory.governance import check_lineage_integrity
+        li = check_lineage_integrity(db_path)
+        lineage_integrity_checked = True
+        lineage_integrity_all_ok = li['all_ok']
+        lineage_integrity_broken_count = li['total_broken']
 
     filter_dict = export_filter.to_dict() if export_filter else {}
 
@@ -352,6 +402,13 @@ def export_bundle(
         exported_at=exported_at,
         exported_by=exported_by,
         filters=filter_dict,
+        exported_db_schema_version=db_schema_version,
+        compression_derived_proposed_excluded=not include_compression_derived_proposed,
+        compression_derived_proposed_excluded_count=compression_excluded_count,
+        dangling_compression_source_count=dangling_compression_source_count,
+        lineage_integrity_checked=lineage_integrity_checked,
+        lineage_integrity_all_ok=lineage_integrity_all_ok,
+        lineage_integrity_broken_count=lineage_integrity_broken_count,
     )
 
     bundle_content['manifest'] = manifest
