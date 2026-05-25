@@ -33,12 +33,24 @@ from .models import (
     ConflictingPair,
     CONTEXT_ASSEMBLY_VERSION,
     ContextActivationPolicy,
+    ContinuityArtifactEntry,
     RuntimeSnapshot,
     SessionContext,
     SessionReconstruction,
     SessionTimelineDivergenceReport,
     VALID_TRANSITION_TYPES,
 )
+
+
+class ContinuityGovernanceError(ValueError):
+    """
+    Raised when a compression artifact referenced in ContextActivationPolicy
+    is not in 'active' status at assembly time.
+
+    Only active artifacts may be surfaced in continuity_context. Candidate,
+    superseded, and invalidated artifacts raise this error to prevent silent
+    use of unreviewed or stale reductions.
+    """
 
 
 def _now_utc() -> str:
@@ -269,6 +281,70 @@ def resolve_assembly_contradictions(
     ]
 
 
+def _load_continuity_artifacts(
+    db_path: str,
+    artifact_ids: List[int],
+    char_budget: int,
+) -> List[ContinuityArtifactEntry]:
+    """
+    Load operator-promoted compression artifacts for inclusion in continuity_context.
+
+    Governance invariants:
+    - Only artifacts with status='active' are permitted.
+    - Any artifact in candidate, superseded, or invalidated status raises
+      ContinuityGovernanceError — no silent fallback.
+    - Artifacts are loaded in declaration order; loading stops when char_budget
+      is exhausted (remaining artifacts are silently skipped to respect budget).
+
+    Read-only. Does not write to any table.
+    """
+    if not artifact_ids:
+        return []
+
+    conn = _mem_connect(db_path)
+    try:
+        entries: List[ContinuityArtifactEntry] = []
+        chars_used = 0
+        for artifact_id in artifact_ids:
+            row = conn.execute(
+                "SELECT id, status, source_assembly_id, source_assembly_hash, "
+                "compression_method, producer_version, promoted_by, promoted_at, "
+                "artifact_text, artifact_char_count "
+                "FROM compression_artifacts WHERE id = ?",
+                (artifact_id,),
+            ).fetchone()
+            if row is None:
+                raise ContinuityGovernanceError(
+                    f"compression artifact id={artifact_id} not found; "
+                    "only active artifacts may be referenced in compression_artifact_ids"
+                )
+            if row['status'] != 'active':
+                raise ContinuityGovernanceError(
+                    f"compression artifact id={artifact_id} has status={row['status']!r}; "
+                    "only 'active' artifacts may be surfaced in continuity_context"
+                )
+            text = row['artifact_text']
+            char_count = row['artifact_char_count']
+            if chars_used + char_count > char_budget:
+                # Budget exhausted — skip remaining artifacts rather than truncating text
+                continue
+            chars_used += char_count
+            entries.append(ContinuityArtifactEntry(
+                artifact_id=row['id'],
+                source_assembly_id=row['source_assembly_id'],
+                source_assembly_hash=row['source_assembly_hash'],
+                compression_method=row['compression_method'],
+                producer_version=row['producer_version'],
+                promoted_by=row['promoted_by'] or '',
+                promoted_at=row['promoted_at'] or '',
+                artifact_text=text,
+                artifact_char_count=char_count,
+            ))
+        return entries
+    finally:
+        conn.close()
+
+
 def reconstruct(
     memory_db_path: str,
     policy: Optional[ContextActivationPolicy] = None,
@@ -314,6 +390,15 @@ def reconstruct(
         runtime_snapshots = _load_runtime_snapshots(
             policy.runtime_db_path, policy.max_runtime_events
         )
+
+    # 3b. Load continuity artifacts (Phase 6B).
+    # Raises ContinuityGovernanceError if any listed artifact is not 'active'.
+    # Uses a separate char budget; does not consume from the main memory budget.
+    continuity_context = _load_continuity_artifacts(
+        memory_db_path,
+        policy.compression_artifact_ids,
+        policy.continuity_char_budget,
+    )
 
     # 4. Apply context window budget
     budgeted = apply_context_budget(
@@ -366,6 +451,7 @@ def reconstruct(
         truncated=budgeted.truncated,
         contradiction_pairs=contradiction_pairs,
         assembly_version=CONTEXT_ASSEMBLY_VERSION,
+        continuity_context=continuity_context,
     )
 
     return SessionReconstruction(context=context)
@@ -452,6 +538,11 @@ def reconstruct_from_dict(
             for p in context_dict.get('contradiction_pairs', [])
         ],
         assembly_version=context_dict.get('assembly_version', 'unknown'),
+        # continuity_context: default [] for backward compat with pre-v1.2.0 snapshots
+        continuity_context=[
+            ContinuityArtifactEntry.from_dict(e)
+            for e in context_dict.get('continuity_context', [])
+        ],
     )
 
 
@@ -586,12 +677,35 @@ def verify_assembly_against_current_db(
     if row is None:
         raise ValueError(f"Assembly {assembly_id} not found in context_assembly_log")
 
-    policy = ContextActivationPolicy.from_dict(_json.loads(row['policy_json']))
+    stored_snapshot = _json.loads(row['assembly_snapshot_json'])
+
+    # Detect continuity artifact drift: check which referenced artifact_ids are no
+    # longer 'active' in the current DB. Do this before reconstruct() so drift is
+    # reported even when reconstruct() would raise ContinuityGovernanceError.
+    stored_continuity = stored_snapshot.get('continuity_context', [])
+    stored_artifact_ids = [e['artifact_id'] for e in stored_continuity]
+    continuity_artifacts_changed: List[int] = []
+    if stored_artifact_ids:
+        conn2 = _mem_connect(db_path)
+        try:
+            for artifact_id in stored_artifact_ids:
+                art_row = conn2.execute(
+                    "SELECT status FROM compression_artifacts WHERE id = ?",
+                    (artifact_id,),
+                ).fetchone()
+                if art_row is None or art_row['status'] != 'active':
+                    continuity_artifacts_changed.append(artifact_id)
+        finally:
+            conn2.close()
+
+    # Re-run reconstruction with continuity artifacts stripped from the policy
+    # (so drift in artifact status doesn't prevent memory-event divergence checks).
+    policy_dict = _json.loads(row['policy_json'])
+    policy_dict['compression_artifact_ids'] = []
+    policy = ContextActivationPolicy.from_dict(policy_dict)
 
     current_recon = reconstruct(db_path, policy)
     current_ctx = current_recon.context
-
-    stored_snapshot = _json.loads(row['assembly_snapshot_json'])
 
     def _items_from_snapshot(d: dict) -> Dict[int, dict]:
         items: Dict[int, dict] = {}
@@ -636,7 +750,11 @@ def verify_assembly_against_current_db(
     contradictions_added = sorted(current_link_ids - stored_link_ids)
     contradictions_retracted = sorted(stored_link_ids - current_link_ids)
 
-    diverged = bool(added or removed or rescored or contradictions_added or contradictions_retracted)
+    diverged = bool(
+        added or removed or rescored
+        or contradictions_added or contradictions_retracted
+        or continuity_artifacts_changed
+    )
 
     return AssemblyDivergenceReport(
         assembly_id=assembly_id,
@@ -647,6 +765,7 @@ def verify_assembly_against_current_db(
         events_rescored_since_assembly=rescored,
         contradictions_added_since_assembly=contradictions_added,
         contradictions_retracted_since_assembly=contradictions_retracted,
+        continuity_artifacts_changed=continuity_artifacts_changed,
     )
 
 

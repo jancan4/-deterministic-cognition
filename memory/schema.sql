@@ -265,10 +265,15 @@ CREATE TABLE IF NOT EXISTS compression_artifacts (
     promoted_at                        TEXT,
     promotion_notes                    TEXT,
 
+    -- Supersession lineage (v12): points to the artifact that replaced this one.
+    -- NULL until superseded. Enables machine-queryable supersession chains.
+    superseded_by_artifact_id          INTEGER,
+
     -- Provenance metadata
     provenance_json                    TEXT    NOT NULL DEFAULT '{}',
 
-    FOREIGN KEY (source_assembly_id)   REFERENCES context_assembly_log(id),
-    FOREIGN KEY (cognition_session_id) REFERENCES cognition_session(id)
+    FOREIGN KEY (source_assembly_id)        REFERENCES context_assembly_log(id),
+    FOREIGN KEY (cognition_session_id)      REFERENCES cognition_session(id),
+    FOREIGN KEY (superseded_by_artifact_id) REFERENCES compression_artifacts(id)
 );
--- Indices for compression_artifacts are created by _migrate_to_v11() in service.py.
+-- Indices for compression_artifacts are created by _migrate_to_v11() and _migrate_to_v12() in service.py.

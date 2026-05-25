@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Tuple
 # Assembly constants
 # ---------------------------------------------------------------------------
 
-CONTEXT_ASSEMBLY_VERSION = '1.1.0'
+CONTEXT_ASSEMBLY_VERSION = '1.2.0'
 CHAR_BUDGET_DEFAULT = 12000
 ENTRY_BUDGET_DEFAULT = 60
 
@@ -30,6 +30,70 @@ VALID_TRANSITION_TYPES = frozenset({
 })
 
 VALID_SESSION_STATUSES = frozenset({'active', 'closed', 'abandoned'})
+
+
+# ---------------------------------------------------------------------------
+# Continuity artifact entry (Phase 6B)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ContinuityArtifactEntry:
+    """
+    An operator-promoted compression artifact surfaced in the session context.
+
+    This is a read-only continuity aid captured inline in the assembly snapshot.
+    It is NOT a memory event. It does NOT alter confidence or retrieval ranking.
+    It appears in the dedicated continuity_context section, which renders AFTER
+    governance_context to preserve governance cognition priority.
+
+    All fields are copied from compression_artifacts at assembly time so that
+    replay_assembly() never re-queries that table.
+    """
+    artifact_id: int
+    source_assembly_id: int
+    source_assembly_hash: str
+    compression_method: str
+    producer_version: str
+    promoted_by: str
+    promoted_at: str
+    artifact_text: str
+    artifact_char_count: int
+
+    def to_dict(self) -> dict:
+        return {
+            'artifact_id': self.artifact_id,
+            'source_assembly_id': self.source_assembly_id,
+            'source_assembly_hash': self.source_assembly_hash,
+            'compression_method': self.compression_method,
+            'producer_version': self.producer_version,
+            'promoted_by': self.promoted_by,
+            'promoted_at': self.promoted_at,
+            'artifact_text': self.artifact_text,
+            'artifact_char_count': self.artifact_char_count,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'ContinuityArtifactEntry':
+        return cls(
+            artifact_id=d['artifact_id'],
+            source_assembly_id=d['source_assembly_id'],
+            source_assembly_hash=d['source_assembly_hash'],
+            compression_method=d['compression_method'],
+            producer_version=d['producer_version'],
+            promoted_by=d['promoted_by'],
+            promoted_at=d['promoted_at'],
+            artifact_text=d['artifact_text'],
+            artifact_char_count=d['artifact_char_count'],
+        )
+
+    def render(self) -> str:
+        return (
+            f"[artifact:{self.artifact_id}] "
+            f"source_assembly={self.source_assembly_id} "
+            f"| method={self.compression_method} | v={self.producer_version}\n"
+            f"  Promoted by: {self.promoted_by} at {self.promoted_at}\n"
+            f"  {self.artifact_text}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +169,17 @@ class ContextActivationPolicy:
     # Compression mode — only 'none' is valid in Phase 3B; hook for future summarization
     compression_mode: str = 'none'
 
+    # Continuity context (Phase 6B): explicitly-named active compression artifact IDs to
+    # surface as a PRIOR SESSION REDUCTION section. Only 'active' artifacts are permitted;
+    # any other status raises ContinuityGovernanceError at assembly time.
+    # Default [] means no continuity section is included.
+    compression_artifact_ids: List[int] = field(default_factory=list)
+
+    # Separate char budget for the continuity_context section. Does NOT consume from
+    # the main memory event char budget (max_chars). Enforced per-artifact: artifacts
+    # are included in declaration order until this budget is exhausted.
+    continuity_char_budget: int = 2000
+
     # Workflow retrieval
     include_active_workflows: bool = True
     workflow_db_path: Optional[str] = None   # if None, workflow section is skipped
@@ -130,6 +205,8 @@ class ContextActivationPolicy:
             'include_adaptations': self.include_adaptations,
             'expand_related': self.expand_related,
             'compression_mode': self.compression_mode,
+            'compression_artifact_ids': list(self.compression_artifact_ids),
+            'continuity_char_budget': self.continuity_char_budget,
             'include_active_workflows': self.include_active_workflows,
             'workflow_db_path': self.workflow_db_path,
             'max_workflows': self.max_workflows,
@@ -349,6 +426,11 @@ class SessionContext:
     # Assembly provenance — default 'unknown' for backward compat with pre-v7 snapshots
     assembly_version: str = 'unknown'
 
+    # Continuity context (Phase 6B): operator-promoted compression artifacts surfaced as
+    # read-only continuity aids. Renders AFTER governance_context. Default [] for backward
+    # compat with pre-v1.2.0 snapshots.
+    continuity_context: List['ContinuityArtifactEntry'] = field(default_factory=list)
+
     def to_dict(self) -> dict:
         return {
             'session_id': self.session_id,
@@ -368,6 +450,7 @@ class SessionContext:
             'chars_used': self.chars_used,
             'truncated': self.truncated,
             'contradiction_pairs': [p.to_dict() for p in self.contradiction_pairs],
+            'continuity_context': [e.to_dict() for e in self.continuity_context],
         }
 
 
@@ -387,6 +470,7 @@ class AssemblyDivergenceReport:
     events_rescored_since_assembly: List[int]          # memory_ids in both but with changed confidence
     contradictions_added_since_assembly: List[int]     # link_ids of new active contradicts links between assembled events
     contradictions_retracted_since_assembly: List[int] # link_ids in stored snapshot no longer active
+    continuity_artifacts_changed: List[int] = field(default_factory=list)  # artifact_ids no longer active
 
 
 @dataclass
@@ -433,6 +517,15 @@ class SessionReconstruction:
             sections.append(_render_section(
                 'ACTIVE GOVERNANCE CONTEXT',
                 [m.render() for m in ctx.governance_context],
+            ))
+
+        # Continuity context renders AFTER governance_context.
+        # Governance cognition is the highest-priority control state and must
+        # never be demoted behind derived continuity artifacts.
+        if ctx.continuity_context:
+            sections.append(_render_section(
+                'PRIOR SESSION REDUCTION',
+                [e.render() for e in ctx.continuity_context],
             ))
 
         if ctx.active_workflows:

@@ -78,7 +78,7 @@ class TestSchemaV7Migration:
         conn = sqlite3.connect(db)
         version = conn.execute('SELECT version FROM memory_schema_version').fetchone()[0]
         conn.close()
-        assert version == 11
+        assert version == 12
 
     def test_fresh_db_context_assembly_log_exists(self, tmp_path):
         db = _mem_db(tmp_path)
@@ -162,7 +162,7 @@ class TestSchemaV7Migration:
         version = conn.execute('SELECT version FROM memory_schema_version').fetchone()[0]
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         conn.close()
-        assert version == 11
+        assert version == 12
         assert 'context_assembly_log' in tables
 
 
@@ -471,4 +471,4 @@ class TestBackwardCompat:
         assert not hasattr(policy, 'include_governance')
 
     def test_context_assembly_version_is_1_1_0(self):
-        assert CONTEXT_ASSEMBLY_VERSION == '1.1.0'
+        assert CONTEXT_ASSEMBLY_VERSION == '1.2.0'

@@ -12,7 +12,7 @@ from .models import (
 )
 
 _SCHEMA = Path(__file__).parent / 'schema.sql'
-_MEMORY_SCHEMA_VERSION = 11
+_MEMORY_SCHEMA_VERSION = 12
 
 
 class ValidationError(ValueError):
@@ -44,6 +44,21 @@ def _validate_confidence(confidence: int) -> None:
         raise ValidationError(
             f"confidence must be {CONFIDENCE_MIN}–{CONFIDENCE_MAX}, got {confidence}"
         )
+
+
+def _migrate_to_v12(conn: sqlite3.Connection) -> None:
+    # Add superseded_by_artifact_id to compression_artifacts (Phase 6B).
+    # The column is nullable; existing rows remain NULL until a supersession is recorded.
+    existing_cols = {row[1] for row in conn.execute('PRAGMA table_info(compression_artifacts)')}
+    if 'superseded_by_artifact_id' not in existing_cols:
+        conn.execute(
+            "ALTER TABLE compression_artifacts "
+            "ADD COLUMN superseded_by_artifact_id INTEGER"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_compression_superseded_by "
+        "ON compression_artifacts(superseded_by_artifact_id)"
+    )
 
 
 def _migrate_to_v11(conn: sqlite3.Connection) -> None:
@@ -259,6 +274,7 @@ def init_db(db_path: str) -> None:
             _migrate_to_v9(conn)
             _migrate_to_v10(conn)
             _migrate_to_v11(conn)
+            _migrate_to_v12(conn)
             conn.execute(
                 'INSERT INTO memory_schema_version (version) VALUES (?)',
                 (_MEMORY_SCHEMA_VERSION,)
@@ -282,6 +298,8 @@ def init_db(db_path: str) -> None:
                 _migrate_to_v10(conn)
             if row['version'] < 11:
                 _migrate_to_v11(conn)
+            if row['version'] < 12:
+                _migrate_to_v12(conn)
             conn.execute(
                 'UPDATE memory_schema_version SET version = ?',
                 (_MEMORY_SCHEMA_VERSION,)

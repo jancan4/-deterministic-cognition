@@ -89,7 +89,7 @@ def _all_raw_ids(db_path) -> list:
 
 class TestAssemblyVersion:
     def test_version_is_1_1_0(self):
-        assert CONTEXT_ASSEMBLY_VERSION == '1.1.0'
+        assert CONTEXT_ASSEMBLY_VERSION == '1.2.0'
 
 
 # ---------------------------------------------------------------------------

@@ -707,14 +707,14 @@ class TestGovernanceOnRetrieval:
 
 
 class TestMemorySchemaVersion:
-    def test_init_db_sets_schema_version_11(self, tmp_path):
+    def test_init_db_sets_schema_version_12(self, tmp_path):
         db = str(tmp_path / 'mem.db')
         service.init_db(db)
         import sqlite3
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 11
+        assert row[0] == 12
 
     def test_init_db_idempotent(self, tmp_path):
         db = str(tmp_path / 'mem.db')
@@ -724,7 +724,7 @@ class TestMemorySchemaVersion:
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 11
+        assert row[0] == 12
 
     def test_migrate_from_v2_adds_status_column(self, tmp_path):
         """Simulate a v2 DB without status column and verify migration adds it."""
@@ -776,7 +776,7 @@ class TestMemorySchemaVersion:
         version_row = conn2.execute('SELECT version FROM memory_schema_version').fetchone()
         conn2.close()
         assert 'status' in cols
-        assert version_row[0] == 11
+        assert version_row[0] == 12
 
     def test_migrate_from_v2_backfills_existing_rows(self, tmp_path):
         """Rows inserted before migration must have status='active' after migration."""
@@ -878,7 +878,7 @@ class TestMemorySchemaVersion:
         conn2 = sqlite3.connect(db)
         row = conn2.execute('SELECT version FROM memory_schema_version').fetchone()
         conn2.close()
-        assert row[0] == 11
+        assert row[0] == 12
 
 
 # ---------------------------------------------------------------------------
@@ -949,13 +949,13 @@ class TestSchemaV6Migration:
         conn.close()
         return db
 
-    def test_schema_version_is_11(self, tmp_path):
+    def test_schema_version_is_12(self, tmp_path):
         db = str(tmp_path / 'mem.db')
         service.init_db(db)
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 11
+        assert row[0] == 12
 
     def test_retrieval_log_has_semantic_mode(self, tmp_path):
         db = str(tmp_path / 'mem.db')
@@ -973,7 +973,7 @@ class TestSchemaV6Migration:
         conn.close()
         assert 'semantic_provenance_json' in cols
 
-    def test_v5_db_migrates_to_v11(self, tmp_path):
+    def test_v5_db_migrates_to_v12(self, tmp_path):
         db = self._v5_db(tmp_path)
         service.init_db(db)
         conn = sqlite3.connect(db)
@@ -981,7 +981,7 @@ class TestSchemaV6Migration:
         cols = {row[1] for row in conn.execute('PRAGMA table_info(retrieval_log)')}
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         conn.close()
-        assert version == 11
+        assert version == 12
         assert 'semantic_mode' in cols
         assert 'semantic_provenance_json' in cols
         assert 'context_assembly_log' in tables
@@ -993,7 +993,7 @@ class TestSchemaV6Migration:
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 11
+        assert row[0] == 12
 
     def test_v5_existing_rows_preserved_after_migration(self, tmp_path):
         db = self._v5_db(tmp_path)
