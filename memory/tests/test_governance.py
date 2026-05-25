@@ -10,6 +10,8 @@ Passing a negative threshold produces a future cutoff, making all current events
   warning_days=36500 → cutoff ~1926    →  no current events are stale
 """
 
+import sqlite3
+
 import pytest
 from memory import service
 from memory.governance import (
@@ -17,13 +19,16 @@ from memory.governance import (
     GovernanceReport,
     RetrievalFilter,
     build_governance_report,
+    check_lineage_integrity,
     detect_adaptation_lineage_gap,
     detect_conflicts,
     detect_deprecated_linked,
     detect_duplicate_title,
     detect_excessive_fanout,
+    detect_fired_decisions_without_assembly,
     detect_low_confidence_active,
     detect_missing_evidence,
+    detect_orphaned_transitions,
     detect_orphans,
     detect_stale_memory,
     detect_unresolved_aging,
@@ -879,3 +884,275 @@ class TestRetrievalFilter:
         r1 = filter_events(all_scored, f)
         r2 = filter_events(all_scored, f)
         assert [s.event.id for s in r1] == [s.event.id for s in r2]
+
+
+# ---------------------------------------------------------------------------
+# detect_fired_decisions_without_assembly (Phase 9A)
+# ---------------------------------------------------------------------------
+
+def _insert_activation_policy(conn):
+    """Insert a minimal activation_policies row and return its id."""
+    now = '2026-01-01T00:00:00Z'
+    conn.execute(
+        """INSERT INTO activation_policies
+           (name, status, trigger_class, trigger_conditions_json,
+            created_at, created_by, reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        ('test-policy', 'active', 'operator_request', '{}', now, 'tester', 'test'),
+    )
+    return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+
+
+def _insert_fired_decision(conn, policy_id, *, resulting_assembly_id=None):
+    """Insert a fired=1 activation_decision_log row."""
+    conn.execute(
+        """INSERT INTO activation_decision_log
+           (policy_id, policy_snapshot_json, trigger_class,
+            trigger_event_json, fired, detection_reason,
+            resulting_assembly_id, detected_at)
+           VALUES (?, ?, ?, ?, 1, ?, ?, ?)""",
+        (policy_id, '{}', 'operator_request', '{}',
+         'test fired', resulting_assembly_id, '2026-01-01T00:00:00Z'),
+    )
+    return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+
+
+def _insert_assembly(conn):
+    """Insert a minimal context_assembly_log row and return its id."""
+    import hashlib, json as _json, uuid
+    now = '2026-01-01T00:00:00Z'
+    snapshot = _json.dumps({'session_id': str(uuid.uuid4()), 'included_entries': 0,
+                            'chars_used': 0, 'char_budget': 4000})
+    h = hashlib.sha256(snapshot.encode()).hexdigest()
+    conn.execute(
+        """INSERT INTO context_assembly_log
+           (assembly_hash, session_id, assembly_version,
+            assembled_at, db_path, policy_json,
+            entries_accepted, entries_rejected_budget, entries_rejected_filter,
+            char_budget_used, char_budget_limit, assembly_snapshot_json)
+           VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 4000, ?)""",
+        (h, str(uuid.uuid4()), 'v1', now, ':memory:', '{}', snapshot),
+    )
+    return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+
+
+class TestDetectFiredDecisionsWithoutAssembly:
+    def _db(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        return db
+
+    def test_flags_fired_decision_with_null_assembly(self, tmp_path):
+        db = self._db(tmp_path)
+        conn = sqlite3.connect(db)
+        policy_id = _insert_activation_policy(conn)
+        decision_id = _insert_fired_decision(conn, policy_id, resulting_assembly_id=None)
+        conn.commit()
+        conn.close()
+
+        issues = detect_fired_decisions_without_assembly(db)
+        assert len(issues) == 1
+        issue = issues[0]
+        assert issue.issue_type == 'fired_decision_without_assembly'
+        assert issue.severity == 'warning'
+        assert issue.memory_id == decision_id
+        assert str(policy_id) in issue.rationale
+
+    def test_no_issue_when_assembly_present(self, tmp_path):
+        db = self._db(tmp_path)
+        conn = sqlite3.connect(db)
+        policy_id = _insert_activation_policy(conn)
+        assembly_id = _insert_assembly(conn)
+        _insert_fired_decision(conn, policy_id, resulting_assembly_id=assembly_id)
+        conn.commit()
+        conn.close()
+
+        issues = detect_fired_decisions_without_assembly(db)
+        assert issues == []
+
+    def test_non_firing_decision_not_flagged(self, tmp_path):
+        db = self._db(tmp_path)
+        conn = sqlite3.connect(db)
+        policy_id = _insert_activation_policy(conn)
+        conn.execute(
+            """INSERT INTO activation_decision_log
+               (policy_id, policy_snapshot_json, trigger_class,
+                trigger_event_json, fired, detection_reason, detected_at)
+               VALUES (?, ?, ?, ?, 0, ?, ?)""",
+            (policy_id, '{}', 'operator_request', '{}',
+             'did not fire', '2026-01-01T00:00:00Z'),
+        )
+        conn.commit()
+        conn.close()
+
+        issues = detect_fired_decisions_without_assembly(db)
+        assert issues == []
+
+    def test_wired_into_governance_report(self, tmp_path):
+        db = self._db(tmp_path)
+        conn = sqlite3.connect(db)
+        policy_id = _insert_activation_policy(conn)
+        _insert_fired_decision(conn, policy_id, resulting_assembly_id=None)
+        conn.commit()
+        conn.close()
+
+        report = build_governance_report(db, detect_execution_lineage_issues=True)
+        types = [i.issue_type for i in report.issues]
+        assert 'fired_decision_without_assembly' in types
+
+    def test_not_wired_when_flag_false(self, tmp_path):
+        db = self._db(tmp_path)
+        conn = sqlite3.connect(db)
+        policy_id = _insert_activation_policy(conn)
+        _insert_fired_decision(conn, policy_id, resulting_assembly_id=None)
+        conn.commit()
+        conn.close()
+
+        report = build_governance_report(db, detect_execution_lineage_issues=False)
+        types = [i.issue_type for i in report.issues]
+        assert 'fired_decision_without_assembly' not in types
+
+    def test_returns_empty_when_table_absent(self, tmp_path):
+        # Pre-schema DB with no activation_decision_log table
+        db = str(tmp_path / 'bare.db')
+        conn = sqlite3.connect(db)
+        conn.execute('CREATE TABLE memory_events (id INTEGER PRIMARY KEY)')
+        conn.commit()
+        conn.close()
+
+        issues = detect_fired_decisions_without_assembly(db)
+        assert issues == []
+
+
+# ---------------------------------------------------------------------------
+# detect_orphaned_transitions (Phase 9A)
+# ---------------------------------------------------------------------------
+
+def _insert_cognition_session(conn):
+    """Insert a minimal cognition_session row and return its id."""
+    import uuid
+    now = '2026-01-01T00:00:00Z'
+    conn.execute(
+        """INSERT INTO cognition_session
+           (session_key, status, started_at, assembly_count, db_path,
+            policy_fingerprint_json)
+           VALUES (?, 'active', ?, 0, ':memory:', '{}')""",
+        (str(uuid.uuid4()), now),
+    )
+    return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+
+
+def _insert_transition(conn, session_id, assembly_id, sequence_index=0):
+    """Insert a minimal assembly_transition_log row (FK enforcement bypassed)."""
+    now = '2026-01-01T00:00:00Z'
+    conn.execute(
+        """INSERT INTO assembly_transition_log
+           (cognition_session_id, sequence_index, to_assembly_id,
+            transition_type, transition_reason, triggered_by, transitioned_at)
+           VALUES (?, ?, ?, 'policy_update', 'test', 'tester', ?)""",
+        (session_id, sequence_index, assembly_id, now),
+    )
+    return conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+
+
+class TestDetectOrphanedTransitions:
+    def _db(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        return db
+
+    def test_flags_transition_with_missing_assembly(self, tmp_path):
+        db = self._db(tmp_path)
+        conn = sqlite3.connect(db)  # no FK enforcement — lets us insert orphan
+        session_id = _insert_cognition_session(conn)
+        nonexistent_assembly_id = 99999
+        transition_id = _insert_transition(conn, session_id, nonexistent_assembly_id)
+        conn.commit()
+        conn.close()
+
+        issues = detect_orphaned_transitions(db)
+        assert len(issues) == 1
+        issue = issues[0]
+        assert issue.issue_type == 'orphaned_assembly_transition'
+        assert issue.severity == 'warning'
+        assert issue.memory_id == transition_id
+        assert str(nonexistent_assembly_id) in issue.rationale
+
+    def test_no_issue_for_valid_transition(self, tmp_path):
+        db = self._db(tmp_path)
+        conn = sqlite3.connect(db)
+        session_id = _insert_cognition_session(conn)
+        assembly_id = _insert_assembly(conn)
+        _insert_transition(conn, session_id, assembly_id)
+        conn.commit()
+        conn.close()
+
+        issues = detect_orphaned_transitions(db)
+        assert issues == []
+
+    def test_returns_empty_when_table_absent(self, tmp_path):
+        db = str(tmp_path / 'bare.db')
+        conn = sqlite3.connect(db)
+        conn.execute('CREATE TABLE memory_events (id INTEGER PRIMARY KEY)')
+        conn.commit()
+        conn.close()
+
+        issues = detect_orphaned_transitions(db)
+        assert issues == []
+
+    def test_wired_into_governance_report(self, tmp_path):
+        db = self._db(tmp_path)
+        conn = sqlite3.connect(db)
+        session_id = _insert_cognition_session(conn)
+        _insert_transition(conn, session_id, 99999)
+        conn.commit()
+        conn.close()
+
+        report = build_governance_report(db, detect_execution_lineage_issues=True)
+        types = [i.issue_type for i in report.issues]
+        assert 'orphaned_assembly_transition' in types
+
+
+# ---------------------------------------------------------------------------
+# check_lineage_integrity (Phase 9A)
+# ---------------------------------------------------------------------------
+
+class TestCheckLineageIntegrity:
+    def _db(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        return db
+
+    def test_clean_db_is_all_ok(self, tmp_path):
+        db = self._db(tmp_path)
+        result = check_lineage_integrity(db)
+        assert result['all_ok'] is True
+        assert result['total_broken'] == 0
+        assert len(result['checks']) == 4
+
+    def test_broken_decision_assembly_ref(self, tmp_path):
+        db = self._db(tmp_path)
+        conn = sqlite3.connect(db)
+        policy_id = _insert_activation_policy(conn)
+        _insert_fired_decision(conn, policy_id, resulting_assembly_id=99999)
+        conn.commit()
+        conn.close()
+
+        result = check_lineage_integrity(db)
+        assert result['all_ok'] is False
+        assert result['total_broken'] >= 1
+        check = next(c for c in result['checks'] if c['name'] == 'decision_resulting_assembly_id')
+        assert check['broken_count'] == 1
+
+    def test_broken_transition_to_assembly_ref(self, tmp_path):
+        db = self._db(tmp_path)
+        conn = sqlite3.connect(db)
+        session_id = _insert_cognition_session(conn)
+        _insert_transition(conn, session_id, 99999)
+        conn.commit()
+        conn.close()
+
+        result = check_lineage_integrity(db)
+        assert result['all_ok'] is False
+        check = next(c for c in result['checks'] if c['name'] == 'transition_to_assembly_id')
+        assert check['broken_count'] == 1

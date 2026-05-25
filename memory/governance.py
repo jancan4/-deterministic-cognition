@@ -1377,6 +1377,280 @@ def detect_supersession_cycles(db_path: str) -> List[GovernanceIssue]:
 
 
 # ---------------------------------------------------------------------------
+# Execution lineage integrity (Phase 9A)
+# ---------------------------------------------------------------------------
+
+def _activation_decision_log_table_exists(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='activation_decision_log'"
+    ).fetchone() is not None
+
+
+def _assembly_transition_log_table_exists(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='assembly_transition_log'"
+    ).fetchone() is not None
+
+
+def _context_assembly_log_table_exists(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='context_assembly_log'"
+    ).fetchone() is not None
+
+
+def detect_fired_decisions_without_assembly(db_path: str) -> List[GovernanceIssue]:
+    """Fired activation decisions that have no resulting assembly.
+
+    A decision with fired=1 must always produce a context_assembly_log row.
+    A NULL resulting_assembly_id indicates the execution pipeline was interrupted
+    after firing but before assembly logging completed — a data integrity gap.
+
+    Returns [] when activation_decision_log does not exist (pre-v15 databases).
+    """
+    issues: List[GovernanceIssue] = []
+    conn = _connect(db_path)
+    try:
+        if not _activation_decision_log_table_exists(conn):
+            return issues
+        rows = conn.execute(
+            """
+            SELECT id, policy_id, detected_at
+            FROM activation_decision_log
+            WHERE fired = 1 AND resulting_assembly_id IS NULL
+            ORDER BY id ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        issues.append(GovernanceIssue(
+            issue_type='fired_decision_without_assembly',
+            severity='warning',
+            memory_id=row['id'],
+            title=f"Fired decision id={row['id']} has no resulting assembly",
+            rationale=(
+                f"Activation decision id={row['id']} (policy_id={row['policy_id']}, "
+                f"detected_at={row['detected_at']}) has fired=1 but resulting_assembly_id "
+                f"is NULL. The execution pipeline completed trigger evaluation but did not "
+                f"log a context assembly, leaving the decision without a lineage anchor."
+            ),
+            recommended_action=(
+                'Investigate whether the assembly was created but not linked, or whether '
+                'the execution was interrupted. If the assembly is missing, consider '
+                're-running the policy. If the decision is stale, archive it.'
+            ),
+            metadata={
+                'decision_id': row['id'],
+                'policy_id': row['policy_id'],
+                'detected_at': row['detected_at'],
+            },
+        ))
+    return issues
+
+
+def detect_orphaned_transitions(db_path: str) -> List[GovernanceIssue]:
+    """Assembly transitions whose target assembly does not exist.
+
+    Every assembly_transition_log row must reference a valid context_assembly_log id
+    via to_assembly_id. Orphaned transitions indicate a FK violation — possible when
+    the database was written without foreign key enforcement or when an assembly was
+    manually deleted.
+
+    Returns [] when either table does not exist.
+    """
+    issues: List[GovernanceIssue] = []
+    conn = _connect(db_path)
+    try:
+        if not _assembly_transition_log_table_exists(conn):
+            return issues
+        if not _context_assembly_log_table_exists(conn):
+            return issues
+        rows = conn.execute(
+            """
+            SELECT atl.id, atl.cognition_session_id, atl.to_assembly_id,
+                   atl.transition_type, atl.transitioned_at
+            FROM assembly_transition_log atl
+            WHERE NOT EXISTS (
+                SELECT 1 FROM context_assembly_log cal
+                WHERE cal.id = atl.to_assembly_id
+            )
+            ORDER BY atl.id ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        issues.append(GovernanceIssue(
+            issue_type='orphaned_assembly_transition',
+            severity='warning',
+            memory_id=row['id'],
+            title=f"Transition id={row['id']} references missing assembly id={row['to_assembly_id']}",
+            rationale=(
+                f"Assembly transition id={row['id']} (session={row['cognition_session_id']}, "
+                f"type={row['transition_type']!r}, at={row['transitioned_at']}) references "
+                f"to_assembly_id={row['to_assembly_id']} which does not exist in "
+                f"context_assembly_log. This is a foreign key violation."
+            ),
+            recommended_action=(
+                'Verify whether the assembly was deleted or never created. Repair the '
+                'transition row or restore the missing assembly from backup.'
+            ),
+            metadata={
+                'transition_id': row['id'],
+                'cognition_session_id': row['cognition_session_id'],
+                'to_assembly_id': row['to_assembly_id'],
+                'transition_type': row['transition_type'],
+            },
+        ))
+    return issues
+
+
+def check_lineage_integrity(db_path: str) -> dict:
+    """Run four foreign-key integrity checks across execution lineage tables.
+
+    Checks:
+      1. decision→assembly: activation_decision_log.resulting_assembly_id
+         must reference context_assembly_log.id (when NOT NULL).
+      2. transition.to→assembly: assembly_transition_log.to_assembly_id
+         must reference context_assembly_log.id.
+      3. transition.from→assembly: assembly_transition_log.from_assembly_id
+         must reference context_assembly_log.id (when NOT NULL).
+      4. transition.session→cognition_session:
+         assembly_transition_log.cognition_session_id must reference
+         cognition_session.id.
+
+    Returns a dict with keys:
+      all_ok (bool): True when total_broken == 0.
+      total_broken (int): sum of broken counts across all checks.
+      checks (list): one entry per check — name, broken_count, broken_ids.
+
+    Checks for absent tables return broken_count=0 with a note in the entry.
+    """
+    conn = _connect(db_path)
+    try:
+        has_decision = _activation_decision_log_table_exists(conn)
+        has_transition = _assembly_transition_log_table_exists(conn)
+        has_assembly = _context_assembly_log_table_exists(conn)
+        has_session = _cognition_session_table_exists(conn)
+
+        checks = []
+
+        # Check 1: fired decision → assembly
+        if has_decision and has_assembly:
+            rows = conn.execute(
+                """
+                SELECT id FROM activation_decision_log
+                WHERE resulting_assembly_id IS NOT NULL
+                  AND resulting_assembly_id NOT IN (SELECT id FROM context_assembly_log)
+                ORDER BY id ASC
+                """
+            ).fetchall()
+            broken_ids = [r['id'] for r in rows]
+            checks.append({
+                'name': 'decision_resulting_assembly_id',
+                'description': 'activation_decision_log.resulting_assembly_id → context_assembly_log.id',
+                'broken_count': len(broken_ids),
+                'broken_ids': broken_ids,
+            })
+        else:
+            checks.append({
+                'name': 'decision_resulting_assembly_id',
+                'description': 'activation_decision_log.resulting_assembly_id → context_assembly_log.id',
+                'broken_count': 0,
+                'broken_ids': [],
+                'note': 'table absent — skipped',
+            })
+
+        # Check 2: transition.to → assembly
+        if has_transition and has_assembly:
+            rows = conn.execute(
+                """
+                SELECT id FROM assembly_transition_log
+                WHERE to_assembly_id NOT IN (SELECT id FROM context_assembly_log)
+                ORDER BY id ASC
+                """
+            ).fetchall()
+            broken_ids = [r['id'] for r in rows]
+            checks.append({
+                'name': 'transition_to_assembly_id',
+                'description': 'assembly_transition_log.to_assembly_id → context_assembly_log.id',
+                'broken_count': len(broken_ids),
+                'broken_ids': broken_ids,
+            })
+        else:
+            checks.append({
+                'name': 'transition_to_assembly_id',
+                'description': 'assembly_transition_log.to_assembly_id → context_assembly_log.id',
+                'broken_count': 0,
+                'broken_ids': [],
+                'note': 'table absent — skipped',
+            })
+
+        # Check 3: transition.from → assembly (when NOT NULL)
+        if has_transition and has_assembly:
+            rows = conn.execute(
+                """
+                SELECT id FROM assembly_transition_log
+                WHERE from_assembly_id IS NOT NULL
+                  AND from_assembly_id NOT IN (SELECT id FROM context_assembly_log)
+                ORDER BY id ASC
+                """
+            ).fetchall()
+            broken_ids = [r['id'] for r in rows]
+            checks.append({
+                'name': 'transition_from_assembly_id',
+                'description': 'assembly_transition_log.from_assembly_id → context_assembly_log.id (when NOT NULL)',
+                'broken_count': len(broken_ids),
+                'broken_ids': broken_ids,
+            })
+        else:
+            checks.append({
+                'name': 'transition_from_assembly_id',
+                'description': 'assembly_transition_log.from_assembly_id → context_assembly_log.id (when NOT NULL)',
+                'broken_count': 0,
+                'broken_ids': [],
+                'note': 'table absent — skipped',
+            })
+
+        # Check 4: transition.session → cognition_session
+        if has_transition and has_session:
+            rows = conn.execute(
+                """
+                SELECT id FROM assembly_transition_log
+                WHERE cognition_session_id NOT IN (SELECT id FROM cognition_session)
+                ORDER BY id ASC
+                """
+            ).fetchall()
+            broken_ids = [r['id'] for r in rows]
+            checks.append({
+                'name': 'transition_cognition_session_id',
+                'description': 'assembly_transition_log.cognition_session_id → cognition_session.id',
+                'broken_count': len(broken_ids),
+                'broken_ids': broken_ids,
+            })
+        else:
+            checks.append({
+                'name': 'transition_cognition_session_id',
+                'description': 'assembly_transition_log.cognition_session_id → cognition_session.id',
+                'broken_count': 0,
+                'broken_ids': [],
+                'note': 'table absent — skipped',
+            })
+
+    finally:
+        conn.close()
+
+    total_broken = sum(c['broken_count'] for c in checks)
+    return {
+        'all_ok': total_broken == 0,
+        'total_broken': total_broken,
+        'checks': checks,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Governance report
 # ---------------------------------------------------------------------------
 
@@ -1406,6 +1680,7 @@ def build_governance_report(
     compression_memory_warning_days: int = COMPRESSION_MEMORY_CANDIDATE_WARNING_DAYS,
     detect_compression_memory_issues: bool = True,
     detect_ontology_issues: bool = True,
+    detect_execution_lineage_issues: bool = True,
 ) -> GovernanceReport:
     """Run all governance checks and return a deterministically sorted report.
 
@@ -1463,6 +1738,9 @@ def build_governance_report(
         issues.extend(detect_deprecated_relationship_usage(db_path))
         issues.extend(detect_deprecated_trigger_class_usage(db_path))
         issues.extend(detect_alias_conflicts(db_path))
+    if detect_execution_lineage_issues:
+        issues.extend(detect_fired_decisions_without_assembly(db_path))
+        issues.extend(detect_orphaned_transitions(db_path))
 
     issues.sort(key=lambda i: (_SEVERITY_ORDER[i.severity], i.issue_type, i.memory_id))
 

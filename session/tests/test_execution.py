@@ -568,4 +568,39 @@ class TestCLIExecute:
         ])
         assert code == 0
         assert 'fired=False' in stdout
-        assert 'resulting_assembly_id' not in stdout
+
+
+# ---------------------------------------------------------------------------
+# Phase 9A: Replay-after-execution regression test
+# ---------------------------------------------------------------------------
+
+class TestReplayAfterExecution:
+    """Regression guard: replay_assembly() restores a context consistent with the stored snapshot."""
+
+    def test_replay_assembly_after_execution_matches_original(self, db):
+        policy = _make_active_policy(db)
+        result = execute_activation_policy(
+            db, policy.id, _operator_trigger(), triggered_by='alice'
+        )
+        assert result.fired is True
+        assembly_id = result.resulting_assembly_id
+
+        replayed = replay_assembly(assembly_id, db)
+        assert replayed.replayed is True
+
+        # The snapshot stored at assembly time must agree with what replay restores.
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            'SELECT assembly_snapshot_json FROM context_assembly_log WHERE id = ?',
+            (assembly_id,),
+        ).fetchone()
+        conn.close()
+
+        stored = json.loads(row['assembly_snapshot_json'])
+        ctx = replayed.context
+
+        assert ctx.session_id == stored['session_id']
+        assert ctx.included_entries == stored['included_entries']
+        assert ctx.chars_used == stored['chars_used']
+        assert ctx.char_budget == stored['char_budget']

@@ -1084,6 +1084,107 @@ def cmd_activation_policy_evaluate(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Operational exposure commands (Phase 9A)
+# ---------------------------------------------------------------------------
+
+def cmd_governance_report(args: argparse.Namespace) -> None:
+    """Run all governance checks and print a report."""
+    from .governance import build_governance_report
+    report = build_governance_report(args.db)
+    if args.format == 'json':
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    else:
+        print(f"Generated:  {report.generated_at}")
+        print(f"Events:     {report.total_events}")
+        print(f"Critical:   {report.critical_count}")
+        print(f"Warning:    {report.warning_count}")
+        print(f"Info:       {report.info_count}")
+        if not report.issues:
+            print("No governance issues found.")
+        else:
+            print()
+            for issue in report.issues:
+                print(f"[{issue.severity.upper()}] {issue.issue_type}  memory_id={issue.memory_id}")
+                print(f"  {issue.title}")
+                print(f"  Rationale: {issue.rationale}")
+                print(f"  Action:    {issue.recommended_action}")
+                print()
+
+
+def cmd_verify_assembly(args: argparse.Namespace) -> None:
+    """Verify a stored context assembly against the current DB (read-only)."""
+    from session.reconstruction import verify_assembly_against_current_db
+    try:
+        report = verify_assembly_against_current_db(args.id, args.db)
+    except ValueError as exc:
+        _die(str(exc))
+    if args.format == 'json':
+        d = {
+            'assembly_id': report.assembly_id,
+            'assembly_hash': report.assembly_hash,
+            'diverged': report.diverged,
+            'events_added_since_assembly': report.events_added_since_assembly,
+            'events_removed_since_assembly': report.events_removed_since_assembly,
+            'events_rescored_since_assembly': report.events_rescored_since_assembly,
+            'contradictions_added_since_assembly': report.contradictions_added_since_assembly,
+            'contradictions_retracted_since_assembly': report.contradictions_retracted_since_assembly,
+            'continuity_artifacts_changed': report.continuity_artifacts_changed,
+        }
+        print(json.dumps(d, indent=2, sort_keys=True))
+    else:
+        status = 'DIVERGED' if report.diverged else 'OK'
+        print(f"assembly_id={args.id}  status={status}")
+        if report.events_added_since_assembly:
+            print(f"  added (now in DB, not in snapshot):   {report.events_added_since_assembly}")
+        if report.events_removed_since_assembly:
+            print(f"  removed (in snapshot, not in DB):     {report.events_removed_since_assembly}")
+        if report.continuity_artifacts_changed:
+            print(f"  continuity artifact drift:            {report.continuity_artifacts_changed}")
+        if not report.diverged:
+            print("  Assembly matches current DB state.")
+
+
+def cmd_verify_session(args: argparse.Namespace) -> None:
+    """Verify all assemblies in a cognition session (read-only)."""
+    from session.reconstruction import verify_session_timeline
+    try:
+        report = verify_session_timeline(args.id, args.db)
+    except ValueError as exc:
+        _die(str(exc))
+    if args.format == 'json':
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    else:
+        status = 'DIVERGED' if report.diverged else 'OK'
+        print(f"session_id={args.id}  status={status}  "
+              f"assemblies={len(report.assembly_reports)}")
+        for ar in report.assembly_reports:
+            ar_status = 'DIVERGED' if ar.diverged else 'OK'
+            print(f"  assembly_id={ar.assembly_id}  {ar_status}")
+            if ar.events_added_since_assembly:
+                print(f"    added:   {ar.events_added_since_assembly}")
+            if ar.events_removed_since_assembly:
+                print(f"    removed: {ar.events_removed_since_assembly}")
+
+
+def cmd_lineage_integrity(args: argparse.Namespace) -> None:
+    """Run foreign-key integrity checks across execution lineage tables (read-only)."""
+    from .governance import check_lineage_integrity
+    result = check_lineage_integrity(args.db)
+    if args.format == 'json':
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        status = 'OK' if result['all_ok'] else 'BROKEN'
+        print(f"lineage_integrity={status}  total_broken={result['total_broken']}")
+        for check in result['checks']:
+            check_status = 'OK' if check['broken_count'] == 0 else 'BROKEN'
+            note = f"  [{check.get('note', '')}]" if 'note' in check else ''
+            print(f"  {check['name']}: {check_status}"
+                  f"  broken={check['broken_count']}{note}")
+            if check['broken_ids']:
+                print(f"    broken_ids: {check['broken_ids']}")
+
+
+# ---------------------------------------------------------------------------
 # parser
 # ---------------------------------------------------------------------------
 
@@ -1139,6 +1240,10 @@ _COMMANDS = {
     'activation-policy-replay': cmd_activation_policy_replay,
     'activation-policy-execute': cmd_activation_policy_execute,
     'activation-policy-evaluate': cmd_activation_policy_evaluate,
+    'governance-report': cmd_governance_report,
+    'verify-assembly': cmd_verify_assembly,
+    'verify-session': cmd_verify_session,
+    'lineage-integrity': cmd_lineage_integrity,
 }
 
 
@@ -1645,6 +1750,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_apev.add_argument('--id', required=True, type=int, help='Activation policy id')
     p_apev.add_argument('--trigger-event', required=True, dest='trigger_event',
                         metavar='JSON', help='Trigger context as a JSON object')
+
+    # governance-report
+    p_gr = sub.add_parser('governance-report', parents=[_db],
+                          help='Run all governance checks and print a report')
+    p_gr.add_argument('--format', choices=['text', 'json'], default='text',
+                      help='Output format (default: text)')
+
+    # verify-assembly
+    p_va = sub.add_parser('verify-assembly', parents=[_db],
+                          help='Verify a stored assembly against current DB (read-only)')
+    p_va.add_argument('--id', required=True, type=int, help='context_assembly_log id')
+    p_va.add_argument('--format', choices=['text', 'json'], default='text',
+                      help='Output format (default: text)')
+
+    # verify-session
+    p_vs = sub.add_parser('verify-session', parents=[_db],
+                          help='Verify all assemblies in a cognition session (read-only)')
+    p_vs.add_argument('--id', required=True, type=int, help='cognition_session id')
+    p_vs.add_argument('--format', choices=['text', 'json'], default='text',
+                      help='Output format (default: text)')
+
+    # lineage-integrity
+    p_li = sub.add_parser('lineage-integrity', parents=[_db],
+                          help='Check FK integrity across execution lineage tables (read-only)')
+    p_li.add_argument('--format', choices=['text', 'json'], default='text',
+                      help='Output format (default: text)')
 
     return parser
 
