@@ -106,8 +106,14 @@ CREATE TABLE IF NOT EXISTS event_embeddings (
     producer_version    TEXT    NOT NULL,
     status              TEXT    NOT NULL DEFAULT 'candidate',
     generated_at        TEXT    NOT NULL,
+    -- Invalidation columns: written ONLY by mark_invalidated(). NULL unless invalidated.
     invalidated_at      TEXT,
     invalidated_reason  TEXT,
+    -- Supersession columns (v14): written ONLY by mark_superseded(). NULL unless superseded.
+    -- Pre-v14 superseded rows have superseded_at IS NULL (historical cohort).
+    -- Status is authoritative; timestamps are informational lineage metadata only.
+    superseded_at       TEXT,
+    superseded_reason   TEXT,
     provenance_json     TEXT    NOT NULL,
     FOREIGN KEY (memory_event_id) REFERENCES memory_events(id),
     UNIQUE (memory_event_id, content_hash, producer_version)

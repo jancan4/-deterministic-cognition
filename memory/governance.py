@@ -888,6 +888,78 @@ def detect_unreviewed_compression_candidates(
     return issues
 
 
+def _event_embeddings_table_exists(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='event_embeddings'"
+    ).fetchone() is not None
+
+
+def detect_superseded_embeddings_without_active_replacement(
+    db_path: str,
+) -> List[GovernanceIssue]:
+    """Superseded embeddings where no active embedding exists for the same (memory_event_id, content_hash).
+
+    An embedding is superseded when a newer computation for the same anchor replaces it.
+    If the replacement was never promoted to 'active', the memory event has no usable
+    embedding — the supersession decommissioned the old one without a live replacement.
+
+    NOTE: Queries use status as the authoritative lifecycle predicate (per governance contract).
+    Both pre-v14 superseded rows (superseded_at IS NULL) and post-v14 rows
+    (superseded_at IS NOT NULL) are detected equally, because the query uses status,
+    not timestamp presence.
+    """
+    issues: List[GovernanceIssue] = []
+
+    conn = _connect(db_path)
+    try:
+        if not _event_embeddings_table_exists(conn):
+            return issues
+        rows = conn.execute(
+            """
+            SELECT ee.id, ee.memory_event_id, ee.content_hash,
+                   ee.adapter_name, ee.model_name, ee.generated_at
+            FROM event_embeddings ee
+            WHERE ee.status = 'superseded'
+              AND NOT EXISTS (
+                  SELECT 1 FROM event_embeddings active_ee
+                  WHERE active_ee.memory_event_id = ee.memory_event_id
+                    AND active_ee.content_hash = ee.content_hash
+                    AND active_ee.status = 'active'
+              )
+            ORDER BY ee.memory_event_id ASC, ee.id ASC
+            """,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        issues.append(GovernanceIssue(
+            issue_type='superseded_embedding_without_active_replacement',
+            severity='warning',
+            memory_id=row['memory_event_id'],
+            title=f"No active replacement: embedding id={row['id']} (event {row['memory_event_id']})",
+            rationale=(
+                f"Embedding id={row['id']} for memory event [{row['memory_event_id']}] "
+                f"(content_hash={row['content_hash']}, model={row['model_name']!r}) "
+                f"has status='superseded' but no active embedding exists for the same anchor. "
+                f"The memory event has no usable embedding."
+            ),
+            recommended_action=(
+                'Generate and promote a new embedding for this memory event, '
+                'or review whether the supersession was applied correctly.'
+            ),
+            metadata={
+                'embedding_id': row['id'],
+                'memory_event_id': row['memory_event_id'],
+                'content_hash': row['content_hash'],
+                'adapter_name': row['adapter_name'],
+                'model_name': row['model_name'],
+                'generated_at': row['generated_at'],
+            },
+        ))
+    return issues
+
+
 def detect_orphan_supersessions(db_path: str) -> List[GovernanceIssue]:
     """Superseded compression artifacts with no superseded_by_artifact_id recorded.
 
@@ -1122,6 +1194,7 @@ def build_governance_report(
     issues.extend(detect_abandoned_sessions(db_path, session_abandoned_threshold_days))
     issues.extend(detect_duplicate_active_sessions(db_path))
     issues.extend(detect_unreviewed_compression_candidates(db_path, compression_warning_days, compression_critical_days))
+    issues.extend(detect_superseded_embeddings_without_active_replacement(db_path))
     if detect_compression_supersession_issues:
         issues.extend(detect_orphan_supersessions(db_path))
         issues.extend(detect_pending_replacement_supersessions(db_path))

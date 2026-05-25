@@ -63,11 +63,11 @@ def _ollama_pin_kwargs(**overrides) -> dict:
 # ---------------------------------------------------------------------------
 
 class TestSchemaV5Migration:
-    def test_schema_version_is_13(self, db):
+    def test_schema_version_is_14(self, db):
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 13
+        assert row[0] == 14
 
     def test_embedding_model_pins_table_exists(self, db):
         conn = sqlite3.connect(db)
@@ -145,7 +145,7 @@ class TestSchemaV5Migration:
         version = conn.execute('SELECT version FROM memory_schema_version').fetchone()[0]
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         conn.close()
-        assert version == 13
+        assert version == 14
         assert 'embedding_model_pins' in tables
 
 

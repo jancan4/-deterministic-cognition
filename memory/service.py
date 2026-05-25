@@ -12,7 +12,7 @@ from .models import (
 )
 
 _SCHEMA = Path(__file__).parent / 'schema.sql'
-_MEMORY_SCHEMA_VERSION = 13
+_MEMORY_SCHEMA_VERSION = 14
 
 
 class ValidationError(ValueError):
@@ -44,6 +44,28 @@ def _validate_confidence(confidence: int) -> None:
         raise ValidationError(
             f"confidence must be {CONFIDENCE_MIN}–{CONFIDENCE_MAX}, got {confidence}"
         )
+
+
+def _migrate_to_v14(conn: sqlite3.Connection) -> None:
+    # Add dedicated supersession columns to event_embeddings (Phase 6C normalization).
+    # These columns are written ONLY by mark_superseded() and remain NULL for all
+    # non-superseded artifacts.
+    #
+    # Historical cohort: pre-v14 superseded rows have superseded_at IS NULL and
+    # invalidated_at IS NOT NULL (old mark_superseded() wrote to invalidated_at).
+    # Status is authoritative for both cohorts; timestamps are lineage metadata only.
+    existing_cols = {row[1] for row in conn.execute('PRAGMA table_info(event_embeddings)')}
+    for col_sql in (
+        "ALTER TABLE event_embeddings ADD COLUMN superseded_at TEXT",
+        "ALTER TABLE event_embeddings ADD COLUMN superseded_reason TEXT",
+    ):
+        col_name = col_sql.split()[-2]
+        if col_name not in existing_cols:
+            conn.execute(col_sql)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_embeddings_superseded_at "
+        "ON event_embeddings(superseded_at)"
+    )
 
 
 def _migrate_to_v13(conn: sqlite3.Connection) -> None:
@@ -295,6 +317,7 @@ def init_db(db_path: str) -> None:
             _migrate_to_v11(conn)
             _migrate_to_v12(conn)
             _migrate_to_v13(conn)
+            _migrate_to_v14(conn)
             conn.execute(
                 'INSERT INTO memory_schema_version (version) VALUES (?)',
                 (_MEMORY_SCHEMA_VERSION,)
@@ -322,6 +345,8 @@ def init_db(db_path: str) -> None:
                 _migrate_to_v12(conn)
             if row['version'] < 13:
                 _migrate_to_v13(conn)
+            if row['version'] < 14:
+                _migrate_to_v14(conn)
             conn.execute(
                 'UPDATE memory_schema_version SET version = ?',
                 (_MEMORY_SCHEMA_VERSION,)

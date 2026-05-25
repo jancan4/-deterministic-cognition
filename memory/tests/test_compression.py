@@ -130,12 +130,12 @@ def _past_utc(days: int) -> str:
 # ---------------------------------------------------------------------------
 
 class TestSchemaV11:
-    def test_schema_version_is_13(self, tmp_path):
+    def test_schema_version_is_14(self, tmp_path):
         db = _db(tmp_path)
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 13
+        assert row[0] == 14
 
     def test_compression_artifacts_table_exists(self, tmp_path):
         db = _db(tmp_path)
@@ -190,7 +190,7 @@ class TestSchemaV11:
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 13
+        assert row[0] == 14
 
 
 # ---------------------------------------------------------------------------

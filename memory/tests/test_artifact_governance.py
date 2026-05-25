@@ -192,7 +192,9 @@ _SYNTHETIC_DDL = """
         id               INTEGER PRIMARY KEY AUTOINCREMENT,
         status           TEXT    NOT NULL DEFAULT 'active',
         invalidated_at   TEXT,
-        invalidated_reason TEXT
+        invalidated_reason TEXT,
+        superseded_at    TEXT,
+        superseded_reason TEXT
     );
 """
 
@@ -290,12 +292,13 @@ class TestMarkSuperseded:
         row_id = _insert_row(conn, 'active')
         mark_superseded(conn, 'test_governed', row_id, 'model upgraded', '2026-06-01T00:00:00Z')
         row = conn.execute(
-            "SELECT status, invalidated_at, invalidated_reason FROM test_governed WHERE id=?",
+            "SELECT status, superseded_at, superseded_reason, invalidated_at FROM test_governed WHERE id=?",
             (row_id,)
         ).fetchone()
         assert row[0] == 'superseded'
-        assert row[1] == '2026-06-01T00:00:00Z'
-        assert row[2] == 'model upgraded'
+        assert row[1] == '2026-06-01T00:00:00Z'   # superseded_at written
+        assert row[2] == 'model upgraded'           # superseded_reason written
+        assert row[3] is None                       # invalidated_at stays NULL
         conn.close()
 
     def test_invalid_from_candidate(self, tmp_path, monkeypatch):

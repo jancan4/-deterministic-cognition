@@ -140,11 +140,11 @@ def _make_candidate_artifact(db_path: str) -> CompressionArtifact:
 # ---------------------------------------------------------------------------
 
 class TestSchemaV13:
-    def test_schema_version_is_13(self, db):
+    def test_schema_version_is_14(self, db):
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 13
+        assert row[0] == 14
 
     def test_v13_columns_exist(self, db):
         conn = sqlite3.connect(db)
@@ -160,7 +160,7 @@ class TestSchemaV13:
         conn.close()
         assert 'idx_compression_superseded_at' in indices
 
-    def test_v12_db_migrates_to_v13(self, tmp_path):
+    def test_v12_db_migrates_to_v14(self, tmp_path):
         """A DB at version 12 gains v13 columns when init_db() is called."""
         from memory.service import _connect
         db_path = str(tmp_path / 'v12.db')
@@ -247,7 +247,7 @@ class TestSchemaV13:
         cols = {r[1] for r in conn.execute('PRAGMA table_info(compression_artifacts)')}
         indices = {r[1] for r in conn.execute('PRAGMA index_list(compression_artifacts)')}
         conn.close()
-        assert version == 13
+        assert version == 14
         assert 'superseded_at' in cols
         assert 'superseded_reason' in cols
         assert 'superseded_by_operator' in cols
@@ -375,13 +375,12 @@ class TestHardColumnInvariants:
         assert row[0] is None
         assert row[1] is None
 
-    def test_mark_superseded_writes_invalidated_at_not_superseded_at(self, db):
-        """mark_superseded() (the shared governance helper for event_embeddings) writes
-        invalidated_at — it must NOT be used for compression artifact supersession.
-        This test confirms the two code paths are physically distinct.
+    def test_mark_superseded_writes_superseded_at_not_invalidated_at(self, db):
+        """Phase 6C: mark_superseded() writes superseded_at — invalidated_at remains NULL.
+
+        This is the normalized behavior after Phase 6C. Status is authoritative;
+        timestamps are informational lineage metadata only.
         """
-        # mark_superseded() is used only for event_embeddings.
-        # Simulate directly on compression_artifacts to confirm it writes invalidated_at.
         old = _make_active_artifact(db)
         conn = sqlite3.connect(db)
         conn.row_factory = sqlite3.Row
@@ -394,10 +393,10 @@ class TestHardColumnInvariants:
             (old.id,),
         ).fetchone()
         conn.close()
-        # Confirm mark_superseded writes invalidated_at (not superseded_at).
+        # Normalized behavior: mark_superseded() writes superseded_at, not invalidated_at.
         assert row['status'] == 'superseded'
-        assert row['invalidated_at'] is not None   # shared helper writes this
-        assert row['superseded_at'] is None         # dedicated column stays NULL
+        assert row['superseded_at'] is not None   # Phase 6C: dedicated column written
+        assert row['invalidated_at'] is None       # invalidation column stays NULL
 
     def test_mark_invalidated_writes_invalidated_at_not_superseded_at(self, db):
         """mark_invalidated() writes invalidated_at — superseded_at stays NULL."""

@@ -6,18 +6,47 @@ tables. Derived artifacts are computed from canonical memory or source data;
 they are never canonical themselves and never enter continuity bundles without
 operator promotion through the governed pipeline.
 
-Governance contract
--------------------
+Governance contract (Phase 6C normalized)
+------------------------------------------
 Every derived artifact table MUST provide the semantic equivalents of:
   - producer_version  TEXT NOT NULL  — algorithm/model version that produced this
   - source_hash       TEXT NOT NULL  — fingerprint of the input (sha256[:16])
   - status            TEXT NOT NULL  — one of VALID_ARTIFACT_STATUSES
   - generated_at      TEXT NOT NULL  — ISO-8601 UTC wall-clock time
 
-Invalidatable artifact tables (those that can be superseded or invalidated)
-additionally require:
-  - invalidated_at     TEXT          — NULL until superseded/invalidated
-  - invalidated_reason TEXT          — NULL until superseded/invalidated
+Tables in _GOVERNED_ARTIFACT_TABLES additionally require:
+  - invalidated_at     TEXT  — NULL unless invalidated; written ONLY by mark_invalidated()
+  - invalidated_reason TEXT  — NULL unless invalidated; written ONLY by mark_invalidated()
+  - superseded_at      TEXT  — NULL unless superseded; written ONLY by mark_superseded()
+  - superseded_reason  TEXT  — NULL unless superseded; written ONLY by mark_superseded()
+
+The two column pairs are mutually exclusive at the row level:
+  status='superseded': superseded_at IS NOT NULL,  invalidated_at IS NULL
+  status='invalidated': invalidated_at IS NOT NULL, superseded_at IS NULL
+
+AUTHORITATIVE LIFECYCLE INVARIANT
+-----------------------------------
+Status is authoritative. Timestamps are informational lineage metadata only.
+
+  - Operational eligibility decisions MUST use status.
+  - Replay semantics MUST use status.
+  - Governance detectors MUST use status as the primary predicate.
+  - Timestamps (invalidated_at, superseded_at) MUST NOT be treated as
+    authoritative lifecycle state.
+
+FORBIDDEN logic:
+  invalidated_at IS NULL  → meaning active or non-invalidated
+  superseded_at IS NULL   → meaning non-superseded
+  timestamp presence      → driving replay eligibility or operational routing
+
+This invariant is critical for two-cohort compatibility (Phase 6C):
+  Pre-v14 superseded rows: superseded_at IS NULL, invalidated_at IS NOT NULL
+                           (old mark_superseded() wrote to invalidated_at)
+  Post-v14 superseded rows: superseded_at IS NOT NULL, invalidated_at IS NULL
+                            (normalized mark_superseded() writes to superseded_at)
+
+Both cohorts have status='superseded' and are semantically equivalent.
+Code MUST query status, not timestamps, to determine lifecycle state.
 
 Embedding materialization invariant
 -------------------------------------
@@ -44,6 +73,8 @@ Governed artifact table allowlist
 -----------------------------------
 _GOVERNED_ARTIFACT_TABLES is the allowlist for mark_invalidated() and
 mark_superseded(). Only tables in this set may be mutated by those helpers.
+All tables in this set MUST provide the full normalized lifecycle column set
+(both invalidation and supersession column pairs) as specified above.
 Phase 2B registered 'event_embeddings' in this set.
 """
 import hashlib
@@ -290,9 +321,20 @@ def mark_superseded(
     """
     Append-only transition: set status='superseded', record when and why.
 
-    Sets invalidated_at=now, invalidated_reason=reason on the artifact row.
+    Sets superseded_at=now, superseded_reason=reason on the artifact row.
     Supersession represents replacement by a newer computation for the same anchor
     (e.g. embedding model upgrade). It does not imply the anchor changed.
+
+    Column invariant (Phase 6C normalized):
+      superseded_at IS NOT NULL — written here
+      invalidated_at IS NULL    — NEVER written by this function
+    Both column pairs are mutually exclusive per row.
+
+    NOTE on historical cohort compatibility:
+      Pre-v14 rows (superseded before this normalization) have superseded_at IS NULL
+      and invalidated_at IS NOT NULL. Post-v14 rows have the inverse.
+      Status is the authoritative lifecycle state for both cohorts.
+      Code MUST NOT use timestamp presence to determine supersession state.
 
     Valid from: status='active' only.
     Invalid from: status='candidate', 'superseded', or 'invalidated'.
@@ -315,7 +357,7 @@ def mark_superseded(
         )
     conn.execute(
         f"UPDATE {table_name} "
-        f"SET status = ?, invalidated_at = ?, invalidated_reason = ? "
+        f"SET status = ?, superseded_at = ?, superseded_reason = ? "
         f"WHERE id = ?",
         (ArtifactStatus.SUPERSEDED, now, reason, artifact_id),
     )
