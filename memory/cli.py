@@ -630,6 +630,58 @@ def cmd_list_supersession_chain(args: argparse.Namespace) -> None:
 # Activation policy commands
 # ---------------------------------------------------------------------------
 
+def cmd_seed_memory_from_compression(args: argparse.Namespace) -> None:
+    from .compression import MemorySeedException, seed_memory_from_compression
+    if not args.operator or not args.operator.strip():
+        _die("--operator must not be empty")
+    if not args.reason or not args.reason.strip():
+        _die("--reason must not be empty")
+    extra_tags = [t.strip() for t in args.tags.split(',') if t.strip()] if args.tags else []
+    try:
+        event = seed_memory_from_compression(
+            db_path=args.db,
+            artifact_id=args.artifact_id,
+            operator=args.operator,
+            reason=args.reason,
+            event_type=args.event_type,
+            title=args.title,
+            tags=extra_tags or None,
+            confidence=args.confidence,
+        )
+    except MemorySeedException as exc:
+        _die(
+            f"artifact id={args.artifact_id} has already seeded memory event "
+            f"id={exc.existing_memory_event_id}. "
+            f"Use 'show --id {exc.existing_memory_event_id}' to inspect."
+        )
+    except ValueError as exc:
+        _die(str(exc))
+    print(f"created memory event id={event.id} status={event.status}")
+
+
+def cmd_list_compression_derived_memory(args: argparse.Namespace) -> None:
+    from .compression import list_compression_derived_memory
+    events = list_compression_derived_memory(
+        db_path=args.db,
+        status=args.status,
+        limit=args.limit,
+    )
+    if not events:
+        print("No compression-derived memory events found.")
+        return
+    header = (
+        f"{'id':>4}  {'event_type':<22}  {'status':<12}  {'conf':>4}  "
+        f"{'source':<35}  title"
+    )
+    print(header)
+    print('-' * 110)
+    for ev in events:
+        print(
+            f"{ev.id:>4}  {ev.event_type:<22}  {ev.status:<12}  {ev.confidence:>4}  "
+            f"{ev.source:<35}  {ev.title[:40]}"
+        )
+
+
 def cmd_activation_policy_create(args: argparse.Namespace) -> None:
     from session.activation_policy import (
         create_activation_policy,
@@ -846,6 +898,8 @@ _COMMANDS = {
     'show-compression-artifact': cmd_show_compression_artifact,
     'supersede-compression-artifact': cmd_supersede_compression_artifact,
     'list-supersession-chain': cmd_list_supersession_chain,
+    'seed-memory-from-compression': cmd_seed_memory_from_compression,
+    'list-compression-derived-memory': cmd_list_compression_derived_memory,
     'activation-policy-create': cmd_activation_policy_create,
     'activation-policy-list': cmd_activation_policy_list,
     'activation-policy-inspect': cmd_activation_policy_inspect,
@@ -1174,6 +1228,29 @@ def build_parser() -> argparse.ArgumentParser:
                            help='Walk the supersession chain from a root artifact (JSON output)')
     p_lsc.add_argument('--id', required=True, type=int,
                        help='Root artifact id (oldest in chain)')
+
+    # seed-memory-from-compression
+    p_smfc = sub.add_parser('seed-memory-from-compression', parents=[_db],
+                            help='Create a proposed memory candidate from an active compression artifact')
+    p_smfc.add_argument('--artifact-id', required=True, type=int, dest='artifact_id',
+                        help='Compression artifact id (must have status=active)')
+    p_smfc.add_argument('--operator', required=True, help='Operator seeding this candidate')
+    p_smfc.add_argument('--reason', required=True, help='Reason for creating the memory candidate')
+    p_smfc.add_argument('--event-type', required=True, dest='event_type',
+                        choices=sorted(VALID_EVENT_TYPES), help='Memory event type')
+    p_smfc.add_argument('--title', required=True, help='Memory event title')
+    p_smfc.add_argument('--tags', default=None,
+                        help='Comma-separated additional tags (optional; "compression-derived" always added)')
+    p_smfc.add_argument('--confidence', type=int, default=None,
+                        choices=list(range(CONFIDENCE_MIN, CONFIDENCE_MAX + 1)),
+                        help='Override confidence 1–5 (default: from artifact.compression_confidence or 3)')
+
+    # list-compression-derived-memory
+    p_lcdm = sub.add_parser('list-compression-derived-memory', parents=[_db],
+                             help='List memory events seeded from compression artifacts')
+    p_lcdm.add_argument('--status', choices=list(VALID_STATUSES), default=None,
+                        help='Filter by status')
+    p_lcdm.add_argument('--limit', type=int, default=50, help='Max results (default: 50)')
 
     # activation-policy-create
     from session.activation_policy import VALID_POLICY_STATUSES

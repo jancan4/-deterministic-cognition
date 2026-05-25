@@ -1226,6 +1226,83 @@ def detect_stale_active_activation_policies(
     return issues
 
 
+# ---------------------------------------------------------------------------
+# Compression-derived memory governance (Phase 7B)
+# ---------------------------------------------------------------------------
+
+COMPRESSION_MEMORY_CANDIDATE_WARNING_DAYS = 14
+
+
+def detect_unreviewed_compression_derived_memory(
+    db_path: str,
+    *,
+    warning_days: int = COMPRESSION_MEMORY_CANDIDATE_WARNING_DAYS,
+) -> List[GovernanceIssue]:
+    """Proposed memory events seeded from compression artifacts older than warning_days.
+
+    A compression-derived candidate that has been in 'proposed' status for an
+    extended period without operator review represents a stalled seeding workflow.
+
+    Identifies seeded events by source field prefix 'compression_artifact:'.
+    This detector is observational only. It does not modify any memory event.
+    """
+    issues: List[GovernanceIssue] = []
+    cutoff = _cutoff(warning_days)
+
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, title, source, created_at, confidence, created_by
+            FROM memory_events
+            WHERE status = 'proposed'
+              AND source LIKE 'compression_artifact:%'
+              AND created_at < ?
+            ORDER BY id ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        try:
+            artifact_id = int(row['source'].split(':')[1])
+        except (IndexError, ValueError):
+            artifact_id = None
+
+        try:
+            created_dt = datetime.fromisoformat(row['created_at'].replace('Z', '+00:00'))
+            days_old = (datetime.now(timezone.utc) - created_dt).days
+        except (ValueError, AttributeError):
+            days_old = warning_days
+
+        issues.append(GovernanceIssue(
+            issue_type='unreviewed_compression_derived_memory',
+            severity='warning',
+            memory_id=row['id'],
+            title=row['title'],
+            rationale=(
+                f"Memory event [{row['id']}] '{row['title']}' was seeded from "
+                f"compression artifact id={artifact_id} and has been in 'proposed' "
+                f"status for {days_old} day(s) without review. "
+                f"Created: {row['created_at']} by {row['created_by']!r}."
+            ),
+            recommended_action=(
+                "Review the memory candidate and transition it to 'accepted' or 'active', "
+                "or reject it via update_status() if the compression was not useful."
+            ),
+            metadata={
+                'memory_event_id': row['id'],
+                'source_compression_artifact_id': artifact_id,
+                'source_key': row['source'],
+                'days_old': days_old,
+                'confidence': row['confidence'],
+            },
+        ))
+    return issues
+
+
 def detect_supersession_cycles(db_path: str) -> List[GovernanceIssue]:
     """Cycles in compression artifact superseded_by_artifact_id chains.
 
@@ -1326,6 +1403,8 @@ def build_governance_report(
     activation_candidate_warning_days: int = ACTIVATION_CANDIDATE_WARNING_DAYS,
     activation_stale_active_days: int = ACTIVATION_STALE_ACTIVE_DAYS,
     detect_activation_issues: bool = True,
+    compression_memory_warning_days: int = COMPRESSION_MEMORY_CANDIDATE_WARNING_DAYS,
+    detect_compression_memory_issues: bool = True,
 ) -> GovernanceReport:
     """Run all governance checks and return a deterministically sorted report.
 
@@ -1365,6 +1444,10 @@ def build_governance_report(
         ))
         issues.extend(detect_stale_active_activation_policies(
             db_path, stale_days=activation_stale_active_days
+        ))
+    if detect_compression_memory_issues:
+        issues.extend(detect_unreviewed_compression_derived_memory(
+            db_path, warning_days=compression_memory_warning_days
         ))
 
     issues.sort(key=lambda i: (_SEVERITY_ORDER[i.severity], i.issue_type, i.memory_id))

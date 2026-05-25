@@ -27,13 +27,34 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from .artifact_governance import ArtifactStatus, mark_active, mark_invalidated
+from .models import MemoryEvent, VALID_EVENT_TYPES
 
 
 _TABLE = 'compression_artifacts'
 
+# ---------------------------------------------------------------------------
+# Summary truncation constants (Phase 7B)
+# ---------------------------------------------------------------------------
+
+_SUMMARY_TRUNCATION_LIMIT = 4000
+_TRUNCATION_SUFFIX = "\n[truncated from compression artifact]"
+
+# Explicit rejection messages for non-active artifact statuses
+_SEED_REJECTION_MESSAGES: dict = {
+    'candidate':  "only status='active' artifacts may seed memory candidates. "
+                  "Promote the artifact first via promote_compression_artifact().",
+    'superseded': "superseded artifacts cannot seed memory candidates.",
+    'invalidated': "invalidated artifacts cannot seed memory candidates.",
+}
+
 
 def _now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _now_mem_utc() -> str:
+    """Second-precision UTC timestamp, consistent with memory_events convention."""
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -535,3 +556,227 @@ def get_supersession_chain(
         )
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 7B: compression-to-memory candidate pathway
+# ---------------------------------------------------------------------------
+
+class MemorySeedException(ValueError):
+    """Raised when a compression artifact has already seeded a memory candidate.
+
+    existing_memory_event_id identifies the previously created memory event.
+    """
+    def __init__(self, message: str, existing_memory_event_id: int) -> None:
+        super().__init__(message)
+        self.existing_memory_event_id = existing_memory_event_id
+
+
+def _compression_source_key(artifact_id: int) -> str:
+    """Canonical source field value for a compression-derived memory event."""
+    return f"compression_artifact:{artifact_id}"
+
+
+def _truncate_artifact_text(text: str) -> str:
+    """Deterministically truncate artifact_text for use as memory event summary.
+
+    Texts at or below _SUMMARY_TRUNCATION_LIMIT characters are returned verbatim.
+    Longer texts are truncated at the limit and _TRUNCATION_SUFFIX is appended.
+    The source artifact_text is never modified.
+    """
+    if len(text) <= _SUMMARY_TRUNCATION_LIMIT:
+        return text
+    return text[:_SUMMARY_TRUNCATION_LIMIT] + _TRUNCATION_SUFFIX
+
+
+def _build_evidence_json(
+    artifact: CompressionArtifact,
+    operator: str,
+    reason: str,
+) -> str:
+    """Build canonical, byte-stable evidence JSON for a seeded memory event.
+
+    All list fields are sorted before serialization. sort_keys=True and
+    canonical separators ensure byte-identical output across repeated calls
+    with identical inputs.
+    """
+    evidence: dict = {
+        "cognition_session_id": artifact.cognition_session_id,
+        "compression_artifact_id": artifact.id,
+        "compression_method": artifact.compression_method,
+        "producer_version": artifact.producer_version,
+        "promoted_by": artifact.promoted_by,
+        "promotion_notes": artifact.promotion_notes,
+        "seeded_by": operator,
+        "seeded_reason": reason,
+        "source_assembly_hash": artifact.source_assembly_hash,
+        "source_assembly_id": artifact.source_assembly_id,
+        "source_contradiction_link_ids": sorted(artifact.source_contradiction_link_ids),
+        "source_memory_event_count": len(artifact.source_memory_event_ids),
+        "source_memory_event_ids": sorted(artifact.source_memory_event_ids),
+    }
+    return json.dumps(evidence, sort_keys=True, separators=(',', ':'))
+
+
+def seed_memory_from_compression(
+    db_path: str,
+    artifact_id: int,
+    operator: str,
+    reason: str,
+    *,
+    event_type: str,
+    title: str,
+    tags: Optional[List[str]] = None,
+    confidence: Optional[int] = None,
+) -> MemoryEvent:
+    """Create a proposed memory candidate from an active compression artifact.
+
+    The memory event starts in status='proposed' and enters the review queue
+    automatically. It must be explicitly activated by an operator — no automatic
+    promotion occurs.
+
+    The source artifact is not mutated. The artifact's artifact_text becomes
+    the memory event summary (truncated at _SUMMARY_TRUNCATION_LIMIT characters
+    with a deterministic suffix if needed).
+
+    Provenance is recorded in the evidence field as canonical JSON, and
+    derived_from links are created to each source memory event that still
+    exists (best-effort — missing source events are silently skipped).
+
+    Idempotency: a compression artifact may seed at most one memory candidate.
+    Calling this function a second time on the same artifact raises
+    MemorySeedException with the existing_memory_event_id.
+
+    Status guard: only status='active' artifacts may seed memory. Candidate,
+    superseded, and invalidated artifacts are explicitly rejected.
+
+    Raises:
+        ValueError: on empty operator/reason/title, invalid event_type,
+                    artifact not found, or non-active artifact status.
+        MemorySeedException: if the artifact has already seeded a memory event.
+    """
+    if not operator or not operator.strip():
+        raise ValueError("'operator' must not be empty")
+    if not reason or not reason.strip():
+        raise ValueError("'reason' must not be empty")
+    if not title or not title.strip():
+        raise ValueError("'title' must not be empty")
+    if event_type not in VALID_EVENT_TYPES:
+        raise ValueError(
+            f"Invalid event_type {event_type!r}. Valid: {sorted(VALID_EVENT_TYPES)}"
+        )
+
+    conn = _connect(db_path)
+    try:
+        # Fetch artifact
+        row = conn.execute(
+            "SELECT * FROM compression_artifacts WHERE id = ?", (artifact_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"compression artifact id={artifact_id} not found")
+        artifact = _row_to_artifact(row)
+
+        # Status guard — explicit messages per rejected status
+        if artifact.status != 'active':
+            detail = _SEED_REJECTION_MESSAGES.get(
+                artifact.status,
+                f"unexpected status={artifact.status!r}",
+            )
+            raise ValueError(
+                f"compression artifact id={artifact_id} has status={artifact.status!r}: {detail}"
+            )
+
+        # Idempotency check
+        source_key = _compression_source_key(artifact_id)
+        existing = conn.execute(
+            "SELECT id FROM memory_events WHERE source = ?", (source_key,)
+        ).fetchone()
+        if existing is not None:
+            raise MemorySeedException(
+                f"compression artifact id={artifact_id} has already seeded "
+                f"memory event id={existing['id']}. "
+                "A compression artifact may only seed one memory candidate.",
+                existing_memory_event_id=existing['id'],
+            )
+
+        # Build field values
+        summary = _truncate_artifact_text(artifact.artifact_text)
+        evidence = _build_evidence_json(artifact, operator, reason)
+        effective_confidence = (
+            confidence
+            if confidence is not None
+            else (artifact.compression_confidence if artifact.compression_confidence is not None else 3)
+        )
+        all_tags = sorted(set(["compression-derived"] + list(tags or [])))
+        tags_json = json.dumps(all_tags)
+        related_ids_json = json.dumps(sorted(artifact.source_memory_event_ids))
+        now = _now_mem_utc()
+
+        # Insert memory event
+        cur = conn.execute(
+            """INSERT INTO memory_events
+               (event_type, title, summary, evidence, source, confidence, status,
+                tags_json, related_ids_json, created_by, created_at, updated_at, version)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+            (
+                event_type, title, summary, evidence, source_key,
+                effective_confidence, 'proposed',
+                tags_json, related_ids_json, operator, now, now,
+            ),
+        )
+        new_event_id = cur.lastrowid
+        conn.commit()
+
+        # Create derived_from links to source memory events (best-effort)
+        for src_event_id in sorted(artifact.source_memory_event_ids):
+            src_exists = conn.execute(
+                "SELECT id FROM memory_events WHERE id = ?", (src_event_id,)
+            ).fetchone()
+            if src_exists is None:
+                continue
+            try:
+                conn.execute(
+                    """INSERT INTO memory_links
+                       (source_id, target_id, relationship, created_at,
+                        created_by, reason, status)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (new_event_id, src_event_id, 'derived_from', now,
+                     operator, reason, 'active'),
+                )
+                conn.commit()
+            except sqlite3.IntegrityError:
+                conn.rollback()
+
+        row = conn.execute(
+            "SELECT * FROM memory_events WHERE id = ?", (new_event_id,)
+        ).fetchone()
+        return MemoryEvent.from_row(row)
+    finally:
+        conn.close()
+
+
+def list_compression_derived_memory(
+    db_path: str,
+    *,
+    status: Optional[str] = None,
+    limit: int = 50,
+) -> List[MemoryEvent]:
+    """List memory events seeded from compression artifacts.
+
+    Identifies seeded events by source field prefix 'compression_artifact:'.
+    Ordered by id DESC (most recent first).
+    """
+    query = "SELECT * FROM memory_events WHERE source LIKE 'compression_artifact:%'"
+    params: list = []
+    if status is not None:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+    return [MemoryEvent.from_row(r) for r in rows]
