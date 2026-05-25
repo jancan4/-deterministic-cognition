@@ -1,0 +1,2 @@
+# No production dependencies.
+# For Ollama model adapter support: pip install requests>=2.28

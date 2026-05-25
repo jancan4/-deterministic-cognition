@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "deterministic-cognition-substrate"
+version = "1.0.0"
+description = "Deterministic, governed cognition substrate with SQLite-backed memory and continuity bundle transport"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev   = ["pytest==8.4.2"]
+ollama = ["requests>=2.28"]
+
+[project.scripts]
+memory-cli    = "memory.cli:main"
+substrate-cli = "cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["*.tests", "*.tests.*"]
+
+[tool.pytest.ini_options]
+testpaths = [
+    "cli/tests",
+    "continuity/tests",
+    "ingestion/tests",
+    "memory/tests",
+    "models/tests",
+    "orchestration/tests",
+    "runtime/tests",
+    "semantic/tests",
+    "session/tests",
+    "sources/tests",
+    "workflow/tests",
+]
+pythonpath = ["."]
