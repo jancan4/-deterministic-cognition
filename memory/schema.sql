@@ -269,6 +269,14 @@ CREATE TABLE IF NOT EXISTS compression_artifacts (
     -- NULL until superseded. Enables machine-queryable supersession chains.
     superseded_by_artifact_id          INTEGER,
 
+    -- Supersession audit columns (v13): populated only by supersede_compression_artifact().
+    -- Hard invariant: superseded_at IS NULL iff status != 'superseded'.
+    --                 invalidated_at IS NULL iff status != 'invalidated'.
+    -- These columns must NEVER be written by invalidation paths and vice versa.
+    superseded_at                      TEXT,
+    superseded_reason                  TEXT,
+    superseded_by_operator             TEXT,
+
     -- Provenance metadata
     provenance_json                    TEXT    NOT NULL DEFAULT '{}',
 

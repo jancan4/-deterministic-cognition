@@ -602,6 +602,30 @@ def cmd_show_compression_artifact(args: argparse.Namespace) -> None:
     print(json.dumps(artifact.to_dict(), indent=2, sort_keys=True))
 
 
+def cmd_supersede_compression_artifact(args: argparse.Namespace) -> None:
+    from .compression import supersede_compression_artifact
+    try:
+        artifact = supersede_compression_artifact(
+            db_path=args.db,
+            artifact_id=args.id,
+            superseded_by_id=args.superseded_by,
+            reason=args.reason,
+            superseded_by_operator=args.operator,
+        )
+    except ValueError as exc:
+        _die(str(exc))
+    print(json.dumps(artifact.to_dict(), indent=2, sort_keys=True))
+
+
+def cmd_list_supersession_chain(args: argparse.Namespace) -> None:
+    from .compression import get_supersession_chain
+    try:
+        chain = get_supersession_chain(artifact_id=args.id, db_path=args.db)
+    except ValueError as exc:
+        _die(str(exc))
+    print(json.dumps(chain.to_dict(), indent=2, sort_keys=True))
+
+
 # ---------------------------------------------------------------------------
 # parser
 # ---------------------------------------------------------------------------
@@ -637,6 +661,8 @@ _COMMANDS = {
     'invalidate-compression-artifact': cmd_invalidate_compression_artifact,
     'list-compression-artifacts': cmd_list_compression_artifacts,
     'show-compression-artifact': cmd_show_compression_artifact,
+    'supersede-compression-artifact': cmd_supersede_compression_artifact,
+    'list-supersession-chain': cmd_list_supersession_chain,
 }
 
 
@@ -940,6 +966,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_sca = sub.add_parser('show-compression-artifact', parents=[_db],
                            help='Show one compression artifact by id (JSON output)')
     p_sca.add_argument('--id', required=True, type=int, help='Compression artifact id')
+
+    # supersede-compression-artifact
+    p_sup = sub.add_parser('supersede-compression-artifact', parents=[_db],
+                           help='Supersede an active compression artifact with a newer replacement')
+    p_sup.add_argument('--id', required=True, type=int,
+                       help='Artifact id to supersede (must be active)')
+    p_sup.add_argument('--superseded-by', required=True, type=int, dest='superseded_by',
+                       help='Id of the replacement artifact')
+    p_sup.add_argument('--reason', required=True,
+                       help='Reason for supersession')
+    p_sup.add_argument('--operator', required=True,
+                       help='Operator recording the supersession')
+
+    # list-supersession-chain
+    p_lsc = sub.add_parser('list-supersession-chain', parents=[_db],
+                           help='Walk the supersession chain from a root artifact (JSON output)')
+    p_lsc.add_argument('--id', required=True, type=int,
+                       help='Root artifact id (oldest in chain)')
 
     return parser
 

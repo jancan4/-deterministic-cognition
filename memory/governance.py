@@ -888,6 +888,188 @@ def detect_unreviewed_compression_candidates(
     return issues
 
 
+def detect_orphan_supersessions(db_path: str) -> List[GovernanceIssue]:
+    """Superseded compression artifacts with no superseded_by_artifact_id recorded.
+
+    An artifact marked superseded but with no pointer to its replacement is an
+    orphan — the lineage chain is broken at the source and no machine-queryable
+    path to the replacement exists.
+    """
+    issues: List[GovernanceIssue] = []
+
+    conn = _connect(db_path)
+    try:
+        if not _compression_artifacts_table_exists(conn):
+            return issues
+        rows = conn.execute(
+            """
+            SELECT id, source_assembly_id, compression_method, generated_at,
+                   superseded_at
+            FROM compression_artifacts
+            WHERE status = 'superseded'
+              AND superseded_by_artifact_id IS NULL
+            ORDER BY id ASC
+            """,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        issues.append(GovernanceIssue(
+            issue_type='orphan_supersession',
+            severity='warning',
+            memory_id=0,
+            title=f"Orphan supersession: artifact id={row['id']}",
+            rationale=(
+                f"Compression artifact id={row['id']} (method={row['compression_method']!r}, "
+                f"assembly={row['source_assembly_id']}) has status='superseded' but "
+                f"superseded_by_artifact_id is NULL. The replacement artifact is unknown."
+            ),
+            recommended_action=(
+                'Record the replacement artifact id by calling supersede_compression_artifact() '
+                'with the correct superseded_by_id, or annotate the provenance manually.'
+            ),
+            metadata={
+                'artifact_id': row['id'],
+                'source_assembly_id': row['source_assembly_id'],
+                'compression_method': row['compression_method'],
+                'generated_at': row['generated_at'],
+                'superseded_at': row['superseded_at'],
+            },
+        ))
+    return issues
+
+
+def detect_pending_replacement_supersessions(db_path: str) -> List[GovernanceIssue]:
+    """Superseded artifacts whose replacement is not yet active.
+
+    If superseded_by_artifact_id points to a candidate artifact, the supersession
+    has been recorded but the replacement has not yet been promoted. The artifact
+    has been decommissioned without a live replacement in place.
+    """
+    issues: List[GovernanceIssue] = []
+
+    conn = _connect(db_path)
+    try:
+        if not _compression_artifacts_table_exists(conn):
+            return issues
+        rows = conn.execute(
+            """
+            SELECT ca.id AS artifact_id,
+                   ca.source_assembly_id, ca.compression_method, ca.generated_at,
+                   ca.superseded_by_artifact_id,
+                   repl.status AS replacement_status
+            FROM compression_artifacts ca
+            JOIN compression_artifacts repl ON repl.id = ca.superseded_by_artifact_id
+            WHERE ca.status = 'superseded'
+              AND repl.status != 'active'
+            ORDER BY ca.id ASC
+            """,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        issues.append(GovernanceIssue(
+            issue_type='pending_replacement_supersession',
+            severity='warning',
+            memory_id=0,
+            title=f"Replacement not active: artifact id={row['artifact_id']}",
+            rationale=(
+                f"Compression artifact id={row['artifact_id']} (method={row['compression_method']!r}) "
+                f"is superseded by artifact id={row['superseded_by_artifact_id']}, "
+                f"but the replacement has status={row['replacement_status']!r} (not 'active'). "
+                f"No active replacement is in place."
+            ),
+            recommended_action=(
+                'Promote the replacement artifact via promote_compression_artifact(), '
+                'or invalidate it and create a new replacement.'
+            ),
+            metadata={
+                'artifact_id': row['artifact_id'],
+                'source_assembly_id': row['source_assembly_id'],
+                'compression_method': row['compression_method'],
+                'generated_at': row['generated_at'],
+                'superseded_by_artifact_id': row['superseded_by_artifact_id'],
+                'replacement_status': row['replacement_status'],
+            },
+        ))
+    return issues
+
+
+def detect_supersession_cycles(db_path: str) -> List[GovernanceIssue]:
+    """Cycles in compression artifact superseded_by_artifact_id chains.
+
+    A cycle means two or more artifacts each claim to be superseded by the other,
+    forming an infinite loop. This is a data integrity violation and must be
+    resolved manually.
+    """
+    issues: List[GovernanceIssue] = []
+
+    conn = _connect(db_path)
+    try:
+        if not _compression_artifacts_table_exists(conn):
+            return issues
+        rows = conn.execute(
+            """
+            SELECT id, superseded_by_artifact_id
+            FROM compression_artifacts
+            WHERE superseded_by_artifact_id IS NOT NULL
+            ORDER BY id ASC
+            """,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    # Build adjacency map: id -> superseded_by_artifact_id
+    successor: Dict[int, int] = {row['id']: row['superseded_by_artifact_id'] for row in rows}
+    all_ids = set(successor.keys())
+
+    reported_cycles: set = set()  # frozensets of cycle member ids already reported
+
+    for start_id in sorted(all_ids):
+        visited_order: List[int] = []
+        visited_set: set = set()
+        current = start_id
+
+        while current in successor and current not in visited_set:
+            visited_order.append(current)
+            visited_set.add(current)
+            current = successor[current]
+
+        if current in visited_set:
+            # current is the entry point of the cycle
+            cycle_start_idx = visited_order.index(current)
+            cycle_ids = visited_order[cycle_start_idx:]
+            cycle_key = frozenset(cycle_ids)
+            if cycle_key in reported_cycles:
+                continue
+            reported_cycles.add(cycle_key)
+
+            sorted_cycle_ids = sorted(cycle_ids)
+            issues.append(GovernanceIssue(
+                issue_type='compression_supersession_cycle',
+                severity='critical',
+                memory_id=0,
+                title=f"Supersession cycle detected: ids={sorted_cycle_ids}",
+                rationale=(
+                    f"A supersession cycle exists among compression artifacts "
+                    f"{sorted_cycle_ids}. Each artifact in the cycle claims to be "
+                    f"superseded by another member of the cycle, creating an infinite loop "
+                    f"in the lineage chain."
+                ),
+                recommended_action=(
+                    'Break the cycle by correcting superseded_by_artifact_id on one or more '
+                    'artifacts. This requires direct DB repair — supersession cannot be undone '
+                    'through the normal API.'
+                ),
+                metadata={
+                    'cycle_artifact_ids': sorted_cycle_ids,
+                },
+            ))
+    return issues
+
+
 # ---------------------------------------------------------------------------
 # Governance report
 # ---------------------------------------------------------------------------
@@ -911,6 +1093,7 @@ def build_governance_report(
     session_abandoned_threshold_days: int = SESSION_ABANDONED_THRESHOLD_DAYS,
     compression_warning_days: int = COMPRESSION_CANDIDATE_WARNING_DAYS,
     compression_critical_days: int = COMPRESSION_CANDIDATE_CRITICAL_DAYS,
+    detect_compression_supersession_issues: bool = True,
 ) -> GovernanceReport:
     """Run all governance checks and return a deterministically sorted report.
 
@@ -939,6 +1122,10 @@ def build_governance_report(
     issues.extend(detect_abandoned_sessions(db_path, session_abandoned_threshold_days))
     issues.extend(detect_duplicate_active_sessions(db_path))
     issues.extend(detect_unreviewed_compression_candidates(db_path, compression_warning_days, compression_critical_days))
+    if detect_compression_supersession_issues:
+        issues.extend(detect_orphan_supersessions(db_path))
+        issues.extend(detect_pending_replacement_supersessions(db_path))
+        issues.extend(detect_supersession_cycles(db_path))
 
     issues.sort(key=lambda i: (_SEVERITY_ORDER[i.severity], i.issue_type, i.memory_id))
 

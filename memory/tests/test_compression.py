@@ -130,12 +130,12 @@ def _past_utc(days: int) -> str:
 # ---------------------------------------------------------------------------
 
 class TestSchemaV11:
-    def test_schema_version_is_12(self, tmp_path):
+    def test_schema_version_is_13(self, tmp_path):
         db = _db(tmp_path)
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 12
+        assert row[0] == 13
 
     def test_compression_artifacts_table_exists(self, tmp_path):
         db = _db(tmp_path)
@@ -158,6 +158,7 @@ class TestSchemaV11:
             'invalidated_at', 'invalidated_reason',
             'promoted_by', 'promoted_at', 'promotion_notes',
             'superseded_by_artifact_id',
+            'superseded_at', 'superseded_reason', 'superseded_by_operator',
             'provenance_json',
         }
         assert required <= cols
@@ -181,6 +182,7 @@ class TestSchemaV11:
         assert 'idx_compression_method' in indices
         assert 'idx_compression_generated_at' in indices
         assert 'idx_compression_superseded_by' in indices  # added in v12
+        assert 'idx_compression_superseded_at' in indices  # added in v13
 
     def test_schema_v11_is_idempotent(self, tmp_path):
         db = _db(tmp_path)
@@ -188,7 +190,7 @@ class TestSchemaV11:
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 12
+        assert row[0] == 13
 
 
 # ---------------------------------------------------------------------------

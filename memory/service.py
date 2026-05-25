@@ -12,7 +12,7 @@ from .models import (
 )
 
 _SCHEMA = Path(__file__).parent / 'schema.sql'
-_MEMORY_SCHEMA_VERSION = 12
+_MEMORY_SCHEMA_VERSION = 13
 
 
 class ValidationError(ValueError):
@@ -44,6 +44,25 @@ def _validate_confidence(confidence: int) -> None:
         raise ValidationError(
             f"confidence must be {CONFIDENCE_MIN}–{CONFIDENCE_MAX}, got {confidence}"
         )
+
+
+def _migrate_to_v13(conn: sqlite3.Connection) -> None:
+    # Add supersession audit columns to compression_artifacts (Phase 6B-beta).
+    # Hard invariant: these columns are written ONLY by supersede_compression_artifact()
+    # and must remain NULL for non-superseded artifacts.
+    existing_cols = {row[1] for row in conn.execute('PRAGMA table_info(compression_artifacts)')}
+    for col_sql in (
+        "ALTER TABLE compression_artifacts ADD COLUMN superseded_at TEXT",
+        "ALTER TABLE compression_artifacts ADD COLUMN superseded_reason TEXT",
+        "ALTER TABLE compression_artifacts ADD COLUMN superseded_by_operator TEXT",
+    ):
+        col_name = col_sql.split()[-2]
+        if col_name not in existing_cols:
+            conn.execute(col_sql)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_compression_superseded_at "
+        "ON compression_artifacts(superseded_at)"
+    )
 
 
 def _migrate_to_v12(conn: sqlite3.Connection) -> None:
@@ -275,6 +294,7 @@ def init_db(db_path: str) -> None:
             _migrate_to_v10(conn)
             _migrate_to_v11(conn)
             _migrate_to_v12(conn)
+            _migrate_to_v13(conn)
             conn.execute(
                 'INSERT INTO memory_schema_version (version) VALUES (?)',
                 (_MEMORY_SCHEMA_VERSION,)
@@ -300,6 +320,8 @@ def init_db(db_path: str) -> None:
                 _migrate_to_v11(conn)
             if row['version'] < 12:
                 _migrate_to_v12(conn)
+            if row['version'] < 13:
+                _migrate_to_v13(conn)
             conn.execute(
                 'UPDATE memory_schema_version SET version = ?',
                 (_MEMORY_SCHEMA_VERSION,)

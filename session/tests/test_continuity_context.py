@@ -158,12 +158,12 @@ class TestSchemaV12:
         conn.close()
         assert 'idx_compression_superseded_by' in indices
 
-    def test_schema_version_is_12(self, tmp_path):
+    def test_schema_version_is_13(self, tmp_path):
         db = _db(tmp_path)
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 12
+        assert row[0] == 13
 
     def test_v11_db_migrates_to_v12(self, tmp_path):
         """A DB at version 11 (without superseded_by column) is upgraded by init_db()."""
@@ -227,7 +227,7 @@ class TestSchemaV12:
         cols = {r[1] for r in conn.execute('PRAGMA table_info(compression_artifacts)')}
         indices = {r[1] for r in conn.execute('PRAGMA index_list(compression_artifacts)')}
         conn.close()
-        assert version == 12
+        assert version == 13
         assert 'superseded_by_artifact_id' in cols
         assert 'idx_compression_superseded_by' in indices
 

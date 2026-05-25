@@ -2,16 +2,21 @@
 Governed compression artifact lifecycle.
 
 Phase 6A: create, retrieve, list, promote, invalidate compression artifacts.
+Phase 6B-beta: supersede_compression_artifact(), get_supersession_chain().
+
 No automatic summarization, no model calls, no autonomous promotion.
 All mutations are explicit, provenance-preserving, and auditable.
 
-Status state machine (from artifact_governance.py):
+Status state machine:
   candidate  -->  active       (promote_compression_artifact, requires operator)
   candidate  -->  invalidated  (invalidate_compression_artifact)
   active     -->  invalidated  (invalidate_compression_artifact)
+  active     -->  superseded   (supersede_compression_artifact, requires operator)
   superseded, invalidated: terminal — no further transitions
 
-Promotion to canonical memory is Phase 6B scope. No promoted_memory_id column exists.
+Column invariants (hard, enforced by distinct code paths):
+  status='superseded': superseded_at IS NOT NULL, invalidated_at IS NULL
+  status='invalidated': invalidated_at IS NOT NULL, superseded_at IS NULL
 """
 from __future__ import annotations
 
@@ -61,6 +66,10 @@ class CompressionArtifact:
     promoted_by: Optional[str]
     promoted_at: Optional[str]
     promotion_notes: Optional[str]
+    superseded_by_artifact_id: Optional[int]
+    superseded_at: Optional[str]
+    superseded_reason: Optional[str]
+    superseded_by_operator: Optional[str]
     provenance: Dict
 
     def to_dict(self) -> dict:
@@ -86,11 +95,42 @@ class CompressionArtifact:
             'promoted_by': self.promoted_by,
             'promoted_at': self.promoted_at,
             'promotion_notes': self.promotion_notes,
+            'superseded_by_artifact_id': self.superseded_by_artifact_id,
+            'superseded_at': self.superseded_at,
+            'superseded_reason': self.superseded_reason,
+            'superseded_by_operator': self.superseded_by_operator,
             'provenance': self.provenance,
         }
 
 
+@dataclass
+class SupersessionChain:
+    """Ordered lineage of compression artifacts linked by superseded_by_artifact_id.
+
+    Artifacts are listed oldest-to-newest (root first, current last).
+    chain_broken=True means a referenced superseded_by_artifact_id was not found in the DB.
+    truncated=True means the chain was cut at the depth limit (50).
+    cycle_detected=True means a cycle was detected; the chain up to the cycle start is included.
+    """
+    root_artifact_id: int
+    artifacts: List['CompressionArtifact']
+    chain_broken: bool = False
+    truncated: bool = False
+    cycle_detected: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            'root_artifact_id': self.root_artifact_id,
+            'chain_length': len(self.artifacts),
+            'chain_broken': self.chain_broken,
+            'truncated': self.truncated,
+            'cycle_detected': self.cycle_detected,
+            'artifacts': [a.to_dict() for a in self.artifacts],
+        }
+
+
 def _row_to_artifact(row: sqlite3.Row) -> CompressionArtifact:
+    keys = row.keys()
     return CompressionArtifact(
         id=row['id'],
         source_assembly_id=row['source_assembly_id'],
@@ -113,6 +153,10 @@ def _row_to_artifact(row: sqlite3.Row) -> CompressionArtifact:
         promoted_by=row['promoted_by'],
         promoted_at=row['promoted_at'],
         promotion_notes=row['promotion_notes'],
+        superseded_by_artifact_id=row['superseded_by_artifact_id'] if 'superseded_by_artifact_id' in keys else None,
+        superseded_at=row['superseded_at'] if 'superseded_at' in keys else None,
+        superseded_reason=row['superseded_reason'] if 'superseded_reason' in keys else None,
+        superseded_by_operator=row['superseded_by_operator'] if 'superseded_by_operator' in keys else None,
         provenance=json.loads(row['provenance_json']),
     )
 
@@ -353,5 +397,141 @@ def invalidate_compression_artifact(
             "SELECT * FROM compression_artifacts WHERE id = ?", (artifact_id,)
         ).fetchone()
         return _row_to_artifact(row)
+    finally:
+        conn.close()
+
+
+def supersede_compression_artifact(
+    db_path: str,
+    artifact_id: int,
+    superseded_by_id: int,
+    reason: str,
+    superseded_by_operator: str,
+) -> CompressionArtifact:
+    """
+    Supersede an active compression artifact with a newer replacement.
+
+    Records status='superseded', superseded_at, superseded_reason,
+    superseded_by_operator, and superseded_by_artifact_id.
+
+    Hard invariant: this function NEVER writes invalidated_at or invalidated_reason.
+    invalidated_* columns are exclusively written by invalidate_compression_artifact().
+
+    Raises ValueError if:
+    - artifact_id or superseded_by_id not found
+    - artifact_id status is not 'active' (only active artifacts may be superseded)
+    - superseded_by_id == artifact_id (no self-supersession)
+    - reason or superseded_by_operator is empty
+    """
+    if not reason or not reason.strip():
+        raise ValueError("reason must not be empty")
+    if not superseded_by_operator or not superseded_by_operator.strip():
+        raise ValueError("superseded_by_operator must not be empty")
+    if artifact_id == superseded_by_id:
+        raise ValueError(f"artifact_id and superseded_by_id must differ (got {artifact_id})")
+
+    now = _now_utc()
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT status FROM compression_artifacts WHERE id = ?", (artifact_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"compression artifact id={artifact_id} not found")
+        if row['status'] != 'active':
+            raise ValueError(
+                f"Cannot supersede artifact id={artifact_id}: "
+                f"current status={row['status']!r}. Only 'active' artifacts may be superseded."
+            )
+
+        replacement_row = conn.execute(
+            "SELECT id FROM compression_artifacts WHERE id = ?", (superseded_by_id,)
+        ).fetchone()
+        if replacement_row is None:
+            raise ValueError(f"superseded_by_id={superseded_by_id} not found in compression_artifacts")
+
+        # Direct SQL — NOT via mark_superseded(). invalidated_at and invalidated_reason remain NULL.
+        conn.execute(
+            """UPDATE compression_artifacts
+               SET status = 'superseded',
+                   superseded_at = ?,
+                   superseded_reason = ?,
+                   superseded_by_operator = ?,
+                   superseded_by_artifact_id = ?
+               WHERE id = ?""",
+            (now, reason, superseded_by_operator, superseded_by_id, artifact_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM compression_artifacts WHERE id = ?", (artifact_id,)
+        ).fetchone()
+        return _row_to_artifact(row)
+    finally:
+        conn.close()
+
+
+_SUPERSESSION_CHAIN_DEPTH_LIMIT = 50
+
+
+def get_supersession_chain(
+    artifact_id: int,
+    db_path: str,
+) -> SupersessionChain:
+    """
+    Walk the supersession chain rooted at artifact_id.
+
+    Traversal follows superseded_by_artifact_id forward (superseded → replacement).
+    Returns artifacts oldest-to-newest (root first).
+
+    chain_broken=True  if a superseded_by_artifact_id FK target is missing from the DB.
+    truncated=True     if the depth limit (50) was reached.
+    cycle_detected=True if a cycle was detected; chain up to the cycle entry is included.
+
+    Never raises on missing chain members — broken chains are reported via chain_broken.
+    Raises ValueError only if artifact_id itself is not found.
+    """
+    conn = _connect(db_path)
+    try:
+        root_row = conn.execute(
+            "SELECT * FROM compression_artifacts WHERE id = ?", (artifact_id,)
+        ).fetchone()
+        if root_row is None:
+            raise ValueError(f"compression artifact id={artifact_id} not found")
+
+        artifacts: List[CompressionArtifact] = [_row_to_artifact(root_row)]
+        visited: set = {artifact_id}
+        chain_broken = False
+        truncated = False
+        cycle_detected = False
+
+        current = _row_to_artifact(root_row)
+        for _ in range(_SUPERSESSION_CHAIN_DEPTH_LIMIT - 1):
+            next_id = current.superseded_by_artifact_id
+            if next_id is None:
+                break
+            if next_id in visited:
+                cycle_detected = True
+                break
+            next_row = conn.execute(
+                "SELECT * FROM compression_artifacts WHERE id = ?", (next_id,)
+            ).fetchone()
+            if next_row is None:
+                chain_broken = True
+                break
+            visited.add(next_id)
+            current = _row_to_artifact(next_row)
+            artifacts.append(current)
+        else:
+            # Loop exhausted depth limit; check if there is still a next link.
+            if current.superseded_by_artifact_id is not None:
+                truncated = True
+
+        return SupersessionChain(
+            root_artifact_id=artifact_id,
+            artifacts=artifacts,
+            chain_broken=chain_broken,
+            truncated=truncated,
+            cycle_detected=cycle_detected,
+        )
     finally:
         conn.close()
