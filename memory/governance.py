@@ -1069,6 +1069,163 @@ def detect_pending_replacement_supersessions(db_path: str) -> List[GovernanceIss
     return issues
 
 
+# ---------------------------------------------------------------------------
+# Activation policy governance
+# ---------------------------------------------------------------------------
+
+ACTIVATION_CANDIDATE_WARNING_DAYS = 7
+ACTIVATION_STALE_ACTIVE_DAYS = 30
+
+
+def _activation_policies_table_exists(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='activation_policies'"
+    ).fetchone() is not None
+
+
+def detect_unreviewed_activation_policies(
+    db_path: str,
+    *,
+    candidate_warning_days: int = ACTIVATION_CANDIDATE_WARNING_DAYS,
+) -> List[GovernanceIssue]:
+    """Candidate activation policies older than candidate_warning_days without activation.
+
+    A policy that remains in 'candidate' status for an extended period may represent
+    a stalled operator workflow or an abandoned proposal.
+
+    This detector is observational only. It does not modify any policy.
+    """
+    issues: List[GovernanceIssue] = []
+    cutoff = _cutoff(candidate_warning_days)
+
+    conn = _connect(db_path)
+    try:
+        if not _activation_policies_table_exists(conn):
+            return issues
+        rows = conn.execute(
+            """
+            SELECT id, name, trigger_class, created_at, created_by
+            FROM activation_policies
+            WHERE status = 'candidate'
+              AND created_at < ?
+            ORDER BY id ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        try:
+            created_dt = datetime.fromisoformat(row['created_at'].replace('Z', '+00:00'))
+            days_old = (datetime.now(timezone.utc) - created_dt).days
+        except (ValueError, AttributeError):
+            days_old = candidate_warning_days
+
+        issues.append(GovernanceIssue(
+            issue_type='unreviewed_activation_policy',
+            severity='warning',
+            memory_id=0,
+            title=f"Unreviewed activation policy id={row['id']} name={row['name']!r}",
+            rationale=(
+                f"Activation policy id={row['id']} name={row['name']!r} "
+                f"(trigger_class={row['trigger_class']!r}) has been in 'candidate' status "
+                f"for {days_old} day(s) without activation. "
+                f"Created: {row['created_at']} by {row['created_by']!r}."
+            ),
+            recommended_action=(
+                "Activate the policy via 'activation-policy-activate' if ready, "
+                "or supersede/remove it if no longer needed."
+            ),
+            metadata={
+                'policy_id': row['id'],
+                'policy_name': row['name'],
+                'trigger_class': row['trigger_class'],
+                'created_at': row['created_at'],
+                'created_by': row['created_by'],
+                'days_old': days_old,
+            },
+        ))
+    return issues
+
+
+def detect_stale_active_activation_policies(
+    db_path: str,
+    *,
+    stale_days: int = ACTIVATION_STALE_ACTIVE_DAYS,
+) -> List[GovernanceIssue]:
+    """Active activation policies that have never fired after stale_days of activation.
+
+    A policy that has been active for an extended period with zero successful trigger
+    firings may be misconfigured, pointing at conditions that never arise, or redundant.
+
+    Only policies with zero fired=1 rows in activation_decision_log are flagged.
+    Policies that have fired at least once are not flagged, regardless of frequency.
+
+    This detector is observational only. It does not modify any policy.
+    """
+    issues: List[GovernanceIssue] = []
+    cutoff = _cutoff(stale_days)
+
+    conn = _connect(db_path)
+    try:
+        if not _activation_policies_table_exists(conn):
+            return issues
+        rows = conn.execute(
+            """
+            SELECT ap.id, ap.name, ap.trigger_class, ap.activated_at, ap.activated_by,
+                   ap.priority
+            FROM activation_policies ap
+            WHERE ap.status = 'active'
+              AND ap.activated_at < ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM activation_decision_log adl
+                  WHERE adl.policy_id = ap.id
+                    AND adl.fired = 1
+              )
+            ORDER BY ap.id ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        try:
+            activated_dt = datetime.fromisoformat(row['activated_at'].replace('Z', '+00:00'))
+            days_active = (datetime.now(timezone.utc) - activated_dt).days
+        except (ValueError, AttributeError):
+            days_active = stale_days
+
+        issues.append(GovernanceIssue(
+            issue_type='stale_active_activation_policy',
+            severity='warning',
+            memory_id=0,
+            title=f"Stale active policy id={row['id']} name={row['name']!r}",
+            rationale=(
+                f"Activation policy id={row['id']} name={row['name']!r} "
+                f"(trigger_class={row['trigger_class']!r}) has been active for "
+                f"{days_active} day(s) with zero successful trigger firings. "
+                f"Activated: {row['activated_at']} by {row['activated_by']!r}."
+            ),
+            recommended_action=(
+                "Review the policy's trigger conditions: the configured conditions may "
+                "never be met. Supersede via 'activation-policy-supersede' if no longer "
+                "needed, or adjust conditions and recreate."
+            ),
+            metadata={
+                'policy_id': row['id'],
+                'policy_name': row['name'],
+                'trigger_class': row['trigger_class'],
+                'activated_at': row['activated_at'],
+                'activated_by': row['activated_by'],
+                'days_active': days_active,
+                'priority': row['priority'],
+            },
+        ))
+    return issues
+
+
 def detect_supersession_cycles(db_path: str) -> List[GovernanceIssue]:
     """Cycles in compression artifact superseded_by_artifact_id chains.
 
@@ -1166,6 +1323,9 @@ def build_governance_report(
     compression_warning_days: int = COMPRESSION_CANDIDATE_WARNING_DAYS,
     compression_critical_days: int = COMPRESSION_CANDIDATE_CRITICAL_DAYS,
     detect_compression_supersession_issues: bool = True,
+    activation_candidate_warning_days: int = ACTIVATION_CANDIDATE_WARNING_DAYS,
+    activation_stale_active_days: int = ACTIVATION_STALE_ACTIVE_DAYS,
+    detect_activation_issues: bool = True,
 ) -> GovernanceReport:
     """Run all governance checks and return a deterministically sorted report.
 
@@ -1199,6 +1359,13 @@ def build_governance_report(
         issues.extend(detect_orphan_supersessions(db_path))
         issues.extend(detect_pending_replacement_supersessions(db_path))
         issues.extend(detect_supersession_cycles(db_path))
+    if detect_activation_issues:
+        issues.extend(detect_unreviewed_activation_policies(
+            db_path, candidate_warning_days=activation_candidate_warning_days
+        ))
+        issues.extend(detect_stale_active_activation_policies(
+            db_path, stale_days=activation_stale_active_days
+        ))
 
     issues.sort(key=lambda i: (_SEVERITY_ORDER[i.severity], i.issue_type, i.memory_id))
 

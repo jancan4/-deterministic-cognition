@@ -627,6 +627,189 @@ def cmd_list_supersession_chain(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Activation policy commands
+# ---------------------------------------------------------------------------
+
+def cmd_activation_policy_create(args: argparse.Namespace) -> None:
+    from session.activation_policy import (
+        create_activation_policy,
+        ActivationPolicyValidationError,
+    )
+    conditions = {}
+    if args.conditions:
+        try:
+            conditions = json.loads(args.conditions)
+        except json.JSONDecodeError as exc:
+            _die(f"Invalid --conditions JSON: {exc}")
+    provenance = None
+    if args.provenance:
+        try:
+            provenance = json.loads(args.provenance)
+        except json.JSONDecodeError as exc:
+            _die(f"Invalid --provenance JSON: {exc}")
+    try:
+        policy = create_activation_policy(
+            db_path=args.db,
+            name=args.name,
+            trigger_class=args.trigger_class,
+            trigger_conditions=conditions,
+            created_by=args.created_by,
+            reason=args.reason,
+            priority=args.priority,
+            policy_version=args.policy_version,
+            provenance=provenance,
+        )
+    except (ActivationPolicyValidationError, ValueError) as exc:
+        _die(str(exc))
+    print(f"created policy id={policy.id} name={policy.name!r} status={policy.status}")
+
+
+def cmd_activation_policy_list(args: argparse.Namespace) -> None:
+    from session.activation_policy import list_activation_policies
+    policies = list_activation_policies(
+        db_path=args.db,
+        status=args.status,
+        trigger_class=args.trigger_class,
+        limit=args.limit,
+    )
+    if not policies:
+        print("No activation policies found.")
+        return
+    header = f"{'id':>4}  {'name':<30}  {'trigger_class':<26}  {'status':<12}  {'priority':>8}  created_at"
+    print(header)
+    print('-' * len(header))
+    for p in policies:
+        activated = p.activated_at or '—'
+        print(
+            f"{p.id:>4}  {p.name:<30}  {p.trigger_class:<26}  {p.status:<12}  "
+            f"{p.priority:>8}  {p.created_at}"
+        )
+
+
+def cmd_activation_policy_inspect(args: argparse.Namespace) -> None:
+    from session.activation_policy import get_activation_policy, list_activation_decisions
+    try:
+        policy = get_activation_policy(args.db, args.id)
+    except ValueError as exc:
+        _die(str(exc))
+
+    print(json.dumps(policy.to_dict(), indent=2, sort_keys=True))
+
+    decisions = list_activation_decisions(args.db, policy_id=policy.id, limit=5)
+    if decisions:
+        print(f"\nLast {len(decisions)} decision(s):")
+        for d in decisions:
+            print(
+                f"  decision_id={d['id']}  fired={bool(d['fired'])}  "
+                f"reason={d['detection_reason']!r}  detected_at={d['detected_at']}"
+            )
+    else:
+        print("\nNo decisions logged for this policy.")
+
+
+def cmd_activation_policy_activate(args: argparse.Namespace) -> None:
+    from session.activation_policy import (
+        activate_activation_policy,
+        ActivationPolicyLifecycleError,
+    )
+    if not args.operator or not args.operator.strip():
+        _die("--operator must not be empty")
+    if not args.reason or not args.reason.strip():
+        _die("--reason must not be empty")
+    try:
+        policy = activate_activation_policy(
+            db_path=args.db,
+            policy_id=args.id,
+            activated_by=args.operator,
+            reason=args.reason,
+        )
+    except (ActivationPolicyLifecycleError, ValueError) as exc:
+        _die(str(exc))
+    print(f"activated policy id={policy.id} at={policy.activated_at}")
+
+
+def cmd_activation_policy_supersede(args: argparse.Namespace) -> None:
+    from session.activation_policy import (
+        supersede_activation_policy,
+        ActivationPolicyLifecycleError,
+    )
+    if not args.operator or not args.operator.strip():
+        _die("--operator must not be empty")
+    if not args.reason or not args.reason.strip():
+        _die("--reason must not be empty")
+    try:
+        policy = supersede_activation_policy(
+            db_path=args.db,
+            policy_id=args.id,
+            superseded_by_operator=args.operator,
+            reason=args.reason,
+            superseded_by_policy_id=args.successor_id,
+        )
+    except (ActivationPolicyLifecycleError, ValueError) as exc:
+        _die(str(exc))
+    print(f"superseded policy id={policy.id} at={policy.superseded_at}")
+
+
+def cmd_activation_policy_decisions(args: argparse.Namespace) -> None:
+    from session.activation_policy import list_activation_decisions
+    decisions = list_activation_decisions(
+        db_path=args.db,
+        policy_id=args.id,
+        fired_only=args.fired_only,
+        limit=args.limit,
+    )
+    if not decisions:
+        print("No decisions found.")
+        return
+    header = f"{'decision_id':>12}  {'fired':>5}  {'trigger_class':<26}  {'detected_at':<22}  reason"
+    print(header)
+    print('-' * 100)
+    for d in decisions:
+        print(
+            f"{d['id']:>12}  {str(bool(d['fired'])):>5}  {d['trigger_class']:<26}  "
+            f"{d['detected_at']:<22}  {d['detection_reason']}"
+        )
+
+
+def cmd_activation_policy_replay(args: argparse.Namespace) -> None:
+    """Replay a historical activation decision. Read-only. Never writes."""
+    from session.activation_policy import replay_activation_decision, evaluate_trigger
+    try:
+        replayed = replay_activation_decision(args.db, args.id)
+    except ValueError as exc:
+        _die(str(exc))
+
+    # Re-evaluate using the snapshot to detect determinism divergence.
+    # evaluate_trigger() is pure — no writes, no reads.
+    re_result = evaluate_trigger(replayed.policy_snapshot, replayed.trigger_event)
+
+    divergence = (re_result.fired != replayed.fired)
+
+    print(f"decision_id={replayed.decision_id}")
+    print(f"policy_id={replayed.policy_snapshot.id} name={replayed.policy_snapshot.name!r}")
+    print(f"trigger_class={replayed.trigger_class}")
+    print(f"detected_at={replayed.detected_at}")
+    print()
+    print(f"original  fired={replayed.fired}  reason={replayed.detection_reason!r}")
+    print(f"replayed  fired={re_result.fired}  reason={re_result.detection_reason!r}")
+
+    if divergence:
+        print()
+        print("DIVERGENCE DETECTED: original and replayed fired values differ.")
+        print("This indicates non-determinism in trigger evaluation. Investigate the policy snapshot.")
+    else:
+        print()
+        print("deterministic: original and replayed results match.")
+
+    if replayed.resulting_assembly_id is not None:
+        print(f"resulting_assembly_id={replayed.resulting_assembly_id}")
+    if replayed.resulting_retrieval_id is not None:
+        print(f"resulting_retrieval_id={replayed.resulting_retrieval_id}")
+    if replayed.resulting_transition_id is not None:
+        print(f"resulting_transition_id={replayed.resulting_transition_id}")
+
+
+# ---------------------------------------------------------------------------
 # parser
 # ---------------------------------------------------------------------------
 
@@ -663,6 +846,13 @@ _COMMANDS = {
     'show-compression-artifact': cmd_show_compression_artifact,
     'supersede-compression-artifact': cmd_supersede_compression_artifact,
     'list-supersession-chain': cmd_list_supersession_chain,
+    'activation-policy-create': cmd_activation_policy_create,
+    'activation-policy-list': cmd_activation_policy_list,
+    'activation-policy-inspect': cmd_activation_policy_inspect,
+    'activation-policy-activate': cmd_activation_policy_activate,
+    'activation-policy-supersede': cmd_activation_policy_supersede,
+    'activation-policy-decisions': cmd_activation_policy_decisions,
+    'activation-policy-replay': cmd_activation_policy_replay,
 }
 
 
@@ -984,6 +1174,71 @@ def build_parser() -> argparse.ArgumentParser:
                            help='Walk the supersession chain from a root artifact (JSON output)')
     p_lsc.add_argument('--id', required=True, type=int,
                        help='Root artifact id (oldest in chain)')
+
+    # activation-policy-create
+    from session.activation_policy import VALID_POLICY_STATUSES
+    from session.models import VALID_TRIGGER_CLASSES
+    p_apc = sub.add_parser('activation-policy-create', parents=[_db],
+                           help='Create a candidate activation policy')
+    p_apc.add_argument('--name', required=True, help='Policy name')
+    p_apc.add_argument('--trigger-class', required=True, dest='trigger_class',
+                       choices=sorted(VALID_TRIGGER_CLASSES),
+                       help='Trigger class')
+    p_apc.add_argument('--created-by', required=True, dest='created_by',
+                       help='Operator creating this policy')
+    p_apc.add_argument('--reason', required=True, help='Reason for creating this policy')
+    p_apc.add_argument('--conditions', default=None,
+                       help='Trigger conditions as JSON object (optional)')
+    p_apc.add_argument('--priority', type=int, default=100,
+                       help='Priority (lower = higher priority; default: 100)')
+    p_apc.add_argument('--policy-version', dest='policy_version', default='1.0.0',
+                       help='Policy version string (default: 1.0.0)')
+    p_apc.add_argument('--provenance', default=None,
+                       help='Provenance metadata as JSON object (optional)')
+
+    # activation-policy-list
+    p_apl = sub.add_parser('activation-policy-list', parents=[_db],
+                           help='List activation policies')
+    p_apl.add_argument('--status', choices=sorted(VALID_POLICY_STATUSES), default=None,
+                       help='Filter by status')
+    p_apl.add_argument('--trigger-class', dest='trigger_class',
+                       choices=sorted(VALID_TRIGGER_CLASSES), default=None,
+                       help='Filter by trigger class')
+    p_apl.add_argument('--limit', type=int, default=50, help='Max results (default: 50)')
+
+    # activation-policy-inspect
+    p_api = sub.add_parser('activation-policy-inspect', parents=[_db],
+                           help='Show full activation policy row and recent decisions')
+    p_api.add_argument('--id', required=True, type=int, help='Activation policy id')
+
+    # activation-policy-activate
+    p_apa = sub.add_parser('activation-policy-activate', parents=[_db],
+                           help='Transition an activation policy from candidate to active')
+    p_apa.add_argument('--id', required=True, type=int, help='Activation policy id')
+    p_apa.add_argument('--operator', required=True, help='Operator activating this policy')
+    p_apa.add_argument('--reason', required=True, help='Reason for activation')
+
+    # activation-policy-supersede
+    p_aps = sub.add_parser('activation-policy-supersede', parents=[_db],
+                           help='Transition an active activation policy to superseded')
+    p_aps.add_argument('--id', required=True, type=int, help='Activation policy id')
+    p_aps.add_argument('--operator', required=True, help='Operator superseding this policy')
+    p_aps.add_argument('--reason', required=True, help='Reason for supersession')
+    p_aps.add_argument('--successor-id', dest='successor_id', type=int, default=None,
+                       help='Id of the replacement policy (optional)')
+
+    # activation-policy-decisions
+    p_apd = sub.add_parser('activation-policy-decisions', parents=[_db],
+                           help='List activation decisions for a policy')
+    p_apd.add_argument('--id', required=True, type=int, help='Activation policy id')
+    p_apd.add_argument('--fired-only', dest='fired_only', action='store_true',
+                       help='Only show decisions where fired=True')
+    p_apd.add_argument('--limit', type=int, default=20, help='Max results (default: 20)')
+
+    # activation-policy-replay
+    p_apr = sub.add_parser('activation-policy-replay', parents=[_db],
+                           help='Replay a historical activation decision (read-only, never writes)')
+    p_apr.add_argument('--id', required=True, type=int, help='Activation decision id')
 
     return parser
 
