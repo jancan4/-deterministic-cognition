@@ -517,6 +517,91 @@ def cmd_replay_session_timeline(args: argparse.Namespace) -> None:
     ))
 
 
+def cmd_create_compression_artifact(args: argparse.Namespace) -> None:
+    from .compression import create_compression_artifact
+    from .artifact_governance import GovernanceInvalidationError
+    provenance = None
+    if args.provenance_json:
+        try:
+            provenance = json.loads(args.provenance_json)
+        except json.JSONDecodeError as exc:
+            _die(f"Invalid --provenance-json: {exc}")
+    excluded_ids: List[int] = []
+    if args.excluded_event_ids:
+        try:
+            excluded_ids = [int(x.strip()) for x in args.excluded_event_ids.split(',') if x.strip()]
+        except ValueError:
+            _die("--excluded-event-ids must be comma-separated integers")
+    try:
+        artifact = create_compression_artifact(
+            db_path=args.db,
+            source_assembly_id=args.assembly_id,
+            compression_method=args.method,
+            producer_version=args.producer_version,
+            artifact_text=args.artifact_text,
+            created_by=args.created_by,
+            cognition_session_id=args.session_id,
+            compression_confidence=args.compression_confidence,
+            excluded_event_ids=excluded_ids,
+            unresolved_issue_count=args.unresolved_issue_count,
+            provenance=provenance,
+        )
+    except (ValueError, GovernanceInvalidationError) as exc:
+        _die(str(exc))
+    print(json.dumps(artifact.to_dict(), indent=2, sort_keys=True))
+
+
+def cmd_promote_compression_artifact(args: argparse.Namespace) -> None:
+    from .compression import promote_compression_artifact
+    from .artifact_governance import GovernanceInvalidationError
+    try:
+        artifact = promote_compression_artifact(
+            db_path=args.db,
+            artifact_id=args.id,
+            promoted_by=args.promoted_by,
+            promotion_notes=args.promotion_notes,
+        )
+    except (ValueError, GovernanceInvalidationError) as exc:
+        _die(str(exc))
+    print(json.dumps(artifact.to_dict(), indent=2, sort_keys=True))
+
+
+def cmd_invalidate_compression_artifact(args: argparse.Namespace) -> None:
+    from .compression import invalidate_compression_artifact
+    from .artifact_governance import GovernanceInvalidationError
+    try:
+        artifact = invalidate_compression_artifact(
+            db_path=args.db,
+            artifact_id=args.id,
+            reason=args.reason,
+            invalidated_by=args.invalidated_by,
+        )
+    except (ValueError, GovernanceInvalidationError) as exc:
+        _die(str(exc))
+    print(json.dumps(artifact.to_dict(), indent=2, sort_keys=True))
+
+
+def cmd_list_compression_artifacts(args: argparse.Namespace) -> None:
+    from .compression import list_compression_artifacts
+    artifacts = list_compression_artifacts(
+        db_path=args.db,
+        status=args.status,
+        compression_method=args.method,
+        source_assembly_id=args.assembly_id,
+        limit=args.limit,
+    )
+    print(json.dumps([a.to_dict() for a in artifacts], indent=2, sort_keys=True))
+
+
+def cmd_show_compression_artifact(args: argparse.Namespace) -> None:
+    from .compression import get_compression_artifact
+    try:
+        artifact = get_compression_artifact(args.db, args.id)
+    except ValueError as exc:
+        _die(str(exc))
+    print(json.dumps(artifact.to_dict(), indent=2, sort_keys=True))
+
+
 # ---------------------------------------------------------------------------
 # parser
 # ---------------------------------------------------------------------------
@@ -547,6 +632,11 @@ _COMMANDS = {
     'list-sessions': cmd_list_sessions,
     'show-session': cmd_show_session,
     'replay-session-timeline': cmd_replay_session_timeline,
+    'create-compression-artifact': cmd_create_compression_artifact,
+    'promote-compression-artifact': cmd_promote_compression_artifact,
+    'invalidate-compression-artifact': cmd_invalidate_compression_artifact,
+    'list-compression-artifacts': cmd_list_compression_artifacts,
+    'show-compression-artifact': cmd_show_compression_artifact,
 }
 
 
@@ -789,6 +879,67 @@ def build_parser() -> argparse.ArgumentParser:
     p_rst = sub.add_parser('replay-session-timeline', parents=[_db],
                            help='Replay all assemblies in a cognition session (JSON output)')
     p_rst.add_argument('--id', required=True, type=int, help='Cognition session id')
+
+    # create-compression-artifact
+    p_cca = sub.add_parser('create-compression-artifact', parents=[_db],
+                           help='Create a governed compression artifact (status=candidate)')
+    p_cca.add_argument('--assembly-id', required=True, type=int, dest='assembly_id',
+                       help='Source context_assembly_log id')
+    p_cca.add_argument('--method', required=True,
+                       help='Compression method identifier (e.g. "extractive_summary_v1")')
+    p_cca.add_argument('--producer-version', required=True, dest='producer_version',
+                       help='Algorithm version that produced this artifact')
+    p_cca.add_argument('--artifact-text', required=True, dest='artifact_text',
+                       help='Compressed artifact text')
+    p_cca.add_argument('--created-by', required=True, dest='created_by',
+                       help='Actor creating this artifact')
+    p_cca.add_argument('--session-id', dest='session_id', type=int, default=None,
+                       help='Cognition session id to attach to (optional)')
+    p_cca.add_argument('--compression-confidence', dest='compression_confidence',
+                       type=int, default=None, choices=list(range(1, 6)),
+                       help='Operator confidence in compression quality (1–5, optional)')
+    p_cca.add_argument('--excluded-event-ids', dest='excluded_event_ids', default=None,
+                       help='Comma-separated memory event ids excluded from assembly (optional)')
+    p_cca.add_argument('--unresolved-issue-count', dest='unresolved_issue_count',
+                       type=int, default=0,
+                       help='Count of unresolved governance issues at compression time (default: 0)')
+    p_cca.add_argument('--provenance-json', dest='provenance_json', default=None,
+                       help='Arbitrary provenance dict as JSON (optional)')
+
+    # promote-compression-artifact
+    p_pca = sub.add_parser('promote-compression-artifact', parents=[_db],
+                           help='Promote a candidate compression artifact to active')
+    p_pca.add_argument('--id', required=True, type=int, help='Compression artifact id')
+    p_pca.add_argument('--promoted-by', required=True, dest='promoted_by',
+                       help='Operator promoting this artifact')
+    p_pca.add_argument('--promotion-notes', required=True, dest='promotion_notes',
+                       help='Notes explaining the promotion decision')
+
+    # invalidate-compression-artifact
+    p_ica = sub.add_parser('invalidate-compression-artifact', parents=[_db],
+                           help='Invalidate a candidate or active compression artifact')
+    p_ica.add_argument('--id', required=True, type=int, help='Compression artifact id')
+    p_ica.add_argument('--reason', required=True,
+                       help='Reason for invalidation')
+    p_ica.add_argument('--invalidated-by', required=True, dest='invalidated_by',
+                       help='Actor invalidating this artifact')
+
+    # list-compression-artifacts
+    p_lca = sub.add_parser('list-compression-artifacts', parents=[_db],
+                           help='List compression artifacts with optional filters (JSON output)')
+    p_lca.add_argument('--status', choices=['candidate', 'active', 'superseded', 'invalidated'],
+                       default=None, help='Filter by status')
+    p_lca.add_argument('--method', default=None,
+                       help='Filter by compression method')
+    p_lca.add_argument('--assembly-id', dest='assembly_id', type=int, default=None,
+                       help='Filter by source assembly id')
+    p_lca.add_argument('--limit', type=int, default=50,
+                       help='Max results to return (default: 50)')
+
+    # show-compression-artifact
+    p_sca = sub.add_parser('show-compression-artifact', parents=[_db],
+                           help='Show one compression artifact by id (JSON output)')
+    p_sca.add_argument('--id', required=True, type=int, help='Compression artifact id')
 
     return parser
 

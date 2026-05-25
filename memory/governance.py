@@ -812,6 +812,83 @@ def detect_duplicate_active_sessions(db_path: str) -> List[GovernanceIssue]:
 
 
 # ---------------------------------------------------------------------------
+# Compression artifact governance
+# ---------------------------------------------------------------------------
+
+COMPRESSION_CANDIDATE_WARNING_DAYS = 7
+COMPRESSION_CANDIDATE_CRITICAL_DAYS = 30
+
+
+def _compression_artifacts_table_exists(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='compression_artifacts'"
+    ).fetchone() is not None
+
+
+def detect_unreviewed_compression_candidates(
+    db_path: str,
+    warning_days: int = COMPRESSION_CANDIDATE_WARNING_DAYS,
+    critical_days: int = COMPRESSION_CANDIDATE_CRITICAL_DAYS,
+) -> List[GovernanceIssue]:
+    """Compression artifacts in 'candidate' status older than warning_days."""
+    warning_cutoff = _cutoff(warning_days)
+    critical_cutoff = _cutoff(critical_days)
+    issues: List[GovernanceIssue] = []
+
+    conn = _connect(db_path)
+    try:
+        if not _compression_artifacts_table_exists(conn):
+            return issues
+        rows = conn.execute(
+            """
+            SELECT id, source_assembly_id, compression_method, producer_version,
+                   generated_at, artifact_char_count
+            FROM compression_artifacts
+            WHERE status = 'candidate'
+              AND generated_at < ?
+            ORDER BY generated_at ASC
+            """,
+            (warning_cutoff,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        if row['generated_at'] < critical_cutoff:
+            severity = 'critical'
+            days_label = f'more than {critical_days} days'
+        else:
+            severity = 'warning'
+            days_label = f'more than {warning_days} days'
+
+        issues.append(GovernanceIssue(
+            issue_type='unreviewed_compression_candidate',
+            severity=severity,
+            memory_id=0,
+            title=f"Unreviewed compression artifact id={row['id']}",
+            rationale=(
+                f"Compression artifact id={row['id']} (method={row['compression_method']!r}, "
+                f"assembly={row['source_assembly_id']}) has been in 'candidate' status for "
+                f"{days_label}. Generated: {row['generated_at']}."
+            ),
+            recommended_action=(
+                'Review the compression artifact and either promote it via '
+                'promote_compression_artifact() or invalidate it via '
+                'invalidate_compression_artifact().'
+            ),
+            metadata={
+                'artifact_id': row['id'],
+                'source_assembly_id': row['source_assembly_id'],
+                'compression_method': row['compression_method'],
+                'producer_version': row['producer_version'],
+                'generated_at': row['generated_at'],
+                'artifact_char_count': row['artifact_char_count'],
+            },
+        ))
+    return issues
+
+
+# ---------------------------------------------------------------------------
 # Governance report
 # ---------------------------------------------------------------------------
 
@@ -832,6 +909,8 @@ def build_governance_report(
     session_stale_warning_days: int = SESSION_STALE_WARNING_DAYS,
     session_stale_critical_days: int = SESSION_STALE_CRITICAL_DAYS,
     session_abandoned_threshold_days: int = SESSION_ABANDONED_THRESHOLD_DAYS,
+    compression_warning_days: int = COMPRESSION_CANDIDATE_WARNING_DAYS,
+    compression_critical_days: int = COMPRESSION_CANDIDATE_CRITICAL_DAYS,
 ) -> GovernanceReport:
     """Run all governance checks and return a deterministically sorted report.
 
@@ -859,6 +938,7 @@ def build_governance_report(
     issues.extend(detect_stale_sessions(db_path, session_stale_warning_days, session_stale_critical_days))
     issues.extend(detect_abandoned_sessions(db_path, session_abandoned_threshold_days))
     issues.extend(detect_duplicate_active_sessions(db_path))
+    issues.extend(detect_unreviewed_compression_candidates(db_path, compression_warning_days, compression_critical_days))
 
     issues.sort(key=lambda i: (_SEVERITY_ORDER[i.severity], i.issue_type, i.memory_id))
 

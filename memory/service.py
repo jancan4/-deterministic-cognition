@@ -12,7 +12,7 @@ from .models import (
 )
 
 _SCHEMA = Path(__file__).parent / 'schema.sql'
-_MEMORY_SCHEMA_VERSION = 10
+_MEMORY_SCHEMA_VERSION = 11
 
 
 class ValidationError(ValueError):
@@ -44,6 +44,32 @@ def _validate_confidence(confidence: int) -> None:
         raise ValidationError(
             f"confidence must be {CONFIDENCE_MIN}–{CONFIDENCE_MAX}, got {confidence}"
         )
+
+
+def _migrate_to_v11(conn: sqlite3.Connection) -> None:
+    # compression_artifacts was added to schema.sql in v11. The table is created
+    # by executescript() via CREATE TABLE IF NOT EXISTS. This function
+    # idempotently ensures all operational indices exist.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_compression_source_assembly "
+        "ON compression_artifacts(source_assembly_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_compression_status "
+        "ON compression_artifacts(status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_compression_session "
+        "ON compression_artifacts(cognition_session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_compression_method "
+        "ON compression_artifacts(compression_method)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_compression_generated_at "
+        "ON compression_artifacts(generated_at)"
+    )
 
 
 def _migrate_to_v10(conn: sqlite3.Connection) -> None:
@@ -232,6 +258,7 @@ def init_db(db_path: str) -> None:
             _migrate_to_v8(conn)
             _migrate_to_v9(conn)
             _migrate_to_v10(conn)
+            _migrate_to_v11(conn)
             conn.execute(
                 'INSERT INTO memory_schema_version (version) VALUES (?)',
                 (_MEMORY_SCHEMA_VERSION,)
@@ -253,6 +280,8 @@ def init_db(db_path: str) -> None:
                 _migrate_to_v9(conn)
             if row['version'] < 10:
                 _migrate_to_v10(conn)
+            if row['version'] < 11:
+                _migrate_to_v11(conn)
             conn.execute(
                 'UPDATE memory_schema_version SET version = ?',
                 (_MEMORY_SCHEMA_VERSION,)

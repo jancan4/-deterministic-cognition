@@ -223,3 +223,52 @@ CREATE TABLE IF NOT EXISTS assembly_transition_log (
 );
 -- Indices for cognition_session and assembly_transition_log are created by
 -- _migrate_to_v10() in service.py.
+
+CREATE TABLE IF NOT EXISTS compression_artifacts (
+    id                                 INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    -- Source attachment
+    source_assembly_id                 INTEGER NOT NULL,
+    source_assembly_hash               TEXT    NOT NULL,
+    cognition_session_id               INTEGER,
+
+    -- Compression parameters
+    compression_method                 TEXT    NOT NULL CHECK (compression_method != ''),
+    producer_version                   TEXT    NOT NULL CHECK (producer_version != ''),
+
+    -- Output
+    artifact_text                      TEXT    NOT NULL CHECK (artifact_text != ''),
+    artifact_char_count                INTEGER NOT NULL,
+
+    -- Source provenance snapshot (captured deterministically at creation time)
+    source_memory_event_ids_json       TEXT    NOT NULL DEFAULT '[]',
+    source_contradiction_link_ids_json TEXT    NOT NULL DEFAULT '[]',
+    confidence_snapshot_json           TEXT    NOT NULL DEFAULT '{}',
+    excluded_event_ids_json            TEXT    NOT NULL DEFAULT '[]',
+    unresolved_issue_count             INTEGER NOT NULL DEFAULT 0,
+
+    -- Compression confidence (operator judgment, 1–5, optional)
+    compression_confidence             INTEGER CHECK (
+                                           compression_confidence IS NULL
+                                           OR (compression_confidence >= 1
+                                               AND compression_confidence <= 5)
+                                       ),
+
+    -- Governance lifecycle (Tier 3 artifact contract)
+    status                             TEXT    NOT NULL DEFAULT 'candidate',
+    generated_at                       TEXT    NOT NULL,
+    invalidated_at                     TEXT,
+    invalidated_reason                 TEXT,
+
+    -- Operator review
+    promoted_by                        TEXT,
+    promoted_at                        TEXT,
+    promotion_notes                    TEXT,
+
+    -- Provenance metadata
+    provenance_json                    TEXT    NOT NULL DEFAULT '{}',
+
+    FOREIGN KEY (source_assembly_id)   REFERENCES context_assembly_log(id),
+    FOREIGN KEY (cognition_session_id) REFERENCES cognition_session(id)
+);
+-- Indices for compression_artifacts are created by _migrate_to_v11() in service.py.

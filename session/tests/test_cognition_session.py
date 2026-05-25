@@ -111,12 +111,12 @@ def _v9_db(tmp_path, name: str = 'v9.db') -> str:
 # ---------------------------------------------------------------------------
 
 class TestSchemaV10:
-    def test_fresh_db_schema_version_10(self, tmp_path):
+    def test_fresh_db_schema_version_11(self, tmp_path):
         db = _mem_db(tmp_path)
         conn = sqlite3.connect(db)
         version = conn.execute('SELECT version FROM memory_schema_version').fetchone()[0]
         conn.close()
-        assert version == 10
+        assert version == 11
 
     def test_cognition_session_table_exists(self, tmp_path):
         db = _mem_db(tmp_path)

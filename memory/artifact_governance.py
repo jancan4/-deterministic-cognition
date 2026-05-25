@@ -88,6 +88,7 @@ EMBEDDING_VISIBLE_FIELDS_VERSION: str = '1'
 # Tables in this set MUST have: status, invalidated_at, invalidated_reason columns.
 _GOVERNED_ARTIFACT_TABLES: FrozenSet[str] = frozenset({
     'event_embeddings',
+    'compression_artifacts',
 })
 
 # Valid source statuses for mark_invalidated (candidate or active).
