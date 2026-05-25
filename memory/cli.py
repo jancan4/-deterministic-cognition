@@ -1006,6 +1006,83 @@ def cmd_activation_policy_replay(args: argparse.Namespace) -> None:
         print(f"resulting_transition_id={replayed.resulting_transition_id}")
 
 
+def cmd_activation_policy_execute(args: argparse.Namespace) -> None:
+    """Execute an active activation policy: evaluate, assemble, and log decision."""
+    from session.execution import execute_activation_policy
+    from session.models import ContextActivationPolicy
+
+    try:
+        trigger_event = json.loads(args.trigger_event)
+    except (json.JSONDecodeError, TypeError) as exc:
+        _die(f"--trigger-event is not valid JSON: {exc}")
+
+    tags = [t.strip() for t in args.tags.split(',')] if args.tags else []
+    context_policy = ContextActivationPolicy(
+        tags=tags,
+        min_confidence=args.min_confidence,
+    )
+
+    try:
+        result = execute_activation_policy(
+            args.db,
+            args.id,
+            trigger_event,
+            context_policy,
+            cognition_session_id=args.session_id,
+            triggered_by=args.triggered_by,
+            transition_reason=args.reason or '',
+            log_non_firing=args.log_non_firing,
+        )
+    except (ValueError, TypeError) as exc:
+        _die(str(exc))
+
+    print(f"policy_id={result.policy_id}")
+    print(f"fired={result.fired}")
+    print(f"detection_reason={result.detection_reason!r}")
+
+    if result.fired:
+        print(f"decision_id={result.decision_id}")
+        print(f"resulting_assembly_id={result.resulting_assembly_id}")
+        if result.resulting_transition_id is not None:
+            print(f"resulting_transition_id={result.resulting_transition_id}")
+        else:
+            print("resulting_transition_id=None")
+        if result.triggering_artifact_ids:
+            print(f"triggering_artifact_ids={result.triggering_artifact_ids}")
+        if result.transition_error is not None:
+            print(f"WARNING: transition logging failed: {result.transition_error}",
+                  file=sys.stderr)
+    elif result.decision_id is not None:
+        print(f"decision_id={result.decision_id} (non-firing, logged)")
+    else:
+        print("no decision logged (use --log-non-firing to log non-firing decisions)")
+
+
+def cmd_activation_policy_evaluate(args: argparse.Namespace) -> None:
+    """Dry-run evaluate an activation policy trigger. Zero DB writes."""
+    from session.activation_policy import evaluate_trigger, get_activation_policy
+
+    try:
+        trigger_event = json.loads(args.trigger_event)
+    except (json.JSONDecodeError, TypeError) as exc:
+        _die(f"--trigger-event is not valid JSON: {exc}")
+
+    try:
+        policy = get_activation_policy(args.db, args.id)
+    except ValueError as exc:
+        _die(str(exc))
+
+    result = evaluate_trigger(policy, trigger_event)
+
+    print(f"policy_id={policy.id}  name={policy.name!r}  status={policy.status!r}")
+    print(f"trigger_class={result.trigger_class}")
+    print(f"fired={result.fired}")
+    print(f"detection_reason={result.detection_reason!r}")
+    if result.triggering_artifact_ids:
+        print(f"triggering_artifact_ids={result.triggering_artifact_ids}")
+    print("[dry-run: zero DB writes]")
+
+
 # ---------------------------------------------------------------------------
 # parser
 # ---------------------------------------------------------------------------
@@ -1060,6 +1137,8 @@ _COMMANDS = {
     'activation-policy-supersede': cmd_activation_policy_supersede,
     'activation-policy-decisions': cmd_activation_policy_decisions,
     'activation-policy-replay': cmd_activation_policy_replay,
+    'activation-policy-execute': cmd_activation_policy_execute,
+    'activation-policy-evaluate': cmd_activation_policy_evaluate,
 }
 
 
@@ -1541,6 +1620,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_apr = sub.add_parser('activation-policy-replay', parents=[_db],
                            help='Replay a historical activation decision (read-only, never writes)')
     p_apr.add_argument('--id', required=True, type=int, help='Activation decision id')
+
+    # activation-policy-execute
+    p_apex = sub.add_parser('activation-policy-execute', parents=[_db],
+                            help='Evaluate and execute an active activation policy')
+    p_apex.add_argument('--id', required=True, type=int, help='Activation policy id')
+    p_apex.add_argument('--trigger-event', required=True, dest='trigger_event',
+                        metavar='JSON', help='Trigger context as a JSON object')
+    p_apex.add_argument('--triggered-by', required=True, dest='triggered_by',
+                        help='Actor initiating execution')
+    p_apex.add_argument('--reason', default='', help='Reason for this execution (optional)')
+    p_apex.add_argument('--session-id', dest='session_id', type=int, default=None,
+                        help='Cognition session id to log transition into (optional)')
+    p_apex.add_argument('--tags', default='',
+                        help='Comma-separated tags for retrieval scope (optional)')
+    p_apex.add_argument('--min-confidence', dest='min_confidence', type=int, default=1,
+                        help='Minimum confidence for retrieval (default: 1)')
+    p_apex.add_argument('--log-non-firing', dest='log_non_firing', action='store_true',
+                        help='Log a decision row even when fired=False')
+
+    # activation-policy-evaluate
+    p_apev = sub.add_parser('activation-policy-evaluate', parents=[_db],
+                            help='Dry-run evaluate a policy trigger — zero DB writes')
+    p_apev.add_argument('--id', required=True, type=int, help='Activation policy id')
+    p_apev.add_argument('--trigger-event', required=True, dest='trigger_event',
+                        metavar='JSON', help='Trigger context as a JSON object')
 
     return parser
 
