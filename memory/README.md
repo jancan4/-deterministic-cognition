@@ -2,6 +2,9 @@
 
 Deterministic, SQLite-backed institutional memory for the FX systems project.
 
+> **Extended documentation:**  
+> This README covers the original memory layer (schema v1 through v3: `memory_events`, `memory_revisions`, `memory_links`). The full CLI reference including sessions, compression, ontology, activation policy, and governance verification commands is in `docs/CLI_REFERENCE.md`. Schema history through v16 is in `docs/SCHEMA_HISTORY.md`. Operator workflows are in `docs/OPERATOR_GUIDE.md`.
+
 ---
 
 ## Architecture

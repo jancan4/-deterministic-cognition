@@ -158,6 +158,76 @@ Filtering does not suppress the governance report. Callers are responsible for r
 
 ---
 
+## Operational Governance Verification (Phase 9A)
+
+Phase 9A extended the governance layer with three read-only detectors that verify structural integrity of the execution lineage — the relationships between cognition sessions, context assemblies, activation decisions, and activation log transitions. These detectors operate on live database state and are always read-only.
+
+### Detectors
+
+#### `detect_fired_decisions_without_assembly(db_path) -> List[dict]`
+
+Scans `activation_decision_log` for rows with a fire outcome that have no associated context assembly record. An activation decision that fired without an assembly record indicates either a missing assembly row or a decision that bypassed the standard assembly pathway. Returns a list of raw decision rows that lack a linked assembly.
+
+Table guard: if `activation_decision_log` or `context_assembly_log` is absent, returns an empty list without error.
+
+#### `detect_orphaned_transitions(db_path) -> List[dict]`
+
+Scans `activation_log_transitions` for rows whose `cognition_session_id` does not reference any row in `cognition_sessions`. An orphaned transition indicates a transition recorded against a session that no longer exists or was never committed. Returns a list of raw transition rows with no valid session parent.
+
+Table guard: if either table is absent, returns an empty list without error.
+
+#### `check_lineage_integrity(db_path) -> LineageIntegrityReport`
+
+Runs four foreign-key checks and returns a `LineageIntegrityReport`:
+
+| Check | Description |
+|---|---|
+| `activation_decisions_without_assembly` | Fired decisions with no assembly record |
+| `orphaned_transitions` | Transitions with no parent session |
+| `assemblies_without_session` | Assembly records with no parent session |
+| `decisions_without_session` | Decision records with no parent session |
+
+`LineageIntegrityReport` fields: `checked` (bool), `all_ok` (bool), `broken_count` (int), `details` (list of per-check result dicts).
+
+### Integration with `build_governance_report`
+
+```python
+build_governance_report(
+    db_path,
+    ...,
+    detect_execution_lineage_issues=True,   # default True
+)
+```
+
+When `detect_execution_lineage_issues=True`, `build_governance_report` runs `check_lineage_integrity` and appends a `governance_issue` for each broken FK relationship found. The issue carries `severity='critical'`, `issue_type='lineage_integrity_broken'`, and a `rationale` identifying which check failed and how many rows were affected.
+
+### Governance Verification CLI Commands
+
+| Command | Description |
+|---|---|
+| `governance-report` | Run `build_governance_report` and print the full issue list. `--format json` produces machine-readable output. |
+| `verify-assembly` | Run `verify_context_assembly_divergence` for one assembly and report divergence details. |
+| `verify-session` | Run `verify_session_timeline_divergence` for one session and report divergence details. |
+| `lineage-integrity` | Run `check_lineage_integrity` and report broken FK counts and details. Always read-only. |
+
+All four commands are read-only. None mutate database state under any circumstances.
+
+#### Usage
+
+```bash
+python -m memory.cli governance-report --db memory.db
+python -m memory.cli governance-report --db memory.db --format json
+
+python -m memory.cli verify-assembly --db memory.db --assembly-id 7
+python -m memory.cli verify-session --db memory.db --session-id 3
+
+python -m memory.cli lineage-integrity --db memory.db
+```
+
+`lineage-integrity` exits with code 0 when all checks pass, code 1 when any broken relationship is found.
+
+---
+
 ## Future Governance Extensions
 
 **Confidence decay schedule**  
