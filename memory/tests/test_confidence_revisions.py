@@ -71,12 +71,12 @@ def _raw(db, sql, params=()):
 # ---------------------------------------------------------------------------
 
 class TestSchemaV9Migration:
-    def test_fresh_db_schema_version_14(self, tmp_path):
+    def test_fresh_db_schema_version_15(self, tmp_path):
         db = _db(tmp_path)
         conn = sqlite3.connect(db)
         version = conn.execute('SELECT version FROM memory_schema_version').fetchone()[0]
         conn.close()
-        assert version == 14
+        assert version == 15
 
     def test_confidence_revisions_table_exists(self, tmp_path):
         db = _db(tmp_path)
@@ -190,7 +190,7 @@ class TestSchemaV9Migration:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         conn.close()
 
-        assert version == 14
+        assert version == 15
         assert 'confidence_revisions' in tables
 
     def test_migration_idempotent(self, tmp_path):
@@ -199,7 +199,7 @@ class TestSchemaV9Migration:
         conn = sqlite3.connect(db)
         version = conn.execute('SELECT version FROM memory_schema_version').fetchone()[0]
         conn.close()
-        assert version == 14
+        assert version == 15
 
 
 # ---------------------------------------------------------------------------

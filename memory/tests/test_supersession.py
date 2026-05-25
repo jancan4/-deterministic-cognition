@@ -140,11 +140,11 @@ def _make_candidate_artifact(db_path: str) -> CompressionArtifact:
 # ---------------------------------------------------------------------------
 
 class TestSchemaV13:
-    def test_schema_version_is_14(self, db):
+    def test_schema_version_is_15(self, db):
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 14
+        assert row[0] == 15
 
     def test_v13_columns_exist(self, db):
         conn = sqlite3.connect(db)
@@ -160,7 +160,7 @@ class TestSchemaV13:
         conn.close()
         assert 'idx_compression_superseded_at' in indices
 
-    def test_v12_db_migrates_to_v14(self, tmp_path):
+    def test_v12_db_migrates_to_v15(self, tmp_path):
         """A DB at version 12 gains v13 columns when init_db() is called."""
         from memory.service import _connect
         db_path = str(tmp_path / 'v12.db')
@@ -247,7 +247,7 @@ class TestSchemaV13:
         cols = {r[1] for r in conn.execute('PRAGMA table_info(compression_artifacts)')}
         indices = {r[1] for r in conn.execute('PRAGMA index_list(compression_artifacts)')}
         conn.close()
-        assert version == 14
+        assert version == 15
         assert 'superseded_at' in cols
         assert 'superseded_reason' in cols
         assert 'superseded_by_operator' in cols

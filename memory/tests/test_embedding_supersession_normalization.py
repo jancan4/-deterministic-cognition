@@ -120,11 +120,11 @@ def _get_embedding_row(db_path: str, emb_id: int) -> sqlite3.Row:
 # ---------------------------------------------------------------------------
 
 class TestSchemaV14:
-    def test_schema_version_is_14(self, db):
+    def test_schema_version_is_15(self, db):
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 14
+        assert row[0] == 15
 
     def test_event_embeddings_has_superseded_at_column(self, db):
         conn = sqlite3.connect(db)
@@ -208,7 +208,7 @@ class TestSchemaV14:
         version = conn.execute('SELECT version FROM memory_schema_version').fetchone()[0]
         cols = {r[1] for r in conn.execute('PRAGMA table_info(event_embeddings)')}
         conn.close()
-        assert version == 14
+        assert version == 15
         assert 'superseded_at' in cols
         assert 'superseded_reason' in cols
 
@@ -218,7 +218,7 @@ class TestSchemaV14:
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 14
+        assert row[0] == 15
 
     def test_new_embedding_columns_default_null(self, db):
         """Fresh embeddings have superseded_at IS NULL (not yet superseded)."""
@@ -649,7 +649,7 @@ class TestHistoricalCohortNonBackfill:
         ).fetchone()
         conn.close()
 
-        assert version == 14
+        assert version == 15
         assert row['status'] == 'superseded'        # authoritative: preserved
         assert row['invalidated_at'] is not None    # historical artifact: preserved
         assert row['superseded_at'] is None          # no backfill: intentional

@@ -83,12 +83,12 @@ def _pin_for(db: str, adapter, pin_scope: str = 'global'):
 # ---------------------------------------------------------------------------
 
 class TestSchemaV4FreshDB:
-    def test_schema_version_is_14(self, tmp_path):
+    def test_schema_version_is_15(self, tmp_path):
         db = _db(tmp_path)
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 14
+        assert row[0] == 15
 
     def test_event_embeddings_table_exists(self, tmp_path):
         db = _db(tmp_path)
@@ -223,13 +223,13 @@ class TestSchemaV4Migration:
         conn.close()
         return db
 
-    def test_migrate_from_v3_bumps_version_to_14(self, tmp_path):
+    def test_migrate_from_v3_bumps_version_to_15(self, tmp_path):
         db = self._v3_db(tmp_path)
         service.init_db(db)
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 14
+        assert row[0] == 15
 
     def test_migrate_from_v3_creates_event_embeddings(self, tmp_path):
         db = self._v3_db(tmp_path)
@@ -256,7 +256,7 @@ class TestSchemaV4Migration:
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 14
+        assert row[0] == 15
 
     def test_v3_existing_data_preserved(self, tmp_path):
         db = self._v3_db(tmp_path)

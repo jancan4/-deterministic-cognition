@@ -12,7 +12,7 @@ from .models import (
 )
 
 _SCHEMA = Path(__file__).parent / 'schema.sql'
-_MEMORY_SCHEMA_VERSION = 14
+_MEMORY_SCHEMA_VERSION = 15
 
 
 class ValidationError(ValueError):
@@ -44,6 +44,32 @@ def _validate_confidence(confidence: int) -> None:
         raise ValidationError(
             f"confidence must be {CONFIDENCE_MIN}–{CONFIDENCE_MAX}, got {confidence}"
         )
+
+
+def _migrate_to_v15(conn: sqlite3.Connection) -> None:
+    # activation_policies and activation_decision_log were added to schema.sql in v15.
+    # Both tables are created by executescript() via CREATE TABLE IF NOT EXISTS.
+    # This function idempotently ensures all governance indices exist.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_activation_policies_status "
+        "ON activation_policies(status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_activation_policies_trigger_class "
+        "ON activation_policies(trigger_class)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_activation_decisions_policy_id "
+        "ON activation_decision_log(policy_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_activation_decisions_assembly_id "
+        "ON activation_decision_log(resulting_assembly_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_activation_decisions_detected_at "
+        "ON activation_decision_log(detected_at)"
+    )
 
 
 def _migrate_to_v14(conn: sqlite3.Connection) -> None:
@@ -318,6 +344,7 @@ def init_db(db_path: str) -> None:
             _migrate_to_v12(conn)
             _migrate_to_v13(conn)
             _migrate_to_v14(conn)
+            _migrate_to_v15(conn)
             conn.execute(
                 'INSERT INTO memory_schema_version (version) VALUES (?)',
                 (_MEMORY_SCHEMA_VERSION,)
@@ -347,6 +374,8 @@ def init_db(db_path: str) -> None:
                 _migrate_to_v13(conn)
             if row['version'] < 14:
                 _migrate_to_v14(conn)
+            if row['version'] < 15:
+                _migrate_to_v15(conn)
             conn.execute(
                 'UPDATE memory_schema_version SET version = ?',
                 (_MEMORY_SCHEMA_VERSION,)

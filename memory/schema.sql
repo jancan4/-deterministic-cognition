@@ -291,3 +291,52 @@ CREATE TABLE IF NOT EXISTS compression_artifacts (
     FOREIGN KEY (superseded_by_artifact_id) REFERENCES compression_artifacts(id)
 );
 -- Indices for compression_artifacts are created by _migrate_to_v11() and _migrate_to_v12() in service.py.
+
+CREATE TABLE IF NOT EXISTS activation_policies (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                    TEXT    NOT NULL,
+    trigger_class           TEXT    NOT NULL,
+    trigger_conditions_json TEXT    NOT NULL DEFAULT '{}',
+    -- Lifecycle: candidate → active → superseded | invalidated
+    -- candidate policies do not fire. Only active policies fire.
+    -- Status is authoritative; timestamps are lineage metadata only.
+    status                  TEXT    NOT NULL DEFAULT 'candidate',
+    priority                INTEGER NOT NULL DEFAULT 100,
+    policy_version          TEXT    NOT NULL DEFAULT '1.0.0',
+    created_by              TEXT    NOT NULL,
+    reason                  TEXT    NOT NULL,
+    created_at              TEXT    NOT NULL,
+    -- Activation columns: written ONLY by activate_activation_policy()
+    activated_at            TEXT,
+    activated_by            TEXT,
+    -- Supersession columns: written ONLY by supersede_activation_policy()
+    -- Hard invariant: supersession columns and invalidation columns are mutually exclusive per row.
+    superseded_at           TEXT,
+    superseded_by_policy_id INTEGER,
+    superseded_by_operator  TEXT,
+    superseded_reason       TEXT,
+    -- Invalidation columns: written ONLY by invalidate_activation_policy() (Phase 7A-beta)
+    invalidated_at          TEXT,
+    invalidated_reason      TEXT,
+    provenance_json         TEXT    NOT NULL DEFAULT '{}'
+);
+-- Indices for activation_policies are created by _migrate_to_v15() in service.py.
+
+CREATE TABLE IF NOT EXISTS activation_decision_log (
+    id                                INTEGER PRIMARY KEY AUTOINCREMENT,
+    policy_id                         INTEGER NOT NULL,
+    policy_snapshot_json              TEXT    NOT NULL,
+    trigger_class                     TEXT    NOT NULL,
+    trigger_event_json                TEXT    NOT NULL DEFAULT '{}',
+    fired                             INTEGER NOT NULL DEFAULT 0,
+    detection_reason                  TEXT    NOT NULL,
+    triggering_artifact_ids_json      TEXT,
+    triggering_workflow_execution_id  TEXT,
+    triggering_session_id             INTEGER,
+    resulting_retrieval_id            INTEGER,
+    resulting_assembly_id             INTEGER,
+    resulting_transition_id           INTEGER,
+    detected_at                       TEXT    NOT NULL,
+    FOREIGN KEY (policy_id) REFERENCES activation_policies(id)
+);
+-- Indices for activation_decision_log are created by _migrate_to_v15() in service.py.

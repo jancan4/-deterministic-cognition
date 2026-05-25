@@ -29,6 +29,32 @@ VALID_TRANSITION_TYPES = frozenset({
     'contradiction_change', 'operator_rebuild', 'policy_update', 'session_close',
 })
 
+# First-class trigger classes for ActivationPolicy (Phase 7A-core).
+# These map to the activation_policies.trigger_class column.
+# Operator-facing explanation of each:
+#   operator_request          — explicit operator refresh command
+#   governance_escalation     — governance detector produced critical/warning issue
+#   contradiction_change      — active contradicts link added or retracted
+#   confidence_revision       — confidence_revision committed since last assembly
+#   retrieval_refresh         — retrieval_log accumulated N new entries (reserved)
+#   continuity_refresh        — compression artifact referenced in policy changed status (reserved)
+#   workflow_checkpoint       — workflow execution reached a stage boundary (reserved)
+#   stale_session_recovery    — cognition_session has no assembly within N days (reserved)
+#   embedding_invalidation    — active embedding superseded or invalidated (reserved)
+#   semantic_candidate_arrival — semantic_candidate_events promoted to proposed status (reserved)
+VALID_TRIGGER_CLASSES: frozenset = frozenset({
+    'operator_request',
+    'governance_escalation',
+    'contradiction_change',
+    'confidence_revision',
+    'retrieval_refresh',
+    'continuity_refresh',
+    'workflow_checkpoint',
+    'stale_session_recovery',
+    'embedding_invalidation',
+    'semantic_candidate_arrival',
+})
+
 VALID_SESSION_STATUSES = frozenset({'active', 'closed', 'abandoned'})
 
 
