@@ -1,6 +1,6 @@
 # CLI Reference
 
-**Repository commit:** 42fef07  
+**Repository commit:** 6cc520f  
 **Memory schema version:** 16  
 **Workflow schema version:** 3  
 **Continuity bundle schema version:** 1.2  
