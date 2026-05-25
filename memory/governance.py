@@ -1405,6 +1405,7 @@ def build_governance_report(
     detect_activation_issues: bool = True,
     compression_memory_warning_days: int = COMPRESSION_MEMORY_CANDIDATE_WARNING_DAYS,
     detect_compression_memory_issues: bool = True,
+    detect_ontology_issues: bool = True,
 ) -> GovernanceReport:
     """Run all governance checks and return a deterministically sorted report.
 
@@ -1449,6 +1450,19 @@ def build_governance_report(
         issues.extend(detect_unreviewed_compression_derived_memory(
             db_path, warning_days=compression_memory_warning_days
         ))
+    if detect_ontology_issues:
+        from .ontology import (
+            detect_alias_conflicts,
+            detect_deprecated_event_type_usage,
+            detect_deprecated_relationship_usage,
+            detect_deprecated_trigger_class_usage,
+            detect_unregistered_compression_methods,
+        )
+        issues.extend(detect_unregistered_compression_methods(db_path))
+        issues.extend(detect_deprecated_event_type_usage(db_path))
+        issues.extend(detect_deprecated_relationship_usage(db_path))
+        issues.extend(detect_deprecated_trigger_class_usage(db_path))
+        issues.extend(detect_alias_conflicts(db_path))
 
     issues.sort(key=lambda i: (_SEVERITY_ORDER[i.severity], i.issue_type, i.memory_id))
 

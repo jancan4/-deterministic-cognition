@@ -12,7 +12,7 @@ from .models import (
 )
 
 _SCHEMA = Path(__file__).parent / 'schema.sql'
-_MEMORY_SCHEMA_VERSION = 15
+_MEMORY_SCHEMA_VERSION = 16
 
 
 class ValidationError(ValueError):
@@ -44,6 +44,24 @@ def _validate_confidence(confidence: int) -> None:
         raise ValidationError(
             f"confidence must be {CONFIDENCE_MIN}–{CONFIDENCE_MAX}, got {confidence}"
         )
+
+
+def _migrate_to_v16(conn: sqlite3.Connection) -> None:
+    # ontology_terms and ontology_aliases were added to schema.sql in v16.
+    # Both tables are created by executescript() via CREATE TABLE IF NOT EXISTS.
+    # This function idempotently ensures all governance indices exist.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ontology_terms_vocab_status "
+        "ON ontology_terms(vocabulary_name, status)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ontology_terms_vocab_term "
+        "ON ontology_terms(vocabulary_name, term)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ontology_aliases_vocab_alias "
+        "ON ontology_aliases(vocabulary_name, alias)"
+    )
 
 
 def _migrate_to_v15(conn: sqlite3.Connection) -> None:
@@ -345,6 +363,7 @@ def init_db(db_path: str) -> None:
             _migrate_to_v13(conn)
             _migrate_to_v14(conn)
             _migrate_to_v15(conn)
+            _migrate_to_v16(conn)
             conn.execute(
                 'INSERT INTO memory_schema_version (version) VALUES (?)',
                 (_MEMORY_SCHEMA_VERSION,)
@@ -376,6 +395,8 @@ def init_db(db_path: str) -> None:
                 _migrate_to_v14(conn)
             if row['version'] < 15:
                 _migrate_to_v15(conn)
+            if row['version'] < 16:
+                _migrate_to_v16(conn)
             conn.execute(
                 'UPDATE memory_schema_version SET version = ?',
                 (_MEMORY_SCHEMA_VERSION,)

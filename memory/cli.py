@@ -627,6 +627,151 @@ def cmd_list_supersession_chain(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Ontology commands (Phase 8A)
+# ---------------------------------------------------------------------------
+
+def cmd_ontology_register(args: argparse.Namespace) -> None:
+    from .ontology import register_term
+    provenance = None
+    if args.provenance:
+        try:
+            provenance = json.loads(args.provenance)
+        except json.JSONDecodeError as exc:
+            _die(f"Invalid --provenance JSON: {exc}")
+    try:
+        term = register_term(
+            db_path=args.db,
+            vocabulary_name=args.vocabulary,
+            term=args.term,
+            label=args.label,
+            introduced_by=args.introduced_by,
+            description=args.description,
+            provenance=provenance,
+        )
+    except ValueError as exc:
+        _die(str(exc))
+    print(f"registered term id={term.id} vocabulary={term.vocabulary_name!r} "
+          f"term={term.term!r} status={term.status}")
+
+
+def cmd_ontology_deprecate(args: argparse.Namespace) -> None:
+    from .ontology import deprecate_term
+    try:
+        term = deprecate_term(
+            db_path=args.db,
+            vocabulary_name=args.vocabulary,
+            term=args.term,
+            deprecated_by=args.deprecated_by,
+            deprecation_reason=args.reason,
+        )
+    except ValueError as exc:
+        _die(str(exc))
+    print(f"deprecated term={term.term!r} vocabulary={term.vocabulary_name!r} "
+          f"at={term.deprecated_at} by={term.deprecated_by!r}")
+
+
+def cmd_ontology_supersede(args: argparse.Namespace) -> None:
+    from .ontology import supersede_term
+    try:
+        term = supersede_term(
+            db_path=args.db,
+            vocabulary_name=args.vocabulary,
+            term=args.term,
+            superseded_by=args.superseded_by,
+            deprecated_by=args.deprecated_by,
+            deprecation_reason=args.reason,
+        )
+    except ValueError as exc:
+        _die(str(exc))
+    print(f"superseded term={term.term!r} vocabulary={term.vocabulary_name!r} "
+          f"superseded_by={term.superseded_by!r} at={term.deprecated_at}")
+
+
+def cmd_ontology_add_alias(args: argparse.Namespace) -> None:
+    from .ontology import add_alias
+    try:
+        alias = add_alias(
+            db_path=args.db,
+            vocabulary_name=args.vocabulary,
+            term=args.term,
+            alias=args.alias,
+            created_by=args.created_by,
+            reason=args.reason,
+        )
+    except ValueError as exc:
+        _die(str(exc))
+    print(f"alias added id={alias.id} vocabulary={alias.vocabulary_name!r} "
+          f"alias={alias.alias!r} -> term={alias.term!r}")
+
+
+def cmd_ontology_list(args: argparse.Namespace) -> None:
+    from .ontology import list_terms
+    terms = list_terms(
+        db_path=args.db,
+        vocabulary_name=args.vocabulary,
+        status=args.status,
+    )
+    if not terms:
+        print("No ontology terms found.")
+        return
+    header = f"{'id':>4}  {'vocabulary':<20}  {'term':<30}  {'status':<12}  label"
+    print(header)
+    print('-' * 90)
+    for t in terms:
+        print(f"{t.id:>4}  {t.vocabulary_name:<20}  {t.term:<30}  {t.status:<12}  {t.label}")
+
+
+def cmd_ontology_show(args: argparse.Namespace) -> None:
+    from .ontology import get_term, list_aliases
+    term = get_term(args.db, args.vocabulary, args.term)
+    if term is None:
+        _die(f"Term {args.term!r} not found in vocabulary {args.vocabulary!r}")
+    print(json.dumps(term.to_dict(), indent=2, sort_keys=True))
+    aliases = list_aliases(args.db, vocabulary_name=args.vocabulary)
+    aliases_for_term = [a for a in aliases if a.term == args.term]
+    if aliases_for_term:
+        print(f"\nAliases ({len(aliases_for_term)}):")
+        for a in aliases_for_term:
+            print(f"  {a.alias!r}  (by {a.created_by!r}, {a.created_at})")
+
+
+def cmd_ontology_resolve(args: argparse.Namespace) -> None:
+    from .ontology import resolve_alias
+    canonical = resolve_alias(args.db, args.vocabulary, args.alias)
+    if canonical is None:
+        print(f"No alias {args.alias!r} found in vocabulary {args.vocabulary!r}.")
+    else:
+        print(f"{args.alias!r} -> {canonical!r}")
+
+
+def cmd_ontology_migrate_report(args: argparse.Namespace) -> None:
+    """Read-only report of post-deprecation usage of deprecated/superseded terms."""
+    from .ontology import (
+        detect_deprecated_event_type_usage,
+        detect_deprecated_relationship_usage,
+        detect_deprecated_trigger_class_usage,
+        detect_unregistered_compression_methods,
+    )
+    sections = [
+        ('event_type', detect_deprecated_event_type_usage(args.db)),
+        ('relationship', detect_deprecated_relationship_usage(args.db)),
+        ('trigger_class', detect_deprecated_trigger_class_usage(args.db)),
+        ('compression_method (unregistered)', detect_unregistered_compression_methods(args.db)),
+    ]
+    found_any = False
+    for vocab, issues in sorted(sections, key=lambda x: x[0]):
+        if not issues:
+            continue
+        found_any = True
+        print(f"\n=== {vocab} ({len(issues)} issue(s)) ===")
+        for issue in sorted(issues, key=lambda i: (i.issue_type, i.memory_id)):
+            print(f"  [{issue.memory_id}] {issue.title}")
+            print(f"    {issue.rationale}")
+    if not found_any:
+        print("No post-deprecation vocabulary usage detected.")
+
+
+# ---------------------------------------------------------------------------
 # Activation policy commands
 # ---------------------------------------------------------------------------
 
@@ -898,6 +1043,14 @@ _COMMANDS = {
     'show-compression-artifact': cmd_show_compression_artifact,
     'supersede-compression-artifact': cmd_supersede_compression_artifact,
     'list-supersession-chain': cmd_list_supersession_chain,
+    'ontology-register': cmd_ontology_register,
+    'ontology-deprecate': cmd_ontology_deprecate,
+    'ontology-supersede': cmd_ontology_supersede,
+    'ontology-add-alias': cmd_ontology_add_alias,
+    'ontology-list': cmd_ontology_list,
+    'ontology-show': cmd_ontology_show,
+    'ontology-resolve': cmd_ontology_resolve,
+    'ontology-migrate-report': cmd_ontology_migrate_report,
     'seed-memory-from-compression': cmd_seed_memory_from_compression,
     'list-compression-derived-memory': cmd_list_compression_derived_memory,
     'activation-policy-create': cmd_activation_policy_create,
@@ -1149,6 +1302,78 @@ def build_parser() -> argparse.ArgumentParser:
     p_rst = sub.add_parser('replay-session-timeline', parents=[_db],
                            help='Replay all assemblies in a cognition session (JSON output)')
     p_rst.add_argument('--id', required=True, type=int, help='Cognition session id')
+
+    # ontology-register
+    from .ontology import VALID_VOCABULARY_NAMES, VALID_TERM_STATUSES
+    p_or = sub.add_parser('ontology-register', parents=[_db],
+                          help='Register a new ontology term with status=active')
+    p_or.add_argument('--vocabulary', required=True, choices=sorted(VALID_VOCABULARY_NAMES),
+                      help='Vocabulary name')
+    p_or.add_argument('--term', required=True, help='Canonical term string')
+    p_or.add_argument('--label', required=True, help='Human-readable label')
+    p_or.add_argument('--introduced-by', required=True, dest='introduced_by',
+                      help='Operator registering this term')
+    p_or.add_argument('--description', default=None, help='Optional description')
+    p_or.add_argument('--provenance', default=None, help='Optional provenance as JSON')
+
+    # ontology-deprecate
+    p_od = sub.add_parser('ontology-deprecate', parents=[_db],
+                          help='Deprecate an active ontology term')
+    p_od.add_argument('--vocabulary', required=True, choices=sorted(VALID_VOCABULARY_NAMES),
+                      help='Vocabulary name')
+    p_od.add_argument('--term', required=True, help='Term to deprecate')
+    p_od.add_argument('--deprecated-by', required=True, dest='deprecated_by',
+                      help='Operator deprecating this term')
+    p_od.add_argument('--reason', required=True, help='Reason for deprecation')
+
+    # ontology-supersede
+    p_os = sub.add_parser('ontology-supersede', parents=[_db],
+                          help='Supersede an active ontology term with a canonical replacement')
+    p_os.add_argument('--vocabulary', required=True, choices=sorted(VALID_VOCABULARY_NAMES),
+                      help='Vocabulary name')
+    p_os.add_argument('--term', required=True, help='Term to supersede')
+    p_os.add_argument('--superseded-by', required=True, dest='superseded_by',
+                      help='Canonical replacement term (must be active in same vocabulary)')
+    p_os.add_argument('--deprecated-by', required=True, dest='deprecated_by',
+                      help='Operator authorizing this supersession')
+    p_os.add_argument('--reason', required=True, help='Reason for supersession')
+
+    # ontology-add-alias
+    p_oaa = sub.add_parser('ontology-add-alias', parents=[_db],
+                           help='Add an alias for a canonical ontology term')
+    p_oaa.add_argument('--vocabulary', required=True, choices=sorted(VALID_VOCABULARY_NAMES),
+                       help='Vocabulary name')
+    p_oaa.add_argument('--term', required=True, help='Canonical term to alias')
+    p_oaa.add_argument('--alias', required=True, help='Alias string')
+    p_oaa.add_argument('--created-by', required=True, dest='created_by',
+                       help='Operator creating this alias')
+    p_oaa.add_argument('--reason', required=True, help='Reason for this alias')
+
+    # ontology-list
+    p_ol = sub.add_parser('ontology-list', parents=[_db],
+                          help='List ontology terms (ordered by vocabulary, term)')
+    p_ol.add_argument('--vocabulary', choices=sorted(VALID_VOCABULARY_NAMES), default=None,
+                      help='Filter by vocabulary')
+    p_ol.add_argument('--status', choices=list(VALID_TERM_STATUSES), default=None,
+                      help='Filter by status')
+
+    # ontology-show
+    p_osh = sub.add_parser('ontology-show', parents=[_db],
+                           help='Show a specific ontology term with aliases')
+    p_osh.add_argument('--vocabulary', required=True, choices=sorted(VALID_VOCABULARY_NAMES),
+                       help='Vocabulary name')
+    p_osh.add_argument('--term', required=True, help='Term to show')
+
+    # ontology-resolve
+    p_ores = sub.add_parser('ontology-resolve', parents=[_db],
+                            help='Resolve an alias to its canonical term (one step only)')
+    p_ores.add_argument('--vocabulary', required=True, choices=sorted(VALID_VOCABULARY_NAMES),
+                        help='Vocabulary name')
+    p_ores.add_argument('--alias', required=True, help='Alias string to resolve')
+
+    # ontology-migrate-report
+    p_omr = sub.add_parser('ontology-migrate-report', parents=[_db],
+                           help='Report post-deprecation vocabulary usage (read-only)')
 
     # create-compression-artifact
     p_cca = sub.add_parser('create-compression-artifact', parents=[_db],

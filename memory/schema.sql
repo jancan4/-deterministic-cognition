@@ -340,3 +340,32 @@ CREATE TABLE IF NOT EXISTS activation_decision_log (
     FOREIGN KEY (policy_id) REFERENCES activation_policies(id)
 );
 -- Indices for activation_decision_log are created by _migrate_to_v15() in service.py.
+
+CREATE TABLE IF NOT EXISTS ontology_terms (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    vocabulary_name     TEXT    NOT NULL,
+    term                TEXT    NOT NULL,
+    label               TEXT    NOT NULL,
+    description         TEXT,
+    status              TEXT    NOT NULL DEFAULT 'active',
+    superseded_by       TEXT,
+    introduced_at       TEXT    NOT NULL,
+    introduced_by       TEXT    NOT NULL,
+    deprecated_at       TEXT,
+    deprecated_by       TEXT,
+    deprecation_reason  TEXT,
+    provenance_json     TEXT,
+    UNIQUE(vocabulary_name, term)
+);
+
+CREATE TABLE IF NOT EXISTS ontology_aliases (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    vocabulary_name TEXT    NOT NULL,
+    term            TEXT    NOT NULL,
+    alias           TEXT    NOT NULL,
+    created_at      TEXT    NOT NULL,
+    created_by      TEXT    NOT NULL,
+    reason          TEXT    NOT NULL,
+    UNIQUE(vocabulary_name, alias)
+);
+-- Indices for ontology_terms and ontology_aliases are created by _migrate_to_v16() in service.py.

@@ -84,11 +84,11 @@ def _make_active_policy(db, **kwargs) -> ActivationPolicy:
 # ---------------------------------------------------------------------------
 
 class TestSchemaV15:
-    def test_fresh_db_schema_version_15(self, db):
+    def test_fresh_db_schema_version_16(self, db):
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 15
+        assert row[0] == 16
 
     def test_activation_policies_table_exists(self, db):
         conn = sqlite3.connect(db)
@@ -163,7 +163,7 @@ class TestSchemaV15:
         conn.close()
         assert 'idx_activation_decisions_detected_at' in idxs
 
-    def test_v14_db_migrates_to_v15(self, tmp_path):
+    def test_v14_db_migrates_to_v15_and_v16(self, tmp_path):
         db_path = str(tmp_path / 'old.db')
 
         # Build a v14 DB by patching the version before init
@@ -184,7 +184,7 @@ class TestSchemaV15:
         )}
         conn.close()
 
-        assert version == 15
+        assert version == 16
         assert 'activation_policies' in tables
         assert 'activation_decision_log' in tables
 

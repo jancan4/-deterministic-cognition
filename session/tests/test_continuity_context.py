@@ -163,7 +163,7 @@ class TestSchemaV12:
         conn = sqlite3.connect(db)
         row = conn.execute('SELECT version FROM memory_schema_version').fetchone()
         conn.close()
-        assert row[0] == 15
+        assert row[0] == 16
 
     def test_v11_db_migrates_to_v12(self, tmp_path):
         """A DB at version 11 (without superseded_by column) is upgraded by init_db()."""
@@ -227,7 +227,7 @@ class TestSchemaV12:
         cols = {r[1] for r in conn.execute('PRAGMA table_info(compression_artifacts)')}
         indices = {r[1] for r in conn.execute('PRAGMA index_list(compression_artifacts)')}
         conn.close()
-        assert version == 15
+        assert version == 16
         assert 'superseded_by_artifact_id' in cols
         assert 'idx_compression_superseded_by' in indices
 
