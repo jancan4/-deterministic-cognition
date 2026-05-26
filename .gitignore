@@ -6,3 +6,5 @@ __pycache__/
 *.db-shm
 *.db-wal
 memory_export.json
+demo/run/
+*.egg-info/
