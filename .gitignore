@@ -8,3 +8,10 @@ __pycache__/
 memory_export.json
 demo/run/
 *.egg-info/
+validation/corpus/
+validation/runs/*.db
+validation/runs/*.db-shm
+validation/runs/*.db-wal
+validation/runs/*.json
+validation/transcripts/
+validation/exports/
