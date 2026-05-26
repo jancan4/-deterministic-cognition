@@ -88,16 +88,23 @@ _HELP_TEXT = """\
     status
     ingest PATH [--source-type TYPE] [--authority-tier TIER]
     review [--status STATUS] [--type TYPE] [--limit N]
+    show ID
+    search QUERY [--type TYPE] [--status STATUS]
     approve ID [ID ...] [--status active|accepted]
     policy create --name NAME --trigger-class CLASS [--priority N]
     policy activate ID
     session start [--policy-id N] [--min-confidence N]
     session close
+    session timeline [--id N]
+    history [--n N] [--fired-only] [--policy-id N]
     governance
+    governance show ISSUE_TYPE
     assembly show [--id N]
+    artifact list [--status STATUS]
     compress "ARTIFACT TEXT" [--confidence N]
     export [--out PATH] [--no-lineage]
     import PATH [--db TARGET_DB] [--dry-run]
+    transcript [--out PATH] [--session-id N]
     lineage
     quit / exit
 
@@ -166,6 +173,31 @@ _COMMAND_HELP = {
         "  lineage\n"
         "  Run FK integrity checks across execution lineage tables.\n"
         "  Read-only. Exits with summary."
+    ),
+    'show': (
+        "  show ID\n"
+        "  Print full detail for memory event ID: fields, revisions, links.\n"
+        "  Read-only."
+    ),
+    'search': (
+        "  search QUERY [--type TYPE] [--status STATUS]\n"
+        "  Full-text search across title, summary, evidence, source, tags.\n"
+        "  Optional post-filters: --type (event_type) and --status."
+    ),
+    'history': (
+        "  history [--n N] [--fired-only] [--policy-id N]\n"
+        "  Show recent activation decisions from the decision log.\n"
+        "  --n N: limit (default 20). --fired-only: only decisions where fired=True."
+    ),
+    'artifact': (
+        "  artifact list [--status STATUS]\n"
+        "  List compression artifacts. STATUS: active, candidate, superseded, invalidated."
+    ),
+    'transcript': (
+        "  transcript [--out PATH] [--session-id N]\n"
+        "  Write a human-readable audit transcript for a session.\n"
+        "  This is an observational artifact only — not a replay or import format.\n"
+        "  Default session: current shell session. Default output: ./transcript_SESSION.txt"
     ),
 }
 
@@ -483,7 +515,9 @@ def cmd_session(state: ShellState, tokens: List[str]) -> ShellState:
         return _session_start(state, rest)
     if sub == 'close':
         return _session_close(state, rest)
-    raise CommandError(f"Unknown session subcommand '{sub}'. Use: start, close")
+    if sub == 'timeline':
+        return _session_timeline(state, rest)
+    raise CommandError(f"Unknown session subcommand '{sub}'. Use: start, close, timeline")
 
 
 def _session_start(state: ShellState, tokens: List[str]) -> ShellState:
@@ -586,6 +620,34 @@ def _session_close(state: ShellState, tokens: List[str]) -> ShellState:
     )
 
 
+def _session_timeline(state: ShellState, tokens: List[str]) -> ShellState:
+    _, flags = _parse_flags(tokens)
+    session_id = state.session_id
+    if 'id' in flags:
+        try:
+            session_id = int(flags['id'])
+        except ValueError:
+            raise CommandError("--id must be an integer") from None
+
+    if session_id is None:
+        raise CommandError(
+            "No open session. Use --id N to specify a session, or 'session start' first."
+        )
+
+    from session.reconstruction import get_session_assemblies
+    from memory.shell_formatter import print_session_timeline
+
+    try:
+        assemblies = get_session_assemblies(session_id, state.db_path)
+    except ValueError as exc:
+        raise CommandError(str(exc)) from exc
+    except Exception as exc:
+        raise CommandError(f"Cannot fetch session timeline: {exc}") from exc
+
+    print_session_timeline(assemblies)
+    return state
+
+
 def _find_active_policy(db_path: str) -> Optional[int]:
     """Return the ID of the most recently activated active policy, or None."""
     try:
@@ -608,10 +670,34 @@ def _find_active_policy(db_path: str) -> Optional[int]:
 # ---------------------------------------------------------------------------
 
 def cmd_governance(state: ShellState, tokens: List[str]) -> ShellState:
-    """Run full governance report. Read-only."""
+    """Run full governance report, or filter by issue type."""
     from memory.governance import build_governance_report
-    from memory.shell_formatter import print_governance_summary
+    from memory.shell_formatter import print_governance_summary, separator, table
 
+    # 'governance show TYPE' — filter by issue_type
+    if tokens and tokens[0] == 'show':
+        if len(tokens) < 2:
+            raise CommandError("Usage: governance show ISSUE_TYPE")
+        issue_type = tokens[1]
+        try:
+            report = build_governance_report(state.db_path)
+        except Exception as exc:
+            raise CommandError(f"Governance report failed: {exc}") from exc
+
+        matched = [i for i in report.issues if i.issue_type == issue_type]
+        separator(f"Governance — {issue_type} ({len(matched)} issues)")
+        if not matched:
+            print(f"\n  No issues of type '{issue_type}'.")
+        else:
+            rows = []
+            for issue in matched:
+                mid = issue.memory_id or ''
+                rationale = (issue.rationale or '')[:60]
+                rows.append([issue.severity, mid, rationale])
+            table(['severity', 'memory_id', 'rationale'], rows)
+        return state
+
+    # bare 'governance' — full report
     try:
         report = build_governance_report(state.db_path)
     except Exception as exc:
@@ -872,4 +958,174 @@ def cmd_lineage(state: ShellState, tokens: List[str]) -> ShellState:
     for check in result.get('checks', []):
         ok = "OK" if check['broken_count'] == 0 else f"BROKEN ({check['broken_count']})"
         print(f"  {check['name']:<45}: {ok}")
+    return state
+
+
+# ---------------------------------------------------------------------------
+# show
+# ---------------------------------------------------------------------------
+
+def cmd_show(state: ShellState, tokens: List[str]) -> ShellState:
+    """Print full detail for a single memory event by ID."""
+    positional, _ = _parse_flags(tokens)
+    if not positional:
+        raise CommandError("Usage: show ID")
+    try:
+        memory_id = int(positional[0])
+    except ValueError:
+        raise CommandError(f"Invalid ID '{positional[0]}' — must be an integer") from None
+
+    from memory.service import get_memory_event, NotFoundError
+    from memory.shell_formatter import print_event_detail
+
+    try:
+        event, revisions, links = get_memory_event(state.db_path, memory_id)
+    except NotFoundError as exc:
+        raise CommandError(str(exc)) from exc
+    except Exception as exc:
+        raise CommandError(f"Cannot fetch event {memory_id}: {exc}") from exc
+
+    print_event_detail(event, revisions, links)
+    return state
+
+
+# ---------------------------------------------------------------------------
+# search
+# ---------------------------------------------------------------------------
+
+def cmd_search(state: ShellState, tokens: List[str]) -> ShellState:
+    """Full-text search across memory events."""
+    positional, flags = _parse_flags(tokens)
+    if not positional:
+        raise CommandError("Usage: search QUERY [--type TYPE] [--status STATUS]")
+    query = positional[0]
+    filter_type = flags.get('type', None)
+    filter_status = flags.get('status', None)
+    limit = int(flags.get('limit', 50))
+
+    from memory.service import search_memory_events, ValidationError
+    from memory.shell_formatter import print_event_list, separator
+
+    try:
+        events = search_memory_events(state.db_path, query=query)
+    except ValidationError as exc:
+        raise CommandError(str(exc)) from exc
+    except Exception as exc:
+        raise CommandError(f"Search failed: {exc}") from exc
+
+    if filter_type:
+        events = [e for e in events if e.event_type == filter_type]
+    if filter_status:
+        events = [e for e in events if e.status == filter_status]
+
+    label = f"Search: {query!r}"
+    if filter_type:
+        label += f"  type={filter_type}"
+    if filter_status:
+        label += f"  status={filter_status}"
+    separator(label)
+    print_event_list(events, limit=limit)
+    print(f"\n  Total: {len(events)}")
+    return state
+
+
+# ---------------------------------------------------------------------------
+# history
+# ---------------------------------------------------------------------------
+
+def cmd_history(state: ShellState, tokens: List[str]) -> ShellState:
+    """Show recent activation decisions from the decision log."""
+    _, flags = _parse_flags(tokens)
+    limit = int(flags.get('n', 20))
+    fired_only = 'fired-only' in flags
+    policy_id = None
+    if 'policy-id' in flags:
+        try:
+            policy_id = int(flags['policy-id'])
+        except ValueError:
+            raise CommandError("--policy-id must be an integer") from None
+
+    from session.activation_policy import list_activation_decisions
+    from memory.shell_formatter import print_decision_history
+
+    try:
+        decisions = list_activation_decisions(
+            state.db_path,
+            policy_id=policy_id,
+            fired_only=fired_only,
+            limit=limit,
+        )
+    except Exception as exc:
+        raise CommandError(f"Cannot fetch decision history: {exc}") from exc
+
+    print_decision_history(decisions)
+    return state
+
+
+# ---------------------------------------------------------------------------
+# artifact
+# ---------------------------------------------------------------------------
+
+def cmd_artifact(state: ShellState, tokens: List[str]) -> ShellState:
+    """Manage compression artifacts: list."""
+    if not tokens:
+        raise CommandError("Usage: artifact list [--status STATUS]")
+    sub = tokens[0]
+    if sub != 'list':
+        raise CommandError(f"Unknown artifact subcommand '{sub}'. Use: list")
+
+    _, flags = _parse_flags(tokens[1:])
+    status = flags.get('status', None)
+    limit = int(flags.get('limit', 50))
+
+    from memory.compression import list_compression_artifacts
+    from memory.shell_formatter import print_artifact_list
+
+    try:
+        artifacts = list_compression_artifacts(state.db_path, status=status, limit=limit)
+    except Exception as exc:
+        raise CommandError(f"Cannot list artifacts: {exc}") from exc
+
+    print_artifact_list(artifacts)
+    return state
+
+
+# ---------------------------------------------------------------------------
+# transcript
+# ---------------------------------------------------------------------------
+
+def cmd_transcript(state: ShellState, tokens: List[str]) -> ShellState:
+    """Write a human-readable observational audit transcript for a session."""
+    _, flags = _parse_flags(tokens)
+
+    session_id = state.session_id
+    if 'session-id' in flags:
+        try:
+            session_id = int(flags['session-id'])
+        except ValueError:
+            raise CommandError("--session-id must be an integer") from None
+
+    if session_id is None:
+        raise CommandError(
+            "No session set. Use --session-id N to specify one, "
+            "or start a session with 'session start'."
+        )
+
+    out_path = flags.get('out', f"transcript_{session_id}.txt")
+
+    from memory.shell_formatter import write_transcript
+
+    try:
+        n_assemblies = write_transcript(state.db_path, session_id, out_path)
+    except ValueError as exc:
+        raise CommandError(str(exc)) from exc
+    except OSError as exc:
+        raise CommandError(f"Cannot write transcript to '{out_path}': {exc}") from exc
+
+    size = os.path.getsize(out_path)
+    print(f"  Transcript written: {out_path} ({size:,} bytes, {n_assemblies} assemblies)")
+    print(
+        "  NOTE: This is a human-readable audit artifact only. "
+        "It is not a continuity bundle and cannot be re-imported."
+    )
     return state
