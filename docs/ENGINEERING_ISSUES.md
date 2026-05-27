@@ -3,7 +3,7 @@
 Tracked here: deferred defects and improvement requests that are non-blocking for the current substrate baseline but require engineering resolution before the next major validation milestone.
 
 **Substrate baseline:** a2d8679  
-**Last updated:** 2026-05-27
+**Last updated:** 2026-05-27 (EI-001 updated post-remediation)
 
 ---
 
@@ -21,8 +21,9 @@ Tracked here: deferred defects and improvement requests that are non-blocking fo
 
 **Class:** C — parser-quality  
 **Priority:** Medium  
-**Status:** Deferred — non-blocking  
-**Opened:** 2026-05-27 (identified Run #1, confirmed Run #2)
+**Status:** Partially mitigated — root cause mechanism fixed; secondary fragment sources remain  
+**Opened:** 2026-05-27 (identified Run #1, confirmed Run #2)  
+**Remediation applied:** 2026-05-27 — `ingestion/extractor.py` + 9 regression tests in `ingestion/tests/test_extractor.py`
 
 **Symptom:**
 `governance_rule` events are extracted with titles that are mid-paragraph sentence fragments. Examples from Run #2 corpus:
@@ -36,19 +37,31 @@ These pass the 15-char content filter (Fix 2) because they are long enough, but 
 **Root cause:**
 The `PatternRule` for `governance_rule` uses the pattern `rule[:\s]+([^\n]{5,120})`. This captures any text after the word "rule" on the same line, including continuations of prior sentences where "rule" appears mid-clause (e.g., "the routing rule evaluates the..." → captures "evaluates the...").
 
-**Not fixed in Run #2 remediation because:**
-Fix 2 addressed the minimum-length floor; fixing the pattern requires narrowing the capture anchor, which risks dropping legitimate short governance rules. Requires corpus-informed calibration.
+**Remediation applied (2026-05-27):**
+Narrowed the four bare-word alternations in `_build_rules()` to require an explicit colon:
+- `rule[:\s]+` → `rule:\s*`
+- `policy[:\s]+` → `policy:\s*`
+- `constraint[:\s]+` → `constraint:\s*`
+- `governance\s+rule` → `governance\s+rule:\s*`
 
-**Proposed remediation (to be validated):**
-1. Require the pattern to trigger only at the start of a line or after a sentence-ending punctuation (`. `, `! `, `? `, newline).
-2. Alternatively, require the captured text to end at a sentence boundary (`.`, `!`, `?`, or newline) within 120 chars.
-3. Add a heuristic: if the captured fragment starts with a verb in past tense or a pronoun, reject (mid-sentence indicators).
+This eliminates triggering on "the routing rule evaluates...", "rule set is...", "rule evaluation was..." and any other mid-sentence usage where "rule" appears without an explicit statement prefix colon.
 
-**Acceptance criterion:**
-On the Run #2 frozen corpus, the number of governance_rule events with fragmentary titles (titles that do not form a standalone imperative or declarative statement) drops to < 20% of all governance_rule events.
+Nine regression tests added covering: mid-sentence suppression (4 tests) and colon-form preservation (5 tests). All 3177 tests pass.
+
+**Remaining fragment sources (not fixed by this remediation):**
+Spot-check of the docs corpus (25 files) after the fix shows 19 `governance_rule` candidates. Fragments persist from two distinct mechanisms not addressed by EI-001:
+
+1. **`must not` + infinitive verb capture**: patterns like "must not be the weakest link in the audit chain." produce titles starting with a bare infinitive verb. The captured text is technically the prohibited action (which is useful) but the standalone title reads as a sentence fragment. Example: "Governance Rule: be the weakest link in the audit chain." These require a `must not` prefix to be interpretable.
+
+2. **`keyword` trigger on poorly-titled chunks**: the `KeywordRule` for "no live capital" fires on a chunk whose first sentence is "1." (a numbered list item), producing "Governance Rule: 1." The keyword is correct but `_title_from_text()` picks up the list numbering as the first sentence. This is a title-extraction quality problem distinct from pattern over-triggering.
+
+3. **Code block extraction**: `policy:` or `constraint:` preceding Python class attributes (e.g., `Policy:\n    events_per_snapshot: int = 50`) fires and extracts the code line as the title. This overlaps with the EI-002 class of structured-content extraction failures.
+
+**Acceptance criterion (original):**
+On the Run #2 frozen corpus, the number of governance_rule events with fragmentary titles drops to < 20% of all governance_rule events. Status: **not verified** against the Run #2 corpus (source markdown files not available for re-extraction). Targeted root cause mechanism is eliminated; acceptance criterion requires re-measurement on the next corpus run.
 
 **Regression guard:**
-`test_governance_rule_must_pattern` and `test_governance_rule_keyword_no_live_capital` in `ingestion/tests/test_extractor.py` must continue to pass.
+`test_governance_rule_must_pattern` and `test_governance_rule_keyword_no_live_capital` in `ingestion/tests/test_extractor.py` continue to pass. 9 new regression tests added for the narrowed pattern.
 
 ---
 

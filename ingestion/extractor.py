@@ -253,7 +253,7 @@ def _build_rules() -> List:
     rules.append(PatternRule(
         pattern=re.compile(
             r'(?:must\s+not|must\s+always|never\s+(?:allow|use|deploy)'
-            r'|governance\s+rule|policy[:\s]+|rule[:\s]+|constraint[:\s]+)'
+            r'|governance\s+rule:\s*|policy:\s*|rule:\s*|constraint:\s*)'
             r'([^\n]{5,120})',
             re.IGNORECASE,
         ),

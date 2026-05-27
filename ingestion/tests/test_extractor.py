@@ -300,3 +300,79 @@ def test_non_header_chunk_with_hash_symbol_not_blocked():
     results = extract_from_chunk(chunk)
     # The chunk itself is not a header-only chunk and should be processed normally
     assert isinstance(results, list)
+
+
+# ---------------------------------------------------------------------------
+# EI-001 regression: governance_rule fragment over-extraction
+# ---------------------------------------------------------------------------
+
+def test_rule_mid_sentence_no_governance():
+    """'rule' as a mid-sentence noun without a colon must not produce governance_rule."""
+    chunk = _chunk("The routing rule evaluates each incoming message against the ruleset.")
+    results = extract_from_chunk(chunk)
+    gov = [c for c in results if c.event_type == 'governance_rule']
+    assert gov == [], f"Unexpected governance_rule from mid-sentence 'rule': {[c.title for c in gov]}"
+
+
+def test_rule_evaluation_fragment_no_governance():
+    """'rule evaluation was' is a technical observation, not a governance statement."""
+    chunk = _chunk("The rule evaluation was single-threaded in the current implementation.")
+    results = extract_from_chunk(chunk)
+    gov = [c for c in results if c.event_type == 'governance_rule']
+    assert gov == [], f"Fragment 'rule evaluation was' must not produce governance_rule: {[c.title for c in gov]}"
+
+
+def test_rule_set_fragment_no_governance():
+    """'rule set is N rules' is a measurement, not a governance statement."""
+    chunk = _chunk("The rule set is currently 47 rules.")
+    results = extract_from_chunk(chunk)
+    gov = [c for c in results if c.event_type == 'governance_rule']
+    assert gov == [], f"Fragment 'rule set is' must not produce governance_rule: {[c.title for c in gov]}"
+
+
+def test_governance_rule_no_colon_no_governance():
+    """'governance rule' without a colon in running prose must not produce a fragment candidate."""
+    chunk = _chunk("The governance rule parallelism work is tracked in the Phase 3 backlog.")
+    results = extract_from_chunk(chunk)
+    gov = [c for c in results if c.event_type == 'governance_rule']
+    assert gov == [], f"'governance rule <noun>' without colon must not fire: {[c.title for c in gov]}"
+
+
+def test_rule_colon_still_produces_governance():
+    """'rule: <content>' with explicit colon must still fire after the narrowing fix."""
+    chunk = _chunk("rule: no live capital deployment without human approval")
+    results = extract_from_chunk(chunk)
+    gov = [c for c in results if c.event_type == 'governance_rule']
+    assert gov, "Expected governance_rule from 'rule:' — must not have been broken by fix"
+
+
+def test_governance_rule_colon_still_produces_governance():
+    """'governance rule: <content>' with colon must still fire."""
+    chunk = _chunk("governance rule: changes require a signed approval before deployment")
+    results = extract_from_chunk(chunk)
+    gov = [c for c in results if c.event_type == 'governance_rule']
+    assert gov, "Expected governance_rule from 'governance rule:'"
+
+
+def test_policy_colon_still_produces_governance():
+    """'policy: <content>' with explicit colon must still fire."""
+    chunk = _chunk("policy: all deployments require a risk-team sign-off before release")
+    results = extract_from_chunk(chunk)
+    gov = [c for c in results if c.event_type == 'governance_rule']
+    assert gov, "Expected governance_rule from 'policy:'"
+
+
+def test_constraint_colon_still_produces_governance():
+    """'constraint: <content>' with explicit colon must still fire."""
+    chunk = _chunk("constraint: maximum 3 replicas per service at all times")
+    results = extract_from_chunk(chunk)
+    gov = [c for c in results if c.event_type == 'governance_rule']
+    assert gov, "Expected governance_rule from 'constraint:'"
+
+
+def test_must_not_unaffected_by_rule_colon_fix():
+    """'must not' trigger must be unaffected by the rule/policy/constraint narrowing."""
+    chunk = _chunk("must not deploy strategies without human approval.")
+    results = extract_from_chunk(chunk)
+    gov = [c for c in results if c.event_type == 'governance_rule']
+    assert gov, "Expected governance_rule from 'must not' — this trigger was not changed"
