@@ -87,9 +87,11 @@ def apply_context_budget(
     """
     max_chars = policy.max_chars
     max_entries = policy.max_entries
+    max_governance_chars = policy.max_governance_chars  # 0 = uncapped
 
     chars_used = 0
     entries_used = 0
+    governance_chars_used = 0
 
     total_candidates = (
         len(governance_context)
@@ -112,6 +114,18 @@ def apply_context_budget(
         chars_used += _char_count(text)
         entries_used += 1
 
+    def _governance_fits(text: str) -> bool:
+        if not _fits(text):
+            return False
+        if max_governance_chars > 0:
+            return governance_chars_used + _char_count(text) <= max_governance_chars
+        return True
+
+    def _accept_governance(text: str) -> None:
+        nonlocal governance_chars_used
+        governance_chars_used += _char_count(text)
+        _accept(text)
+
     out_gov: List[ActivatedMemory] = []
     out_unres: List[ActivatedMemory] = []
     out_wf: List[ActiveWorkflow] = []
@@ -120,12 +134,12 @@ def apply_context_budget(
     out_lin: List[ActiveWorkflow] = []
     out_rt: List[RuntimeSnapshot] = []
 
-    # Tier 0: governance — preserved first
+    # Tier 0: governance — preserved first (optionally capped by max_governance_chars)
     for item in governance_context:
         rendered = item.render()
-        if _fits(rendered):
+        if _governance_fits(rendered):
             out_gov.append(item)
-            _accept(rendered)
+            _accept_governance(rendered)
 
     # Tier 1: unresolved — preserved second
     for item in unresolved_items:

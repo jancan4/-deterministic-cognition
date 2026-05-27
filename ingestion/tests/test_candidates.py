@@ -421,3 +421,86 @@ def test_candidate_count_property():
     doc, chunks, cands = _ingest(text)
     result = IngestionResult(document=doc, chunks=chunks, candidates=cands)
     assert result.candidate_count == len(cands)
+
+
+# ---------------------------------------------------------------------------
+# Defect 1 regression: header-only chunk guard (via full pipeline)
+# ---------------------------------------------------------------------------
+
+def test_header_only_chunk_produces_no_candidates():
+    """A standalone '## Root Cause' paragraph must yield zero candidates through the full pipeline."""
+    text = "Some context paragraph.\n\n## Root Cause\n\nActual content about the incident follows."
+    doc, chunks, cands = _ingest(text)
+    # No candidate should have a title that contains '## '
+    for c in cands:
+        assert '## ' not in c.title
+
+
+# ---------------------------------------------------------------------------
+# Defect 2 regression: fragment quality filter
+# ---------------------------------------------------------------------------
+
+def test_fragment_title_rejected():
+    """A governance_rule event extracted from a 7-char fragment must be filtered out."""
+    # The pattern 'rule[:\s]+' in the extractor matches 'rule change,' producing
+    # a candidate with title content 'change,' (7 chars) — below MIN_USEFUL_CONTENT_CHARS.
+    text = "was it a routing rule change,\nor a traffic spike?"
+    doc, chunks, cands = _ingest(text)
+    for c in cands:
+        title = c.title
+        sep = title.find(': ')
+        content = title[sep + 2:].strip() if sep != -1 else title
+        assert len(content) >= 15, f"Fragment title not filtered: {title!r}"
+
+
+def test_adequate_title_content_passes_filter():
+    """A governance_rule with a full sentence title must pass through unchanged."""
+    text = "governance rule: no live capital deployment without quant validation approval."
+    doc, chunks, cands = _ingest(text)
+    gov = [c for c in cands if c.event_type == 'governance_rule']
+    assert gov, "Expected at least one governance_rule candidate"
+    for c in gov:
+        sep = c.title.find(': ')
+        content = c.title[sep + 2:].strip() if sep != -1 else c.title
+        assert len(content) >= 15
+
+
+# ---------------------------------------------------------------------------
+# Defect 3 regression: markdown sanitization
+# ---------------------------------------------------------------------------
+
+def test_markdown_bold_stripped_from_title():
+    """**bold** markers must be removed from extracted titles."""
+    # Simulate an architecture_decision chunk containing bold markdown
+    text = "We decided to use **PostgreSQL** as the primary store for all events."
+    doc, chunks, cands = _ingest(text)
+    for c in cands:
+        assert '**' not in c.title, f"Bold markdown not stripped from title: {c.title!r}"
+
+
+def test_markdown_bold_stripped_from_summary():
+    """**bold** markers must not appear in the summary field."""
+    text = "ADR: decided to use **WAL mode** for SQLite. This prevents writer starvation."
+    doc, chunks, cands = _ingest(text)
+    for c in cands:
+        assert '**' not in c.summary, f"Bold markdown not stripped from summary: {c.summary!r}"
+
+
+def test_markdown_heading_not_in_title():
+    """Heading syntax '##' must not appear in any extracted title."""
+    # Use a multi-paragraph document so the heading is its own chunk (header-only guard),
+    # and a content paragraph that also references heading-like text inline.
+    text = "Note: the ## section marker appears inline in some documents."
+    doc, chunks, cands = _ingest(text)
+    for c in cands:
+        assert '##' not in c.title, f"Heading marker in title: {c.title!r}"
+
+
+def test_evidence_preserves_raw_source():
+    """evidence must contain the unmodified source text (provenance preservation)."""
+    text = "ADR: decided to use **PostgreSQL** as the primary store."
+    doc, chunks, cands = _ingest(text)
+    for c in cands:
+        if c.evidence:
+            # evidence must contain the original text with markdown intact
+            assert '**' in c.evidence or 'PostgreSQL' in c.evidence

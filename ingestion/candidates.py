@@ -23,6 +23,7 @@ Commit:
   All functions except commit_candidates are read-only and produce no
   side effects. The caller (CLI ingest-file) decides whether to commit.
 """
+import re
 from typing import List, Optional, Tuple
 
 from .models import (
@@ -35,6 +36,57 @@ from .extractor import extract_from_chunks
 
 # Candidates below this confidence are discarded before presenting to operator
 MIN_CANDIDATE_CONFIDENCE = 2
+
+# Minimum chars of real content after stripping the event-type prefix from the title.
+# Titles shorter than this are almost always sentence fragments, not useful memory events.
+MIN_USEFUL_CONTENT_CHARS = 15
+
+# ---------------------------------------------------------------------------
+# Markdown sanitization — applied to display fields (title, summary) only.
+# evidence and source_span are never modified: they carry raw source provenance.
+# ---------------------------------------------------------------------------
+
+_MD_HEADING_RE = re.compile(r'#{1,6}\s')        # ## Title → Title (space required)
+_MD_BOLD_RE = re.compile(r'\*\*([^*\n]*)\*\*')  # **text** → text
+_MD_ITALIC_RE = re.compile(r'\*([^*\n]+)\*')    # *text* → text
+_MD_BOLD_ORPHAN_RE = re.compile(r'\*+')          # leftover asterisks
+_MD_TABLE_DIV_RE = re.compile(                   # |---|---| separator rows
+    r'\|[-:\s|]+\|',
+)
+_MD_PIPE_RE = re.compile(r'\|')                  # table cell borders
+_MD_BACKTICK_RE = re.compile(r'`+([^`\n]*)`+')  # `code` → code
+_MD_MULTI_SPACE_RE = re.compile(r'[ \t]{2,}')   # collapse whitespace
+
+
+def _sanitize_markdown(text: str) -> str:
+    """Strip markdown syntax from a display field. Returns the cleaned string (may be shorter)."""
+    text = _MD_HEADING_RE.sub('', text)
+    text = _MD_BOLD_RE.sub(r'\1', text)
+    text = _MD_ITALIC_RE.sub(r'\1', text)
+    text = _MD_BOLD_ORPHAN_RE.sub('', text)
+    text = _MD_TABLE_DIV_RE.sub(' ', text)
+    text = _MD_PIPE_RE.sub(' ', text)
+    text = _MD_BACKTICK_RE.sub(r'\1', text)
+    text = _MD_MULTI_SPACE_RE.sub(' ', text)
+    return text.strip()
+
+
+def _apply_sanitization(cand: CandidateMemoryEvent) -> None:
+    """Sanitize title and summary in-place. evidence and source_span are untouched."""
+    clean_title = _sanitize_markdown(cand.title)
+    if clean_title:
+        cand.title = clean_title[:80]
+    clean_summary = _sanitize_markdown(cand.summary)
+    if clean_summary:
+        cand.summary = clean_summary
+
+
+def _has_sufficient_content(cand: CandidateMemoryEvent) -> bool:
+    """Return False for candidates whose title carries too little real content."""
+    title = cand.title
+    sep = title.find(': ')
+    content = title[sep + 2:].strip() if sep != -1 else title
+    return len(content) >= MIN_USEFUL_CONTENT_CHARS
 
 
 def _dedup_key(cand: CandidateMemoryEvent, chunk_index: int) -> Tuple:
@@ -98,8 +150,14 @@ def extract_candidates(
     raw = extract_from_chunks(chunks)
     filtered = [c for c in raw if c.confidence >= MIN_CANDIDATE_CONFIDENCE]
     deduped = _deduplicate(filtered, chunks)
-    deduped.sort(key=lambda c: (c.source_span.start, c.event_type))
-    return deduped
+    # Sanitize display fields (title, summary) at the candidate generation boundary.
+    # evidence and source_span are preserved unchanged for provenance.
+    for cand in deduped:
+        _apply_sanitization(cand)
+    # Reject candidates whose title content is too short to be useful (fragment titles).
+    quality = [c for c in deduped if _has_sufficient_content(c)]
+    quality.sort(key=lambda c: (c.source_span.start, c.event_type))
+    return quality
 
 
 def commit_candidates(

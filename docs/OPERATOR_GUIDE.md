@@ -30,6 +30,8 @@ The following terms are used consistently throughout this guide and all other op
 | **lineage integrity** | The property that all foreign-key relationships between activation decisions, context assemblies, activation log transitions, and cognition sessions are intact and unbroken |
 
 > **Authority boundary:** This guide explains operational workflows only. Deep semantics, invariants, and replay compatibility rules are defined in the architecture documents. Do not treat this guide as the authoritative source for lifecycle semantics.
+>
+> **System charter:** The enduring objective, core invariants, operational boundaries, and validation philosophy are defined in [`GOAL.md`](../GOAL.md) at the repository root. Consult that document for freeze discipline and sign-off criteria.
 
 ---
 

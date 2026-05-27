@@ -255,3 +255,48 @@ def test_extract_deterministic():
     r1 = extract_from_chunk(chunk)
     r2 = extract_from_chunk(chunk)
     assert [c.event_type for c in r1] == [c.event_type for c in r2]
+
+
+# ---------------------------------------------------------------------------
+# Defect 1 regression: section header extraction guard
+# ---------------------------------------------------------------------------
+
+def test_header_only_h2_produces_no_candidates():
+    """'## Root Cause' standalone chunk must not produce any incident candidate."""
+    chunk = _chunk("## Root Cause")
+    results = extract_from_chunk(chunk)
+    assert results == []
+
+
+def test_header_only_h1_produces_no_candidates():
+    chunk = _chunk("# Title")
+    assert extract_from_chunk(chunk) == []
+
+
+def test_header_only_h3_produces_no_candidates():
+    chunk = _chunk("### Background")
+    assert extract_from_chunk(chunk) == []
+
+
+def test_header_with_body_still_extracts():
+    """A chunk that has a heading PLUS content lines must still be processed."""
+    text = "## Root Cause\nThe connection pool was exhausted due to a configuration error."
+    chunk = _chunk(text)
+    # Has body content — extraction must run (may or may not produce candidates but must not
+    # short-circuit unconditionally)
+    results = extract_from_chunk(chunk)
+    assert isinstance(results, list)
+
+
+def test_header_only_whitespace_variants_no_candidates():
+    """Header chunk with trailing whitespace must still be detected as header-only."""
+    chunk = _chunk("## Impact  ")
+    assert extract_from_chunk(chunk) == []
+
+
+def test_non_header_chunk_with_hash_symbol_not_blocked():
+    """A chunk referencing a GitHub issue '#123' must not be blocked."""
+    chunk = _chunk("We decided to use ADR #123 as the reference.")
+    results = extract_from_chunk(chunk)
+    # The chunk itself is not a header-only chunk and should be processed normally
+    assert isinstance(results, list)

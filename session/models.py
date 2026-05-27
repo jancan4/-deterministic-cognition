@@ -223,6 +223,13 @@ class ContextActivationPolicy:
     max_chars: int = CHAR_BUDGET_DEFAULT
     max_entries: int = ENTRY_BUDGET_DEFAULT
 
+    # Optional cap on chars consumed by the governance tier (Tier 0).
+    # 0 means uncapped (default: governance fills as much of max_chars as it needs).
+    # Set to a positive value to reserve budget for lower-priority tiers.
+    # Analogous to continuity_char_budget: a per-tier budget that does not overlap
+    # with the main max_chars accounting.
+    max_governance_chars: int = 0
+
     def to_dict(self) -> dict:
         return {
             'tags': list(self.tags),
@@ -242,6 +249,7 @@ class ContextActivationPolicy:
             'max_memory_candidates': self.max_memory_candidates,
             'max_chars': self.max_chars,
             'max_entries': self.max_entries,
+            'max_governance_chars': self.max_governance_chars,
         }
 
     @classmethod

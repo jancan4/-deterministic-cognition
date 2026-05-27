@@ -69,6 +69,15 @@ def _span_from_chunk(chunk: Chunk) -> SourceSpan:
     )
 
 
+def _is_header_only_chunk(text: str) -> bool:
+    """
+    Return True when the chunk is a single markdown section heading with no body.
+    e.g. "## Root Cause" — these produce no useful standalone candidates.
+    """
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return len(lines) == 1 and bool(re.match(r'^#{1,6}\s', lines[0]))
+
+
 # ---------------------------------------------------------------------------
 # Rule base classes
 # ---------------------------------------------------------------------------
@@ -444,6 +453,8 @@ def extract_from_chunk(chunk: Chunk) -> List[CandidateMemoryEvent]:
     candidate per chunk. Duplicates (same event_type from multiple rules on
     the same chunk) are preserved — deduplication is done by candidates.py.
     """
+    if _is_header_only_chunk(chunk.text):
+        return []
     candidates: List[CandidateMemoryEvent] = []
     for rule in _RULES:
         try:

@@ -277,3 +277,70 @@ def test_total_candidates_counts_all_inputs():
         runtime_snapshots=[_runtime(5)],
     )
     assert result.total_candidates == 5
+
+
+# ---------------------------------------------------------------------------
+# Fix 4 regression: max_governance_chars cap
+# ---------------------------------------------------------------------------
+
+def test_max_governance_chars_zero_is_uncapped():
+    """max_governance_chars=0 must behave identically to no cap: all governance items included."""
+    gov_items = [_governance(i) for i in range(5)]
+    result = _budget(
+        policy=_policy(max_governance_chars=0, max_chars=999999),
+        governance_context=gov_items,
+    )
+    assert len(result.governance_context) == 5
+
+
+def test_max_governance_chars_limits_governance_tier():
+    """When max_governance_chars is set, governance entries stop at the cap."""
+    gov1 = _governance(1)
+    gov2 = _governance(2)
+    gov3 = _governance(3)
+    # Set the cap to fit gov1 but not gov1+gov2
+    one_entry_chars = len(gov1.render()) + 4
+    policy = _policy(max_governance_chars=one_entry_chars, max_chars=999999)
+
+    result = _budget(policy=policy, governance_context=[gov1, gov2, gov3])
+    assert len(result.governance_context) == 1
+    assert result.governance_context[0].memory_id == 1
+
+
+def test_max_governance_chars_leaves_budget_for_memory():
+    """After capping governance, relevant_memory must fill the remaining budget."""
+    gov_items = [_governance(i) for i in range(10)]
+    mem_items = [_mem(i + 100) for i in range(5)]
+
+    one_gov_chars = len(gov_items[0].render()) + 4
+    policy = _policy(
+        max_governance_chars=one_gov_chars,  # cap: only 1 governance entry
+        max_chars=999999,
+    )
+    result = _budget(policy=policy, governance_context=gov_items, relevant_memory=mem_items)
+
+    assert len(result.governance_context) == 1
+    assert len(result.relevant_memory) == 5  # all memory fits
+
+
+def test_max_governance_chars_still_respects_overall_budget():
+    """max_governance_chars does not override max_chars: the overall budget still applies."""
+    gov1 = _governance(1)
+    one_entry_chars = len(gov1.render()) + 4
+    # overall budget fits 1 governance entry exactly; governance cap is larger
+    policy = _policy(max_chars=one_entry_chars, max_governance_chars=one_entry_chars * 10)
+
+    result = _budget(
+        policy=policy,
+        governance_context=[gov1, _governance(2)],
+        relevant_memory=[_mem(10)],
+    )
+    # Overall budget exhausted after gov1; gov2 and memory must not fit
+    assert len(result.governance_context) == 1
+    assert len(result.relevant_memory) == 0
+
+
+def test_max_governance_chars_default_is_uncapped():
+    """ContextActivationPolicy default must have max_governance_chars=0 (uncapped)."""
+    policy = _policy()
+    assert policy.max_governance_chars == 0
