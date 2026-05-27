@@ -1,0 +1,129 @@
+# Engineering Issue Backlog
+
+Tracked here: deferred defects and improvement requests that are non-blocking for the current substrate baseline but require engineering resolution before the next major validation milestone.
+
+**Substrate baseline:** a2d8679  
+**Last updated:** 2026-05-27
+
+---
+
+## Classification key
+
+- **Class C** — ingestion quality defect: substrate mechanics intact, parser/extractor output incorrect
+- **non-blocking** — does not block sign-off or operation of the current baseline
+- **deferred** — explicitly deferred from Run #1 and Run #2 remediation scope
+- **parser-quality** — root cause is in `ingestion/extractor.py`, `ingestion/candidates.py`, or pattern rules
+- **not replay/governance defect** — does not affect lineage integrity, continuity portability, or governance detection
+
+---
+
+## EI-001 — governance_rule pattern over-extraction
+
+**Class:** C — parser-quality  
+**Priority:** Medium  
+**Status:** Deferred — non-blocking  
+**Opened:** 2026-05-27 (identified Run #1, confirmed Run #2)
+
+**Symptom:**
+`governance_rule` events are extracted with titles that are mid-paragraph sentence fragments. Examples from Run #2 corpus:
+- "Governance Rule: evaluation was single-threaded."
+- "Governance Rule: via Kubernetes rollout strategy."
+- "Governance Rule: flow into staging."
+- "Governance Rule: set is currently 47 rules."
+
+These pass the 15-char content filter (Fix 2) because they are long enough, but they are not standalone governance statements — they are clauses extracted from the middle of a larger sentence.
+
+**Root cause:**
+The `PatternRule` for `governance_rule` uses the pattern `rule[:\s]+([^\n]{5,120})`. This captures any text after the word "rule" on the same line, including continuations of prior sentences where "rule" appears mid-clause (e.g., "the routing rule evaluates the..." → captures "evaluates the...").
+
+**Not fixed in Run #2 remediation because:**
+Fix 2 addressed the minimum-length floor; fixing the pattern requires narrowing the capture anchor, which risks dropping legitimate short governance rules. Requires corpus-informed calibration.
+
+**Proposed remediation (to be validated):**
+1. Require the pattern to trigger only at the start of a line or after a sentence-ending punctuation (`. `, `! `, `? `, newline).
+2. Alternatively, require the captured text to end at a sentence boundary (`.`, `!`, `?`, or newline) within 120 chars.
+3. Add a heuristic: if the captured fragment starts with a verb in past tense or a pronoun, reject (mid-sentence indicators).
+
+**Acceptance criterion:**
+On the Run #2 frozen corpus, the number of governance_rule events with fragmentary titles (titles that do not form a standalone imperative or declarative statement) drops to < 20% of all governance_rule events.
+
+**Regression guard:**
+`test_governance_rule_must_pattern` and `test_governance_rule_keyword_no_live_capital` in `ingestion/tests/test_extractor.py` must continue to pass.
+
+---
+
+## EI-002 — architecture_decision metadata row extraction
+
+**Class:** C — parser-quality  
+**Priority:** Low  
+**Status:** Deferred — non-blocking  
+**Opened:** 2026-05-27 (identified Run #2)
+
+**Symptom:**
+`architecture_decision` events are extracted with titles that are metadata rows from ADR decision tables rather than decision content. Examples from Run #2 corpus:
+- "Architecture Decision: Date: 2025-10-01"
+- "Architecture Decision: Sam Webb: "Who owns the event store schema?...""
+- "Architecture Decision: Owner Action Due" (table column header, rejected — id=61, 69, 129, 136)
+
+These pass extraction and some pass the quality filter. The rejected variants were caught by the operator review pass, but the retained variants remain as active events with misleading titles.
+
+**Root cause:**
+ADR documents use structured tables for decision metadata (Date, Owner, Action, Due date). The `architecture_decision` pattern fires on any text following "decided", "decision", or "ADR:" including table rows. There is no guard against extracting table-structured metadata as decision content.
+
+**Not fixed in Run #2 remediation because:**
+Fix 3 markdown sanitization strips table dividers (`|---|`) but does not prevent extraction of table cell content as event titles. Fixing requires either a structural parser for markdown tables or a guard that detects table-row context before applying the decision pattern.
+
+**Proposed remediation (to be validated):**
+1. In `_is_table_row(line)`, detect lines that match `|...|...|` structure and suppress pattern matching within them.
+2. In `extract_from_chunk`, skip chunks where the majority of non-empty lines are table rows.
+3. Alternatively, add a post-extraction heuristic: if the title contains `Date:`, `Owner:`, `Action:`, `Due:` as a prefix after the event-type prefix, discard.
+
+**Acceptance criterion:**
+On the Run #2 frozen corpus, zero `architecture_decision` events with titles matching the pattern `Architecture Decision: [A-Z][a-z]+:` (metadata key prefix) are extracted.
+
+**Regression guard:**
+`test_architecture_decision_keyword_adr` and `test_architecture_decision_pattern` in `ingestion/tests/test_extractor.py` must continue to pass.
+
+---
+
+## EI-003 — source_reference over-extraction
+
+**Class:** C — parser-quality  
+**Priority:** Low  
+**Status:** Deferred — non-blocking  
+**Opened:** 2026-05-27 (identified Run #2)
+
+**Symptom:**
+18 `source_reference` events were extracted from the Run #2 corpus and all 18 were rejected by operator review. The events correspond to inline URL citations, bibliography entries, and "See:" references — structural citation markers rather than substantive institutional knowledge.
+
+**Root cause:**
+The `source_reference` pattern fires on any line containing a URL or a "See:" prefix. These are common in reference material, deployment runbooks, and incident reports as navigation aids, not as knowledge claims. The pattern has no minimum context requirement — it fires on a bare URL with no surrounding sentence.
+
+**Not fixed in Run #2 remediation because:**
+The rejection rate of 100% (18/18) was caught and handled by the operator review pass. Suppressing `source_reference` entirely would be too aggressive — legitimate source references with meaningful context (e.g., "See [paper X] for the derivation of the regime classifier confidence threshold") should be captured. The fix requires context sensitivity, not pattern removal.
+
+**Proposed remediation (to be validated), choose one:**
+1. **Confidence floor**: assign `source_reference` a default confidence of 1 (currently 2 or 3). Events at confidence 1 are filtered by the default `min_confidence=2` activation policy, making them invisible to assembly without reaching rejection status.
+2. **Context requirement**: require the URL or citation to appear in a sentence with at least one non-stop-word verb or noun before the URL. Bare-URL lines and table-of-contents entries would not qualify.
+3. **Opt-in extraction**: treat `source_reference` as an opt-in event type that requires an explicit keyword prefix ("source:", "reference:", "citation:") rather than a URL alone.
+
+**Acceptance criterion:**
+On the Run #2 frozen corpus, `source_reference` rejection rate in operator review drops from 100% to ≤ 30%.
+
+**Regression guard:**
+`test_source_reference_pattern` in `ingestion/tests/test_extractor.py` must continue to pass with a well-formed "See: URL" pattern.
+
+---
+
+## Not in scope for this backlog
+
+The following are **not** tracked here because they are architectural decisions, not defects:
+
+- No auto-contradiction detection — documented acceptable limitation in `validation/SIGN_OFF.md §7`
+- `relevant_memory=0` in assembly without semantic search — expected behavior given tier ordering and corpus size; mitigations documented in RUN_20260527_OPERATOR.md
+- Uniform confidence 3 for `governance_rule` — extractor design; calibration requires a separate confidence-assignment strategy
+
+---
+
+*Issues in this file are non-blocking, deferred, and do not affect replay integrity, governance detection, or continuity portability.*  
+*They must be resolved before the next major corpus expansion (> 50 documents) or external operator onboarding.*

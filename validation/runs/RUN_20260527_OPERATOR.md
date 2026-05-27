@@ -311,5 +311,22 @@ All substrate infrastructure checkpoints pass:
 
 ---
 
-*Run log completed: 2026-05-27*  
-*Operator countersign required before this run log is considered valid for release decision.*
+*Run log completed: 2026-05-27*
+
+---
+
+## Countersign
+
+**Countersigned**: 2026-05-27  
+**Quant operator**: Jan Cantryn  
+**Status**: PASS — countersigned and valid for release decision
+
+**Basis for countersign:**
+- Replay integrity validated: source and recovered reconstruction identical (governance_ids, unresolved_ids, chars_used)
+- Continuity portability validated: 147 events, 0 collisions, exact status-distribution match
+- Governance integrity validated: CRITICAL=0; all 10 WARNINGs non-blocking and correctly classified
+- Remediation scope validated: all three Run #1 Class C defects resolved; Fix 4 governance cap confirmed working
+- Deferred issues documented, bounded, and explicitly classified non-blocking in §Operational Pain Points
+- GOAL.md committed at a2d8679 anchors operational invariants and freeze discipline going forward
+
+**No prior findings, severity classifications, or template ratings altered by this countersign.**
