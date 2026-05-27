@@ -310,6 +310,117 @@ class TestRetrieveGovernance:
         results = retrieve_governance(db)
         assert results[0].event.event_type == 'governance_rule'
 
+    # ------------------------------------------------------------------
+    # EI-004 regression: rejected events must not surface in governance tier
+    # ------------------------------------------------------------------
+
+    def test_rejected_governance_rule_excluded(self, tmp_path):
+        """retrieve_governance must not return rejected governance_rule events."""
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        _add(db, event_type='governance_rule', status='rejected')
+        results = retrieve_governance(db)
+        assert results == [], (
+            "Rejected governance_rule surfaced in governance tier: "
+            + str([s.event.title for s in results])
+        )
+
+    def test_rejected_architecture_decision_excluded(self, tmp_path):
+        """retrieve_governance must not return rejected architecture_decision events."""
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        _add(db, event_type='architecture_decision', status='rejected')
+        results = retrieve_governance(db)
+        assert results == [], (
+            "Rejected architecture_decision surfaced in governance tier: "
+            + str([s.event.title for s in results])
+        )
+
+    def test_active_governance_rule_included(self, tmp_path):
+        """retrieve_governance must return active governance_rule events."""
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        ev = _add(db, event_type='governance_rule', status='active')
+        results = retrieve_governance(db)
+        ids = [s.event.id for s in results]
+        assert ev.id in ids, "Active governance_rule missing from governance tier"
+
+    def test_active_architecture_decision_included(self, tmp_path):
+        """retrieve_governance must return active architecture_decision events."""
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        ev = _add(db, event_type='architecture_decision', status='active')
+        results = retrieve_governance(db)
+        ids = [s.event.id for s in results]
+        assert ev.id in ids, "Active architecture_decision missing from governance tier"
+
+    def test_ei004_high_id_rejected_does_not_displace_active(self, tmp_path):
+        """
+        EI-004 regression: a rejected event with a higher ID must not rank above
+        an active event with a lower ID in the governance tier.
+
+        Scenario:
+          - id=1: governance_rule, active, confidence=3
+          - id=2: governance_rule, rejected, confidence=3 (higher ID, same confidence)
+
+        Before fix: both surfaced; id=2 (higher ID) won the recency tiebreaker.
+        After fix: only id=1 is returned.
+        """
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        active_ev = _add(db, event_type='governance_rule', status='active', confidence=3)
+        rejected_ev = _add(db, event_type='governance_rule', status='rejected', confidence=3)
+        results = retrieve_governance(db)
+        ids = [s.event.id for s in results]
+        assert active_ev.id in ids, "Active governance_rule not in results"
+        assert rejected_ev.id not in ids, (
+            "Rejected governance_rule (id=%d) displaced active event (id=%d)"
+            % (rejected_ev.id, active_ev.id)
+        )
+
+    def test_ei004_active_surfaces_when_only_active(self, tmp_path):
+        """
+        EI-004 regression: with only active governance events, all active events
+        surface regardless of count, confirming the filter doesn't suppress actives.
+        """
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        ids = [
+            _add(db, event_type='governance_rule', status='active', confidence=4).id,
+            _add(db, event_type='architecture_decision', status='active', confidence=3).id,
+            _add(db, event_type='governance_rule', status='active', confidence=2).id,
+        ]
+        results = retrieve_governance(db)
+        result_ids = [s.event.id for s in results]
+        for eid in ids:
+            assert eid in result_ids, "Active governance event id=%d missing from tier" % eid
+
+    def test_superseded_governance_excluded(self, tmp_path):
+        """retrieve_governance must not surface superseded events."""
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        _add(db, event_type='governance_rule', status='superseded')
+        results = retrieve_governance(db)
+        assert results == [], "Superseded governance_rule surfaced in governance tier"
+
+    def test_mixed_statuses_only_active_and_accepted_returned(self, tmp_path):
+        """
+        With a mix of active, accepted, rejected, superseded governance events,
+        only active and accepted events must surface.
+        """
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        active_ev   = _add(db, event_type='governance_rule', status='active')
+        accepted_ev = _add(db, event_type='governance_rule', status='accepted')
+        rejected_ev = _add(db, event_type='governance_rule', status='rejected')
+        super_ev    = _add(db, event_type='governance_rule', status='superseded')
+        results = retrieve_governance(db)
+        ids = {s.event.id for s in results}
+        assert active_ev.id in ids,   "active governance_rule must be in results"
+        assert accepted_ev.id in ids, "accepted governance_rule must be in results"
+        assert rejected_ev.id not in ids,  "rejected governance_rule must not be in results"
+        assert super_ev.id not in ids,     "superseded governance_rule must not be in results"
+
 
 # ---------------------------------------------------------------------------
 # related-event expansion

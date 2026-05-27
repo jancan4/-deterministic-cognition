@@ -227,6 +227,7 @@ def retrieve_adaptations(db_path: str, tags: Optional[List[str]] = None, limit: 
 def retrieve_governance(db_path: str, limit: int = 20) -> List[ScoredEvent]:
     query = RetrievalQuery(
         event_types=['governance_rule', 'architecture_decision'],
+        statuses=['active', 'accepted'],
         limit=limit,
         expand_related=False,
     )

@@ -2,8 +2,8 @@
 
 Tracked here: deferred defects and improvement requests that are non-blocking for the current substrate baseline but require engineering resolution before the next major validation milestone.
 
-**Substrate baseline:** a2d8679  
-**Last updated:** 2026-05-27 (EI-001 updated post-remediation)
+**Substrate baseline:** 9245ee7  
+**Last updated:** 2026-05-27 (EI-004 remediated; EI-006 opened)
 
 ---
 
@@ -125,6 +125,59 @@ On the Run #2 frozen corpus, `source_reference` rejection rate in operator revie
 
 **Regression guard:**
 `test_source_reference_pattern` in `ingestion/tests/test_extractor.py` must continue to pass with a well-formed "See: URL" pattern.
+
+---
+
+## EI-006 — Governance partition includes rejected and superseded events from general retrieval path
+
+**Class:** Non-blocking — retrieval/noise issue  
+**Priority:** Low  
+**Status:** Deferred — non-blocking  
+**Opened:** 2026-05-27 (identified during EI-004 remediation, Longitudinal Run L1)
+
+**Symptom:**
+After the EI-004 fix to `retrieve_governance()`, the governance context tier still surfaces a bounded number of rejected and superseded events. Observed in `longitudinal_v1.db` post-EI-004-fix: events with status `rejected` (ids 20, 36, 63 — EI-001 `must not` fragments, conf=3) and `superseded` (ids 25, 31 — pre-ADR-007 Kafka decisions) appear alongside active governance events in the assembled governance tier.
+
+**Root cause:**
+`activate_memory()` in `session/activation.py` runs two retrieval passes:
+
+1. `retrieve_governance()` — fixed by EI-004 to return only `active` and `accepted` events.
+2. A general `RetrievalQuery` with no `event_types` and no `statuses` filter — returns all event types at all statuses that meet `min_confidence`. This pass is designed to surface residual events not covered by specific retrieval paths.
+
+After deduplication by `seen_ids`, `governance_rule` and `architecture_decision` events retrieved by the general pass (but excluded from the governance pass because they are rejected/superseded) are added to the activation set. `partition_by_section()` then routes all events with `event_type in GOVERNANCE_EVENT_TYPES` to `governance_context` without checking status. Rejected and superseded governance-typed events therefore appear in the governance tier.
+
+**Affected code paths:**
+- `session/activation.py` — `activate_memory()` general retrieval query (lines ~153–159): no `statuses` filter
+- `session/activation.py` — `partition_by_section()` (lines ~192–193): routes by `event_type` only, not by `status`
+
+**Current operational impact:**
+The governance tier is semantically noisy. Rejected and superseded entries consume governance tier budget and may displace additional active events. Impact is bounded: at the standard `max_governance_chars=4000` policy, the L1 corpus produces a 7-entry governance tier with 2 active, 3 rejected (small `must not` verb fragments), and 2 superseded entries.
+
+**Why EI-004 fixed the primary blocker:**
+EI-004's root cause was `retrieve_governance()` returning unfiltered results ordered by `id DESC`, allowing late-ingested high-ID rejected table-header artifacts (ids 117, 119, 120, conf=4) to consume the entire governance tier budget and produce 0 active events in assembly. The EI-004 fix eliminates that specific path. The residual events (20, 36, 63, 25, 31) enter via the general retrieval path, are lower-confidence fragments, and do not exhaust the budget — active events now surface.
+
+**Why EI-006 is deferred:**
+- The governance tier is no longer collapsed (0 active → 2 active after EI-004).
+- The residual rejected/superseded entries are bounded and predictable.
+- The issue does not affect lineage integrity, replay determinism, or continuity portability.
+- Fixing requires modifying `partition_by_section()` routing logic, which has broad test coverage implications. Conservative approach: defer pending a dedicated retrieval-partitioning review.
+
+**Recommended future remediation:**
+Add a status exclusion guard in `partition_by_section()` in `session/activation.py`:
+
+```python
+EXCLUDE_FROM_GOVERNANCE = frozenset({'rejected', 'superseded', 'archived', 'deprecated'})
+
+if mem.event_type in GOVERNANCE_EVENT_TYPES and mem.status not in EXCLUDE_FROM_GOVERNANCE:
+    sections['governance_context'].append(mem)
+```
+
+This preserves `active`, `accepted`, `unresolved`, and `proposed` governance events while excluding terminal-status events. Requires regression tests covering: rejected governance_rule excluded from tier, superseded architecture_decision excluded, unresolved governance_rule still included.
+
+**Acceptance criterion:**
+After fix, governance context tier contains zero events with status in `{'rejected', 'superseded', 'archived', 'deprecated'}` under any activation policy.
+
+**Not replay-affecting, not continuity-corrupting.**
 
 ---
 
