@@ -648,4 +648,209 @@ L1-C3 focus: governance tier quality under continued accumulation pressure, EI-0
 
 ---
 
+## 12. Checkpoint L1-C3
+
+**Date:** 2026-05-28  
+**Commit baseline:** 0ae2a1e (EI-006 fix)  
+**DB state entering L1-C3:** 215 events (60 active, 150 rejected, 5 superseded), max id=215
+
+---
+
+### 12.1 Corpus batch 3
+
+5 documents added (2026-04-28 through 2026-05-14):
+
+| Document | Content |
+|---|---|
+| INC-006-2026-04-28-hpa-flapping.md | HPA autoscaler flapping: 10,000-msg trigger too sensitive at current throughput |
+| ADR-010-jwt-lifetime-extension.md | JWT lifetime extended 15→30 min; ADR-006 §2 constraint superseded |
+| 2026-05-09-q2-mid-quarter-review.md | Q2 mid-quarter: OTel slipped, schema versioning deferred, JWT complete |
+| 2026-Q2-midpoint-revision.md | Q2 roadmap v2.0: OTel + schema versioning → Q3 |
+| operational-limits-v3.md | Updated operational limits: JWT 30 min, HPA trigger 20,000 msg, cooldown |
+
+Ingestion result: 189 chunks, 59 candidates committed
+
+### 12.2 Operator review
+
+| Queue | Total | Approved (active) | Rejected |
+|---|---|---|---|
+| Proposed | 55 | 24 | 31 |
+| Unresolved | 4 | 2 | 2 |
+| **Total** | **59** | **26** | **33** |
+
+0 events unreviewed after separate unresolved queue pass.
+
+Rejection patterns:
+- Table headers (Priority Item Status Notes, Risk Owner Status, Status: Accepted): 3 events
+- Source attributions (Source: ADR-XXX...) from operational-limits-v3: 7 events
+- Governance rule fragments starting with "be..." (must-not-be EI-001 pattern): 4 events
+- List item fragments, date stamps, generic summaries: 9 events
+- Validation result fragments: 2 events
+- Cross-batch duplicate fragments from op-limits table structure: 6 events
+
+### 12.3 Governance report
+
+| Severity | Count |
+|---|---|
+| CRITICAL | 0 |
+| WARNING | 23 |
+| INFO | 251 |
+
+WARNING breakdown: 18 duplicate_title (cross-doc structural repetition from operational-limits-v2/v3 table rows), 5 low_confidence_active (pre-existing, known). No new patterns. No blocking issues.
+
+### 12.4 Lineage integrity
+
+all_ok=True, total_broken=0
+
+### 12.5 Contradiction links and supersession (EI-005 protocol)
+
+Contradiction links created before supersession:
+
+| Link ID | Source | Target | Relationship |
+|---|---|---|---|
+| 16 | id=43 (ADR-006 JWT 15 min) | id=228 (ADR-010 JWT 30 min) | contradicts |
+| 17 | id=206 (op-limits-v2 10,000-msg trigger) | id=218 (INC-006 root cause) | contradicts |
+| 18 | id=209 (OTel Q2 2026-05-01) | id=239 (OTel deferred Q3) | contradicts |
+
+Supersessions applied:
+
+| Event ID | Title (truncated) | Superseded by |
+|---|---|---|
+| id=43 | ADR-006 JWT 15-minute lifetime | ADR-010 (id=228) |
+| id=46 | ADR-006 JWT open concern | ADR-010 resolution |
+| id=206 | op-limits-v2 10,000-msg autoscale trigger | INC-006 action (id=218) |
+| id=209 | OTel Q2 2026-05-01 target | Q3 deferral (id=239) |
+
+Post-supersession DB state: 274 total, 82 active, 183 rejected, 9 superseded
+
+### 12.6 Assembly reconstruction
+
+Policy: max_chars=16000, min_confidence=2, max_governance_chars=4000, include_unresolved=True
+
+| Metric | Value |
+|---|---|
+| chars_used | 15915 / 16000 |
+| included_entries | 28 |
+| truncated | True |
+| governance_context entries | 7 (all active) |
+| unresolved_items | 0 |
+| active_investigations | 0 |
+| relevant_memory | 21 |
+
+Governance tier (all active):
+- id=227 governance_rule — The 30-minute token lifetime must not be increased (ADR-010)
+- id=274 architecture_decision — Operational limits binding; limit changes require ADR update (op-limits-v3)
+- id=267 architecture_decision — ADR-009 target 2026-05-01 not met; OTel deferred to Q3 2026
+- id=262 architecture_decision — 30-minute token lifetime must not be increased without re-evaluating exposure model
+- id=260 architecture_decision — The 15-minute constraint from ADR-006 is no longer operative (ADR-010)
+- id=259 architecture_decision — [REVISED] JWT previous values: 15 min lifetime, 2 min refresh window
+- id=236 architecture_decision — OTel implementation slipped; complexity in context propagation layer
+
+EI-006 fix confirmed: 0 rejected, 0 superseded events in governance_context tier.
+
+**Governance tier recency bias observation:** All 7 governance entries are from L1-C3 batch (ids 227–274). Older operative decisions (replica limits id=14/19, connection pool id=38/41, deployment limits id=122) are excluded from the governance tier despite being active. They have lower activation scores due to higher recency_rank. This is a long-horizon usability concern: as the corpus grows, operative constraints from earlier batches become invisible in governance context.
+
+### 12.7 Replay determinism
+
+×2 reconstructions → identical governance IDs, chars_used, included_entries. PASS.
+
+### 12.8 Continuity export / import
+
+Export: 274 events, schema_version=1.2  
+Import to clean DB: 274 imported, 0 skipped, 0 collisions  
+Reconstruction identity: governance IDs [227, 274, 267, 262, 260, 259, 236] match; chars_used 15915=15915  
+ROUND-TRIP: PASS
+
+Bundle: `longitudinal_v1_bundle_L1C3.json`, assembly_id=4
+
+### 12.9 New issue: EI-008
+
+**EI-008: Rejected events surface in relevant_memory via general retrieve pass**
+
+`activate_memory()` general retrieve pass has no status filter. Rejected events with confidence ≥ min_confidence pass the activation filter. EI-006 fix excluded them from governance_context; they now fall to `relevant_memory`. At L1-C3, 5 of the top 21 relevant_memory entries are rejected governance_rule fragments (ids 273, 261, 225, 219, 213 — all must-not-be verb fragments from previous batches).
+
+Root cause: the fix for EI-006 correctly gates governance_context, but `relevant_memory` is the catch-all with no status guard. Rejected events with confidence ≥ 2 always surface here.
+
+Classification: Class C retrieval/noise, non-blocking, not replay-affecting. Fix: either a status filter on the general retrieve pass, or a status guard in the `relevant_memory` fallthrough in `partition_by_section()`. Deferred — does not affect governance correctness or determinism.
+
+### 12.10 L1-C3 assessment
+
+| Criteria | Status |
+|---|---|
+| Operator review completes (0 unreviewed) | PASS (includes 4 unresolved incident fragments) |
+| CRITICAL governance issues | 0 — PASS |
+| Lineage integrity | PASS |
+| Continuity round-trip | PASS |
+| Replay determinism | PASS |
+| Supersession workflow functional | PASS — EI-005 protocol observed, 3 links before 4 supersessions |
+| Contradiction linking functional | PASS — 3 links created |
+| EI-006 fix confirmed under accumulation | PASS — 0 rejected/superseded in governance tier |
+| Assembly produces useful governance context | PASS — 7 active substantive decisions |
+| Retrieval quality | CONDITIONAL — semantic queries return unrelated events; known limitation |
+| EI-007 operational impact | LOW-MEDIUM — 4 unresolved fragments reviewed separately; manageable |
+| EI-008 new issue | OPENED — rejected events in relevant_memory; non-blocking |
+| Governance recency bias | OBSERVED — older operative constraints invisible in governance tier under pressure |
+
+**Checkpoint L1-C3 assessment: PASS**
+
+Substrate mechanics (ingestion, lineage, supersession, contradiction linking, export/import, determinism) all sound. EI-006 fix confirmed under accumulation: governance tier holds at 7 active entries, all substantive, no fragment contamination. Continuity portable. Determinism stable.
+
+**Primary observation:** Governance tier recency bias is the emerging concern for long-horizon usability. Under the default activation scoring, recent governance events displace older operative constraints. The system correctly tracks what changed most recently, but the operator cannot assume the governance tier reflects the full operative constraint set — only the most recently surfaced subset. This becomes more acute as the corpus grows.
+
+**EI-007 trajectory:** Incident pattern false positives continue at ~4/batch. The unresolved queue review burden is low at current batch sizes but will grow proportionally.
+
+**EI-008 observation:** Rejected events in `relevant_memory` are a quality concern. As the rejected event corpus grows (183 rejected at L1-C3, likely to reach 300+ by L1-C4), the `relevant_memory` tier will contain an increasing proportion of non-actionable fragments. This is the same accumulation dynamic as EI-006 but for the fallback tier.
+
+**Recommendation before L1-C4:** Consider whether EI-008 (rejected events in relevant_memory) warrants a minimum-surface fix (status guard in relevant_memory fallthrough) before the next corpus batch. The dynamics are similar to EI-006 and will follow the same accumulation trajectory.
+
+---
+
+## 13. Post-Checkpoint L1-C3 Remediation
+
+### 13.1 EI-008 fix — relevant_memory status exclusion
+
+**Date:** 2026-05-28  
+**Trigger:** L1-C3 observation — 21/28 assembly relevant_memory entries were rejected/superseded fragments
+
+**Root cause (confirmed):**
+`partition_by_section()` `relevant_memory` fallthrough (`if not placed`) had no status guard. Rejected/superseded events excluded from `governance_context` by EI-006 fell through unconditionally to `relevant_memory`.
+
+**Fix applied:**
+One-line addition to `partition_by_section()`:
+```python
+if not placed and mem.status not in GOVERNANCE_EXCLUDE_STATUSES:
+    sections['relevant_memory'].append(mem)
+```
+Reuses existing `GOVERNANCE_EXCLUDE_STATUSES` constant. Also updated constant docstring to reflect dual application (EI-006 governance_context, EI-008 relevant_memory). 9 EI-008 regression tests added. One EI-006 test updated: `test_ei006_rejected_governance_falls_to_relevant_memory` → `test_ei006_rejected_governance_excluded_from_all_sections` (rejected governance now excluded from all sections).
+
+**Post-fix verification (longitudinal_v1.db):**
+
+| Metric | Before (EI-008 open) | After (EI-008 remediated) |
+|---|---|---|
+| relevant_memory entries | 21 (all rejected/superseded) | 0 |
+| rejected/superseded in relevant_memory | 21 | 0 |
+| included_entries | 28 | 7 |
+| chars_used | 15915 / 16000 | 3900 / 16000 |
+| governance tier (active) | 7 | 7 (unchanged) |
+| replay determinism | PASS | PASS |
+| continuity round-trip (274 events) | PASS | PASS |
+
+**Revealed behavior:**
+Post-fix, `relevant_memory` is empty. The 21 previously-included entries were 100% rejected/superseded events. Active non-governance events (8 incidents, 2 open_questions, 4 implementation_notes, 4 validation_results) are not surfacing via the general retrieve — the `max_memory_candidates=50` limit fills entirely with architecture_decision events (66 active, conf ≥ 3). This is a pre-existing retrieval architecture limitation (related to governance recency bias, deferred per operator decision). The EI-008 fix is correct: the session context is now smaller but entirely substantive.
+
+**Test suite:** 3203 passed, 1 warning.
+
+**Files changed:**
+- `session/activation.py` — one-line status guard + docstring update
+- `session/tests/test_activation.py` — 9 EI-008 regression tests + 1 EI-006 test name/assertion update
+- `docs/ENGINEERING_ISSUES.md` — EI-008 entry added as Remediated
+
+### 13.2 L1-C4 readiness
+
+EI-008 fix applied and verified. Session context is now free of rejected/superseded events in all tiers. Determinism and round-trip PASS. L1-C4 may proceed.
+
+L1-C4 focus: governance recency bias observation under further accumulation, EI-007 unresolved queue growth, retrieval architecture pressure as non-governance active events grow.
+
+---
+
 *This document is the operator record for Longitudinal Run L1. Findings are recorded as observed; no remediation is performed during the run unless replay integrity, lineage, or determinism breaks.*

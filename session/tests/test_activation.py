@@ -310,13 +310,21 @@ def test_ei006_active_governance_survives_with_rejected():
     )
 
 
-def test_ei006_rejected_governance_falls_to_relevant_memory():
-    """A rejected governance event excluded from governance_context falls to
-    relevant_memory (documents the post-fix fallthrough behavior)."""
+def test_ei006_rejected_governance_excluded_from_all_sections():
+    """A rejected governance event is excluded from all sections.
+    EI-006: excluded from governance_context.
+    EI-008: also excluded from relevant_memory fallback.
+    It appears in no section — not surfaced to session context at all."""
     mem = _make_mem(30, 'governance_rule', 'rejected')
     sections = partition_by_section([mem])
-    assert mem not in sections['governance_context']
-    assert mem in sections['relevant_memory']
+    assert mem not in sections['governance_context'], (
+        "EI-006 regression: rejected governance_rule in governance_context"
+    )
+    assert mem not in sections['relevant_memory'], (
+        "EI-008 regression: rejected governance_rule in relevant_memory fallback"
+    )
+    assert mem not in sections['unresolved_items']
+    assert mem not in sections['active_investigations']
 
 
 def test_ei006_unresolved_governance_still_included():
@@ -336,3 +344,102 @@ def test_ei006_accepted_governance_still_included():
     mem = _make_mem(41, 'architecture_decision', 'accepted')
     sections = partition_by_section([mem])
     assert mem in sections['governance_context']
+
+
+# ---------------------------------------------------------------------------
+# EI-008 regression: partition_by_section must exclude terminal-status events
+# from relevant_memory fallback
+# ---------------------------------------------------------------------------
+
+def test_ei008_rejected_implementation_note_excluded():
+    """A rejected implementation_note must not appear in relevant_memory."""
+    mem = _make_mem(50, 'implementation_note', 'rejected')
+    sections = partition_by_section([mem])
+    assert mem not in sections['relevant_memory'], (
+        "EI-008 regression: rejected implementation_note appeared in relevant_memory"
+    )
+
+
+def test_ei008_superseded_implementation_note_excluded():
+    """A superseded implementation_note must not appear in relevant_memory."""
+    mem = _make_mem(51, 'implementation_note', 'superseded')
+    sections = partition_by_section([mem])
+    assert mem not in sections['relevant_memory'], (
+        "EI-008 regression: superseded implementation_note appeared in relevant_memory"
+    )
+
+
+def test_ei008_rejected_governance_excluded_from_both():
+    """A rejected governance_rule must be excluded from both governance_context
+    and relevant_memory — it should not appear in any section."""
+    mem = _make_mem(52, 'governance_rule', 'rejected')
+    sections = partition_by_section([mem])
+    assert mem not in sections['governance_context'], (
+        "EI-006 regression: rejected governance_rule in governance_context"
+    )
+    assert mem not in sections['relevant_memory'], (
+        "EI-008 regression: rejected governance_rule fell through to relevant_memory"
+    )
+
+
+def test_ei008_archived_excluded():
+    """An archived event must not appear in relevant_memory."""
+    mem = _make_mem(53, 'implementation_note', 'archived')
+    sections = partition_by_section([mem])
+    assert mem not in sections['relevant_memory'], (
+        "EI-008 regression: archived event appeared in relevant_memory"
+    )
+
+
+def test_ei008_deprecated_excluded():
+    """A deprecated event must not appear in relevant_memory."""
+    mem = _make_mem(54, 'validation_result', 'deprecated')
+    sections = partition_by_section([mem])
+    assert mem not in sections['relevant_memory'], (
+        "EI-008 regression: deprecated event appeared in relevant_memory"
+    )
+
+
+def test_ei008_active_relevant_still_included():
+    """An active non-governance, non-investigation event must still appear
+    in relevant_memory (preservation test)."""
+    mem = _make_mem(55, 'implementation_note', 'active')
+    sections = partition_by_section([mem])
+    assert mem in sections['relevant_memory']
+
+
+def test_ei008_accepted_relevant_still_included():
+    """An accepted non-governance, non-investigation event must appear
+    in relevant_memory (preservation test)."""
+    mem = _make_mem(56, 'validation_result', 'accepted')
+    sections = partition_by_section([mem])
+    assert mem in sections['relevant_memory']
+
+
+def test_ei008_rejected_and_active_mix():
+    """Primary EI-008 regression: when rejected and active events coexist,
+    only active events appear in relevant_memory."""
+    active_mem = _make_mem(60, 'implementation_note', 'active')
+    rejected_mem = _make_mem(61, 'implementation_note', 'rejected')
+    superseded_mem = _make_mem(62, 'validation_result', 'superseded')
+
+    sections = partition_by_section([active_mem, rejected_mem, superseded_mem])
+
+    assert active_mem in sections['relevant_memory'], (
+        "Active implementation_note must be in relevant_memory"
+    )
+    assert rejected_mem not in sections['relevant_memory'], (
+        "EI-008 regression: rejected event appeared in relevant_memory"
+    )
+    assert superseded_mem not in sections['relevant_memory'], (
+        "EI-008 regression: superseded event appeared in relevant_memory"
+    )
+
+
+def test_ei008_unresolved_goes_to_unresolved_not_relevant():
+    """An unresolved non-governance, non-investigation event goes to
+    unresolved_items and is NOT placed in relevant_memory."""
+    mem = _make_mem(63, 'implementation_note', 'unresolved')
+    sections = partition_by_section([mem])
+    assert mem in sections['unresolved_items']
+    assert mem not in sections['relevant_memory']

@@ -3,7 +3,7 @@
 Tracked here: deferred defects and improvement requests that are non-blocking for the current substrate baseline but require engineering resolution before the next major validation milestone.
 
 **Substrate baseline:** 9245ee7  
-**Last updated:** 2026-05-28 (EI-004 remediated; EI-006 remediated post-L1-C2)
+**Last updated:** 2026-05-28 (EI-004 remediated; EI-006 remediated post-L1-C2; EI-008 remediated post-L1-C3)
 
 ---
 
@@ -181,6 +181,58 @@ This preserves `active`, `accepted`, `unresolved`, and `proposed` governance eve
 | replay determinism | N/A | PASS |
 
 **Acceptance criterion:** Met. Governance context tier contains zero events with status in `{'rejected', 'superseded', 'archived', 'deprecated'}`. Full suite: **3194 passed**.
+
+**Not replay-affecting, not continuity-corrupting.**
+
+---
+
+## EI-008 — Rejected and superseded events surface in relevant_memory via general retrieve fallback
+
+**Class:** Non-blocking — retrieval/noise issue  
+**Priority:** Medium (same accumulation dynamics as EI-006, same trajectory)  
+**Status:** Remediated — 2026-05-28  
+**Opened:** 2026-05-28 (identified during L1-C3 checkpoint)  
+**Remediated:** 2026-05-28 — `session/activation.py` + 9 regression tests in `session/tests/test_activation.py`
+
+**Symptom:**
+At L1-C3 (274 events), 21 of 28 assembly `relevant_memory` entries were rejected or superseded events. The first 5 visible entries were rejected governance_rule fragments. The `relevant_memory` tier was providing the appearance of context while containing exclusively non-actionable artifacts.
+
+**Root cause:**
+`partition_by_section()` had status guards only for `governance_context` (EI-006 fix) and `unresolved_items`/`active_investigations` (which rely on status-matching conditions). The final fallthrough — `if not placed` → `relevant_memory` — had no status guard. Events excluded from `governance_context` by the EI-006 fix (rejected/superseded governance events) fell through to `relevant_memory`. Additionally, any other rejected/superseded events retrieved via the general pass fell to `relevant_memory` unconditionally.
+
+**Affected code paths:**
+- `session/activation.py` — `partition_by_section()` line ~207: `if not placed` with no status check
+
+**Remediation applied (2026-05-28):**
+Added status exclusion guard to the `relevant_memory` fallthrough, reusing the existing `GOVERNANCE_EXCLUDE_STATUSES` constant:
+
+```python
+if not placed and mem.status not in GOVERNANCE_EXCLUDE_STATUSES:
+    sections['relevant_memory'].append(mem)
+```
+
+Also updated docstring on `GOVERNANCE_EXCLUDE_STATUSES` to reflect dual application (EI-006 and EI-008). Updated one existing EI-006 test that documented the old fallthrough behavior. 9 new EI-008 regression tests added.
+
+**Revealed behavior:**
+Post-fix, `relevant_memory` is empty at L1-C3. The 21 previously included entries were 100% rejected/superseded events. Active non-governance events (incidents, implementation_notes, open_questions) were never reaching the activated set via the general retrieve — the general retrieve's `max_memory_candidates=50` limit fills entirely with architecture_decision events (66 active, all confidence ≥ 3), which dominate the recency/confidence ordering. This is a pre-existing retrieval architecture limitation (related to governance recency bias, deferred). The fix is not responsible for the empty tier — it reveals what was always true about the retrieval subsystem's coverage.
+
+**Post-fix result (L1-C3 longitudinal_v1.db):**
+
+| Metric | Before (EI-008 open) | After (EI-008 remediated) |
+|---|---|---|
+| relevant_memory entries | 21 (all rejected/superseded) | 0 (correct — nothing substantive retrievable) |
+| rejected/superseded in relevant_memory | 21 | 0 |
+| included_entries | 28 | 7 |
+| chars_used | 15915 / 16000 | 3900 / 16000 |
+| governance tier | 7 active | 7 active (unchanged) |
+| replay determinism | PASS | PASS |
+| continuity round-trip | PASS | PASS |
+
+**Note on chars_used drop:** The 15915 chars previously used were almost entirely for rejected/superseded fragments. The post-fix 3900 chars represent genuine active institutional knowledge. The session context is now smaller but entirely substantive.
+
+**Acceptance criterion:** Met. `relevant_memory` contains zero events with status in `{'rejected', 'superseded', 'archived', 'deprecated'}`. Full suite: **3203 passed**.
+
+**Also updated:** `test_ei006_rejected_governance_falls_to_relevant_memory` renamed to `test_ei006_rejected_governance_excluded_from_all_sections` to reflect that rejected governance events now appear in NO section (not just excluded from governance_context).
 
 **Not replay-affecting, not continuity-corrupting.**
 

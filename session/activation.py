@@ -26,10 +26,10 @@ GOVERNANCE_EVENT_TYPES = frozenset({'governance_rule', 'architecture_decision'})
 # Statuses that indicate an unresolved item
 UNRESOLVED_STATUSES = frozenset({'unresolved', 'proposed'})
 
-# Terminal-negative statuses excluded from the governance_context partition.
+# Terminal-negative statuses excluded from session context partitions.
 # Events with these statuses have been explicitly rejected or superseded and
-# must not consume governance tier budget or displace active institutional
-# knowledge. (EI-006 fix)
+# must not consume context budget or displace active institutional knowledge.
+# Applied to: governance_context (EI-006) and relevant_memory (EI-008).
 GOVERNANCE_EXCLUDE_STATUSES = frozenset({'rejected', 'superseded', 'archived', 'deprecated'})
 
 
@@ -204,7 +204,7 @@ def partition_by_section(
         if mem.event_type in INVESTIGATION_EVENT_TYPES:
             sections['active_investigations'].append(mem)
             placed = True
-        if not placed:
+        if not placed and mem.status not in GOVERNANCE_EXCLUDE_STATUSES:
             sections['relevant_memory'].append(mem)
     return sections
 
