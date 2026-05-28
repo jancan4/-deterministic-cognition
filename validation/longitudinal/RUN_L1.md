@@ -2267,3 +2267,197 @@ Change doctrine ranks: `open_question` → 5, `incident` → 5 (raising them abo
 ---
 
 *This document is the operator record for Longitudinal Run L1. Findings are recorded as observed; no remediation is performed during the run unless replay integrity, lineage, or determinism breaks.*
+
+---
+
+## §22 — L1-C8 Checkpoint: OTel Phase 3, INC-010, Q3 Close Review
+
+**Date:** 2026-05-28  
+**Checkpoint class:** Moderate batch — 3 documents, 54 candidates ingested
+
+---
+
+### 22.1 Corpus Batch Description
+
+Three documents added to `validation/longitudinal/corpus/`:
+
+| Document | Path | Source |
+|---|---|---|
+| INC-010 router trace header overflow | `incidents/INC-010-2026-09-08-router-trace-header-overflow.md` | Staging incident 2026-09-08 |
+| OTel Phase 3 completion note | `planning/2026-09-12-otel-phase3-complete.md` | Amara Osei, 2026-09-12 |
+| Q3 close review meeting notes | `meetings/2026-09-25-q3-close-review.md` | Marcus Lee, 2026-09-25 |
+
+**Thematic content:** OTel Phase 3 (Helix-Router tracing live), INC-010 (staging-only header overflow during Phase 3 pre-deployment), ADR-012 (trace context infrastructure requirements), Q3 close declaration, parity check retirement deferral, two new Q4 open questions.
+
+---
+
+### 22.2 Ingestion Results
+
+Ingestion via `ingestion/ingest.py` produced 54 candidate events (IDs 487–540).
+
+**Pre-ingest state:** 486 total (196 active, 281 rejected, 9 superseded, 0 unresolved)  
+**Post-ingest, pre-review:** 540 total (196 active, 46 proposed, 281 rejected, 9 superseded, 8 unresolved)
+
+EI-007 pattern (incident/open_question routing) fired on 8 fragments, producing unresolved events that were handled at review.
+
+---
+
+### 22.3 Operator Review Decisions
+
+**Total reviewed:** 54 candidates (46 proposed + 8 unresolved)  
+**Approved → active:** 18  
+**Rejected:** 36
+
+| Decision | Count | Rationale |
+|---|---|---|
+| Approved | 18 | Substantive: val_results, impl_notes, arch_decisions, governance_rules, open_questions |
+| Rejected (fragments) | 21 | Sentence fragments without standalone meaning |
+| Rejected (duplicates) | 9 | arch_decision type mis-applied to impl_note content |
+| Rejected (EI-007 false positives) | 5 | incident/open_question events from document body text; IDs 488, 490, 500, 518, 528 |
+| Rejected (source_references) | 2 | IDs 532, 536 |
+
+**Approved events by type:**
+
+| Type | Count | IDs |
+|---|---|---|
+| validation_result | 5 | 487, 493, 513, 514, 523 |
+| implementation_note | 7 | 494, 496, 504, 507, 509, 510, 526 |
+| architecture_decision | 2 | 517 (ADR-012), 525 (parity check deferral) |
+| governance_rule | 1 | 534 (superseded ADR bidirectional refs) |
+| open_question | 3 | 497 (INC-010 follow-up), 538 (Q4 P1 OTel), 539 (operational-limits growth) |
+
+**Post-review DB state:** 540 total (214 active, 317 rejected, 9 superseded, 0 unresolved)  
+Active delta: +18 (196 → 214)  
+Rejected delta: +36 (281 → 317)  
+Unresolved cleared: 8 → 0 (3 promoted to active, 5 rejected)
+
+---
+
+### 22.4 Context Assembly: Section Composition
+
+**Policy:** ContextActivationPolicy defaults (max_chars=12000, max_entries=60, max_governance_chars=6000, max_memory_candidates=50, include_investigations=True)
+
+**Assembly fingerprint:** `9594d09a1bd7bf60`  
+**Chars used:** 11,979 / 12,000 (99.8%)  
+**Total candidates:** 126  
+**Included entries:** 13  
+**Truncated:** True
+
+| Section | Items | Chars (approx) | Types |
+|---|---|---|---|
+| governance_context | 7 | ~5,796 | 6 governance_rule, 1 architecture_decision |
+| unresolved_items | 0 | 0 | — |
+| active_investigations | 6 | ~6,183 | 6 open_question |
+| relevant_memory | 0 | 0 | — |
+
+**governance_context items (IDs in activation order):**  
+[534] governance_rule (new — superseded ADR bidirectional refs), [476] governance_rule, [419] governance_rule, [394] governance_rule, [306] governance_rule, [227] governance_rule, [472] architecture_decision
+
+**active_investigations items (IDs in activation order):**  
+[539] open_question (new — operational-limits growth monitoring), [538] open_question (new — Q4 P1 OTel per-event sampling), [497] open_question (new — INC-010 ADR-009 infrastructure gap), [466] open_question, [458] open_question, [444] open_question
+
+---
+
+### 22.5 Governance Visibility Gap: ADR-012 Excluded by Char Cap
+
+**Observation:** ADR-012 [517] (trace context infrastructure requirements, approved 2026-09-12) does NOT appear in `governance_context` despite being activated at rank `(0, 2, -4, 2, 0, 517)` — position 7 in governance activation order, immediately after the 6 governance_rules.
+
+**Root cause:** max_governance_chars=6000. After 6 governance_rules (cumulative ~4,893 chars including separator overhead), ADR-012's rendered text (1,334 chars) would push governance to ~6,227 chars — 227 chars over the cap. ADR-012 is skipped. Architecture_decision [472] (893 chars, cumulative ~5,796) fits and is included instead.
+
+**Impact:** ADR-012, the primary governance deliverable of L1-C8 (trace header infrastructure constraint, ≥2048 bytes for all services), is absent from the assembled context. The constraint is structurally invisible at the default 12k budget with current governance_rules density.
+
+**Classification:** Expected behavior — governance cap is working as designed. ADR-012 exclusion is a consequence of governance corpus growth (now 50 governance events) and ADR-012's large summary. Not a correctness failure.
+
+**Operator note:** ADR-012 visibility gap is recorded. Remediation (raise max_governance_chars, or cap individual governance summaries) is a candidate for Layer 5 / Q4 planning. Do not remediate during L1-C8.
+
+---
+
+### 22.6 Active Investigations: L1-C8 Usefulness Assessment
+
+Layer 4 (implemented in the L1-C7 cycle) is now producing substantive output. All 3 new L1-C8 open questions surfaced:
+
+- **[539]** Q4 planning: operational-limits growth monitoring cadence (Priya Mehta, due 2026-10-15) — substantive, actionable
+- **[538]** Q4 planning: OTel per-event sampling evaluation (Jan Kowalski, due 2026-10-07) — substantive, actionable
+- **[497]** INC-010 follow-up: ADR infrastructure gap (resolved by ADR-012, recorded for historical accuracy)
+
+Previously existing open questions [466] (parity check retirement), [458] (load test follow-up), [444] (operational-limits documentation) also surface. All substantive with clear owners.
+
+**Assessment:** `active_investigations` is the most operationally useful section post-Layer 4. All 6 items are non-trivial open questions with owners and due dates. Layer 4 is working as intended.
+
+---
+
+### 22.7 Relevant Memory Washout
+
+`relevant_memory` remains at 0 items. Governance (Tier 0) + active_investigations (Tier 3) exhaust the 12,000-char budget before Tier 4 (relevant_memory) is reached.
+
+**What is displaced:** All 214 active non-governance events — 19 validation_results (including 5 new L1-C8 results: IDs 487, 493, 513, 514, 523), 51 implementation_notes (including 7 new: IDs 494, 496, 504, 507, 509, 510, 526), 11 incidents, and other types.
+
+**INC-010 visibility:** INC-010's approved events (validation_results [487, 493], implementation_notes [494, 496]) are all absent from assembly. The incident and its engineering findings are invisible in the default 12k context.
+
+**Classification:** Consistent with pre-L1-C8 behavior (relevant_memory=0 documented in §20). No regression. The washout is a known consequence of governance density + investigations at 12k. Layer 4.5 (investigation char cap) remains deferred; empirical data is now available.
+
+---
+
+### 22.8 Incident Visibility Gap
+
+INC-010 (trace header overflow, 2026-09-08) and its approved events are absent from assembly. There are 11 active incidents in the corpus; all 11 are invisible at 12k.
+
+This is the same gap observed in §20 and §21. INC-010 does not introduce a new incident visibility pattern — it adds another instance of the existing gap. Incidents (doctrine=7) rank below investigations in the general candidate pool and are fully displaced by governance + investigations.
+
+Not remediated. Incident retrieval path is out of scope for current layers.
+
+---
+
+### 22.9 Replay and Export Verification
+
+**3-run replay:**
+
+| Run | Fingerprint | Chars | IDs |
+|---|---|---|---|
+| 1 | `9594d09a1bd7bf60` | 11,979 | [534, 476, 419, 394, 306, 227, 472, 539, 538, 497, 466, 458, 444] |
+| 2 | `9594d09a1bd7bf60` | 11,979 | [534, 476, 419, 394, 306, 227, 472, 539, 538, 497, 466, 458, 444] |
+| 3 | `9594d09a1bd7bf60` | 11,979 | [534, 476, 419, 394, 306, 227, 472, 539, 538, 497, 466, 458, 444] |
+
+**Replay verdict: PASS** — 3/3 identical fingerprints.
+
+**Export/import round-trip:**
+- `to_dict()` → JSON: 17,368 bytes — serializable
+- `reconstruct_from_dict(json.loads(raw))` IDs: [534, 476, 419, 394, 306, 227, 472, 539, 538, 497, 466, 458, 444]
+- Round-trip ID match: **PASS**
+- Round-trip chars match: **PASS**
+
+---
+
+### 22.10 L1-C8 Verdict and Recommendation
+
+**Verdict: PASS**
+
+| Check | Result | Notes |
+|---|---|---|
+| Replay determinism | PASS | 3/3 fingerprints identical |
+| Export/import round-trip | PASS | IDs and chars preserved |
+| Governance semantic integrity | PASS | No rejected/superseded events in governance_context |
+| Active investigations usefulness | PASS | 3 new L1-C8 OQs surfaced correctly |
+| Lineage integrity | PASS | No unresolved items in DB post-review |
+| Relevant memory washout | EXPECTED | Consistent with §20; no regression |
+
+**ADR-012 governance visibility gap:** Documented. Expected behavior. Not a correctness failure.
+
+**Layer 4.5 empirical basis now available:**
+- 6 investigations consume ~6,183 chars of the 12,000 budget
+- Per-investigation average: ~1,030 chars
+- A cap of ~3,500 chars (~3–4 investigations) would free ~2,700 chars for relevant_memory
+- Trade-off is an operator decision; empirical basis is now in place
+
+**Remaining operational risks:**
+1. ADR-012 is invisible at default 12k budget (governance char cap constraint; 227 chars over limit)
+2. All 11 incidents invisible (no incident retrieval path)
+3. All 19 validation_results invisible (relevant_memory washout)
+4. EI-007 continues generating false positives (~15% rate on incident/OQ-type content; 5 of 33 in this batch)
+5. Investigation section may deepen relevant_memory washout as Q4 open questions accumulate
+
+**Recommendation:** L1-C8 is complete. Current state (Layer 4 committed, L1-C8 DB state untracked) is stable. Next design candidates: Layer 4.5 (investigation char cap using L1-C8 empirical data) and/or Layer 5 (governance char cap or ADR summary truncation).
+
+---
+
+*§22 written 2026-05-28. L1-C8 declared complete.*
