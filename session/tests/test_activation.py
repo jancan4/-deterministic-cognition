@@ -154,8 +154,8 @@ def test_activate_memory_deduplicated(tmp_path):
 
 def test_activate_memory_respects_min_confidence(tmp_path):
     db = _mem_db(tmp_path)
-    _add(db, event_type='hypothesis', title='Low', confidence=1, status='proposed')
-    _add(db, event_type='hypothesis', title='High', confidence=4, status='proposed')
+    _add(db, event_type='hypothesis', title='Low', confidence=1, status='active')
+    _add(db, event_type='hypothesis', title='High', confidence=4, status='active')
     result = activate_memory(db, _policy(min_confidence=3, include_unresolved=False))
     titles = [m.title for m in result]
     assert 'Low' not in titles
@@ -443,3 +443,172 @@ def test_ei008_unresolved_goes_to_unresolved_not_relevant():
     sections = partition_by_section([mem])
     assert mem in sections['unresolved_items']
     assert mem not in sections['relevant_memory']
+
+
+# ---------------------------------------------------------------------------
+# Layer 3 regression: general retrieve must not be saturated by governance
+# ---------------------------------------------------------------------------
+
+def test_layer3_governance_does_not_enter_relevant_memory(tmp_path):
+    """Governance events must not appear in relevant_memory regardless of count.
+
+    Layer 3 fix: general_query now filters to _NON_GOVERNANCE_EVENT_TYPES.
+    Regression: before the fix, governance events would fill all candidate
+    slots via doctrine_rank ordering and crowd out non-governance events.
+    """
+    db = _mem_db(tmp_path)
+    # Add many governance events (enough to previously fill all 50 candidate slots)
+    for i in range(60):
+        _add(db, event_type='architecture_decision', title=f'ADR-{i}',
+             status='active', confidence=4)
+    # Add one non-governance event
+    _add(db, event_type='implementation_note', title='IMPL-1',
+         status='active', confidence=3)
+
+    result = activate_memory(db, _policy())
+    sections = partition_by_section(result)
+
+    # Non-governance event must appear in relevant_memory
+    rel_types = [m.event_type for m in sections['relevant_memory']]
+    assert 'implementation_note' in rel_types, (
+        "Layer 3 regression: implementation_note not in relevant_memory — "
+        "governance events may still be saturating the general retrieve pass"
+    )
+    # Governance events must not appear in relevant_memory
+    assert 'architecture_decision' not in rel_types, (
+        "Layer 3 regression: architecture_decision appeared in relevant_memory"
+    )
+    assert 'governance_rule' not in rel_types, (
+        "Layer 3 regression: governance_rule appeared in relevant_memory"
+    )
+
+
+def test_layer3_active_non_governance_events_surface_in_relevant_memory(tmp_path):
+    """All active non-governance event types must be reachable in relevant_memory."""
+    db = _mem_db(tmp_path)
+    non_governance_active = [
+        ('implementation_note', 'IMPL', 'active'),
+        ('incident',            'INC',  'active'),
+        ('validation_result',   'VAL',  'active'),
+        ('rejected_idea',       'REJ',  'active'),
+    ]
+    for etype, title, status in non_governance_active:
+        _add(db, event_type=etype, title=title, status=status, confidence=3)
+
+    result = activate_memory(db, _policy())
+    sections = partition_by_section(result)
+    rel_types = {m.event_type for m in sections['relevant_memory']}
+
+    for etype, _, _ in non_governance_active:
+        assert etype in rel_types, (
+            f"Layer 3: active {etype} event not surfacing in relevant_memory"
+        )
+
+
+def test_layer3_governance_saturation_does_not_starve_non_governance(tmp_path):
+    """With 60+ governance events and active non-governance events, the
+    non-governance events must still surface in relevant_memory.
+
+    This is the primary Layer 3 regression: before the fix, 50 governance
+    candidate slots left zero room for non-governance events.
+    """
+    db = _mem_db(tmp_path)
+    # Add enough governance events to exceed max_memory_candidates (50)
+    for i in range(55):
+        _add(db, event_type='architecture_decision', title=f'ADR-{i}',
+             status='active', confidence=3)
+    # Add several non-governance events at various types
+    for i in range(5):
+        _add(db, event_type='implementation_note', title=f'IMPL-{i}',
+             status='active', confidence=3)
+    for i in range(3):
+        _add(db, event_type='validation_result', title=f'VAL-{i}',
+             status='active', confidence=3)
+
+    result = activate_memory(db, _policy())
+    sections = partition_by_section(result)
+
+    impl_in_relevant = [m for m in sections['relevant_memory']
+                        if m.event_type == 'implementation_note']
+    val_in_relevant = [m for m in sections['relevant_memory']
+                       if m.event_type == 'validation_result']
+
+    assert len(impl_in_relevant) == 5, (
+        f"Layer 3 regression: expected 5 implementation_notes in relevant_memory, "
+        f"got {len(impl_in_relevant)}"
+    )
+    assert len(val_in_relevant) == 3, (
+        f"Layer 3 regression: expected 3 validation_results in relevant_memory, "
+        f"got {len(val_in_relevant)}"
+    )
+
+
+def test_layer3_unresolved_investigation_not_double_counted_in_active_investigations(tmp_path):
+    """Unresolved open_question/hypothesis must appear in unresolved_items only,
+    NOT also in active_investigations.
+
+    Pre-Layer-3 overlap: unresolved investigations were placed in BOTH
+    unresolved_items (Tier 1) AND active_investigations (Tier 3), consuming
+    budget twice and preventing relevant_memory items from surfacing.
+    """
+    db = _mem_db(tmp_path)
+    _add(db, event_type='open_question', title='OQ-UNRES', status='unresolved', confidence=3)
+    _add(db, event_type='open_question', title='OQ-ACTIVE', status='active', confidence=3)
+    _add(db, event_type='hypothesis', title='HYP-UNRES', status='unresolved', confidence=3)
+
+    result = activate_memory(db, _policy())
+    sections = partition_by_section(result)
+
+    oq_unres = next((m for m in result if m.title == 'OQ-UNRES'), None)
+    oq_active = next((m for m in result if m.title == 'OQ-ACTIVE'), None)
+    hyp_unres = next((m for m in result if m.title == 'HYP-UNRES'), None)
+
+    # Unresolved items must be in unresolved_items, NOT in active_investigations
+    assert oq_unres in sections['unresolved_items']
+    assert oq_unres not in sections['active_investigations'], (
+        "Overlap: unresolved open_question is double-counted in active_investigations"
+    )
+    assert hyp_unres in sections['unresolved_items']
+    assert hyp_unres not in sections['active_investigations'], (
+        "Overlap: unresolved hypothesis is double-counted in active_investigations"
+    )
+
+    # Active investigation (not unresolved) must be in active_investigations only
+    if oq_active:
+        assert oq_active in sections['active_investigations']
+        assert oq_active not in sections['unresolved_items']
+
+
+def test_layer3_rejected_governance_does_not_enter_general_retrieve_path(tmp_path):
+    """Rejected governance events must not consume candidate slots in the
+    general retrieve pass and must not appear in any section.
+
+    Before the Layer 3 fix, the general retrieve had no status filter,
+    so 126 rejected governance events occupied candidate slots by doctrine_rank.
+    """
+    db = _mem_db(tmp_path)
+    # Add rejected governance (formerly polluting the general retrieve)
+    for i in range(10):
+        _add(db, event_type='architecture_decision', title=f'REJ-ADR-{i}',
+             status='rejected', confidence=3)
+    # Add active non-governance
+    _add(db, event_type='implementation_note', title='IMPL-ACTIVE',
+         status='active', confidence=3)
+
+    result = activate_memory(db, _policy())
+    sections = partition_by_section(result)
+
+    # Rejected governance must not appear anywhere
+    all_ids = (
+        [m.memory_id for m in sections['governance_context']] +
+        [m.memory_id for m in sections['relevant_memory']] +
+        [m.memory_id for m in sections['unresolved_items']] +
+        [m.memory_id for m in sections['active_investigations']]
+    )
+    rejected_titles = [m.title for m in result if m.title.startswith('REJ-ADR-')]
+    assert rejected_titles == [], (
+        f"Layer 3: rejected governance events appeared in activated result: {rejected_titles}"
+    )
+    # Active non-governance must be present
+    rel_titles = [m.title for m in sections['relevant_memory']]
+    assert 'IMPL-ACTIVE' in rel_titles

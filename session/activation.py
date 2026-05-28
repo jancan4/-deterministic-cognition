@@ -23,6 +23,13 @@ INVESTIGATION_EVENT_TYPES = frozenset({'open_question', 'hypothesis'})
 # Governance event types — always surfaced; not filterable by activation policy
 GOVERNANCE_EVENT_TYPES = frozenset({'governance_rule', 'architecture_decision'})
 
+# All valid event types that are NOT governance — used to constrain the general
+# retrieve pass so it cannot be saturated by governance events (which already
+# have a dedicated retrieve_governance() pass above it).
+_NON_GOVERNANCE_EVENT_TYPES: List[str] = sorted(
+    t for t in VALID_EVENT_TYPES if t not in GOVERNANCE_EVENT_TYPES
+)
+
 # Statuses that indicate an unresolved item
 UNRESOLVED_STATUSES = frozenset({'unresolved', 'proposed'})
 
@@ -154,9 +161,15 @@ def activate_memory(
         )
         _add(retrieve(memory_db_path, adaptation_query))
 
-    # General retrieve: always run to catch all events not covered by the
-    # specific paths above (hypothesis, implementation_note, experiment, etc.)
+    # General retrieve: catches all active non-governance events not covered by
+    # the specific passes above (implementation_note, incident, open_question,
+    # validation_result, hypothesis, etc.). Governance is excluded because it
+    # already has a dedicated retrieve_governance() pass; without this exclusion
+    # the 200+ governance events (active + rejected) in doctrine_rank positions
+    # 1–2 fill all candidate slots and non-governance events never surface.
     general_query = RetrievalQuery(
+        event_types=_NON_GOVERNANCE_EVENT_TYPES,
+        statuses=['active', 'accepted'],
         tags=list(policy.tags),
         min_confidence=policy.min_confidence,
         limit=policy.max_memory_candidates,
@@ -180,12 +193,17 @@ def partition_by_section(
     Sections:
     - 'governance_context': governance_rule, architecture_decision
     - 'unresolved_items': status in UNRESOLVED_STATUSES
-    - 'active_investigations': open_question, hypothesis
+    - 'active_investigations': open_question/hypothesis with non-unresolved status
     - 'relevant_memory': everything else
 
-    Items may appear in multiple categories (e.g. an unresolved governance
-    rule appears in both governance_context and unresolved_items). The
-    context_window layer deduplicates by section if needed.
+    Unresolved investigations (open_question/hypothesis with status in
+    UNRESOLVED_STATUSES) are placed in unresolved_items only, not also in
+    active_investigations. The two sections are mutually exclusive for
+    investigation-type events so the context budget does not count them twice.
+
+    Governance events may still appear in both governance_context and
+    unresolved_items (intentional: governance integrity requires them in
+    governance_context regardless of status).
     """
     sections: Dict[str, List[ActivatedMemory]] = {
         'governance_context': [],
@@ -201,7 +219,7 @@ def partition_by_section(
         if _is_unresolved_mem(mem):
             sections['unresolved_items'].append(mem)
             placed = True
-        if mem.event_type in INVESTIGATION_EVENT_TYPES:
+        if mem.event_type in INVESTIGATION_EVENT_TYPES and not _is_unresolved_mem(mem):
             sections['active_investigations'].append(mem)
             placed = True
         if not placed and mem.status not in GOVERNANCE_EXCLUDE_STATUSES:

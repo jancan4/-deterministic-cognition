@@ -148,12 +148,19 @@ def test_reconstruct_includes_unresolved(tmp_path):
     assert 'unresolved' in statuses
 
 
-def test_reconstruct_unresolved_in_investigations_too(tmp_path):
+def test_reconstruct_unresolved_open_question_in_unresolved_not_investigations(tmp_path):
+    """Unresolved open_questions must appear in unresolved_items only, not also
+    in active_investigations. The two sections are mutually exclusive for
+    investigation-type events to prevent budget double-counting."""
     db = _mem_db(tmp_path)
     _add(db, event_type='open_question', title='Q1', status='unresolved')
     result = reconstruct(db, _policy(include_unresolved=True))
+    unres_types = [m.event_type for m in result.context.unresolved_items]
     inv_types = [m.event_type for m in result.context.active_investigations]
-    assert 'open_question' in inv_types
+    assert 'open_question' in unres_types
+    assert 'open_question' not in inv_types, (
+        "Overlap: unresolved open_question double-counted in active_investigations"
+    )
 
 
 # ---------------------------------------------------------------------------
