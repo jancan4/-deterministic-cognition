@@ -1089,6 +1089,71 @@ def build_parser() -> argparse.ArgumentParser:
         help='Maximum results per state (default: 50)',
     )
 
+    # generate-context-packet -------------------------------------------
+    gcp_p = sub.add_parser(
+        'generate-context-packet',
+        help='Generate a deterministic ContextPacket from a substrate assembly',
+    )
+    gcp_p.set_defaults(command='generate-context-packet')
+    gcp_p.add_argument('--db', default='memory.db', dest='db', help='Memory database (default: memory.db)')
+    gcp_p.add_argument('--task-type', required=True, dest='task_type',
+                       choices=['extraction', 'classification', 'synthesis', 'echo'],
+                       help='Task type for the model')
+    gcp_p.add_argument('--task-prompt', required=True, dest='task_prompt',
+                       help='Task instruction text sent to the model')
+    gcp_p.add_argument('--adapter', default='echo', dest='adapter',
+                       choices=['echo'],
+                       help='Adapter target (default: echo)')
+    gcp_p.add_argument('--output', required=True, dest='output',
+                       help='Output path for the ContextPacket JSON file')
+    gcp_p.add_argument('--assembly-id', default=None, type=int, dest='assembly_id',
+                       help='Use a specific context_assembly_log row (default: reconstruct fresh)')
+    gcp_p.add_argument('--tag', action='append', default=[], dest='tags', metavar='TAG',
+                       help='Tag filter for fresh reconstruction (repeatable)')
+    gcp_p.add_argument('--min-confidence', default=1, type=int, dest='min_confidence',
+                       help='Minimum confidence for fresh reconstruction (default: 1)')
+    gcp_p.add_argument('--requested-by', default='operator', dest='requested_by',
+                       help='Operator identity for provenance (default: operator)')
+    gcp_p.add_argument('--redact-provenance', action='store_true', default=False,
+                       dest='redact_provenance',
+                       help='Strip source_db_path and requested_by from packet provenance')
+
+    # run-model-task -----------------------------------------------------
+    rmt_p = sub.add_parser(
+        'run-model-task',
+        help='Execute a model task on a ContextPacket file (file-only, no DB access)',
+    )
+    rmt_p.set_defaults(command='run-model-task')
+    rmt_p.add_argument('--packet', required=True, dest='packet',
+                       help='Path to ContextPacket JSON file')
+    rmt_p.add_argument('--adapter', default='echo', dest='adapter',
+                       choices=['echo'],
+                       help='Adapter to use (default: echo)')
+    rmt_p.add_argument('--output', required=True, dest='output',
+                       help='Output path for ModelTaskResult JSON file')
+    rmt_p.add_argument('--requested-by', default='operator', dest='requested_by',
+                       help='Operator identity for provenance (default: operator)')
+
+    # ingest-model-output ------------------------------------------------
+    imo_p = sub.add_parser(
+        'ingest-model-output',
+        help='Ingest a ModelTaskResult into the semantic candidate ledger',
+    )
+    imo_p.set_defaults(command='ingest-model-output')
+    imo_p.add_argument('--task-result', required=True, dest='task_result',
+                       help='Path to ModelTaskResult JSON file')
+    imo_p.add_argument('--db', default='memory.db', dest='db',
+                       help='Memory database (required with --commit)')
+    imo_p.add_argument('--commit', action='store_true', default=False, dest='commit',
+                       help='Write candidates to semantic ledger (default: dry-run)')
+    imo_p.add_argument('--allow-governance-candidates', action='store_true', default=False,
+                       dest='allow_governance_candidates',
+                       help='Admit governance_rule candidates (requires --commit)')
+    imo_p.add_argument('--max-candidates', default=20, type=int, dest='max_candidates',
+                       help='Maximum candidates to ingest (default: 20)')
+    imo_p.add_argument('--force-stale', action='store_true', default=False, dest='force_stale',
+                       help='Override stale-assembly abort (use with caution)')
+
     return parser
 
 
@@ -2102,6 +2167,243 @@ def cmd_bundle_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_generate_context_packet(args: argparse.Namespace) -> int:
+    """
+    Generate a deterministic ContextPacket from a substrate assembly.
+
+    Logs the assembly if not already logged, then builds a self-contained
+    packet file. The packet is detached from the live DB after this call.
+    packet_id does NOT include generated_at.
+    """
+    import json as _json
+    from integration.models import TaskEnvelope, VALID_TASK_TYPES
+    from integration.packet_builder import packet_from_reconstruction
+
+    db = args.db
+    task_type = args.task_type
+    task_prompt = args.task_prompt
+    adapter_target = args.adapter
+    output_path = args.output
+    requested_by = getattr(args, 'requested_by', 'operator')
+    redact = getattr(args, 'redact_provenance', False)
+
+    if task_type not in VALID_TASK_TYPES:
+        print(f"ERROR: task_type {task_type!r} is not valid. Must be one of: {VALID_TASK_TYPES}", file=sys.stderr)
+        return 1
+    if not task_prompt or not task_prompt.strip():
+        print("ERROR: --task-prompt must not be empty", file=sys.stderr)
+        return 1
+    if not output_path:
+        print("ERROR: --output is required", file=sys.stderr)
+        return 1
+
+    try:
+        envelope = TaskEnvelope.build(task_type=task_type, task_prompt_text=task_prompt)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    assembly_id = getattr(args, 'assembly_id', None)
+
+    try:
+        from session.models import ContextActivationPolicy
+        from session.reconstruction import reconstruct, log_assembly, replay_assembly
+
+        if assembly_id is not None:
+            try:
+                reconstruction = replay_assembly(assembly_id, db)
+            except ValueError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 1
+            # Get the log row for this assembly
+            import sqlite3 as _sqlite3
+            conn = _sqlite3.connect(db)
+            conn.row_factory = _sqlite3.Row
+            try:
+                row = conn.execute(
+                    "SELECT * FROM context_assembly_log WHERE id = ?", (assembly_id,)
+                ).fetchone()
+            finally:
+                conn.close()
+            if row is None:
+                print(f"ERROR: assembly_id {assembly_id} not found in context_assembly_log", file=sys.stderr)
+                return 1
+            assembly_log_row = dict(row)
+        else:
+            tags = list(getattr(args, 'tags', []))
+            min_conf = getattr(args, 'min_confidence', 1)
+            policy = ContextActivationPolicy(
+                tags=tags,
+                min_confidence=min_conf,
+                include_unresolved=True,
+                include_adaptations=True,
+                expand_related=True,
+            )
+            reconstruction = reconstruct(db, policy)
+            assembly_log_row = log_assembly(db, reconstruction)
+
+    except Exception as exc:
+        print(f"ERROR: reconstruction failed: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        packet = packet_from_reconstruction(
+            reconstruction=reconstruction,
+            assembly_log_row=assembly_log_row,
+            task_envelope=envelope,
+            adapter_target=adapter_target,
+            requested_by=requested_by,
+            db_path=db,
+            redact_provenance=redact,
+        )
+    except Exception as exc:
+        print(f"ERROR: packet generation failed: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        with open(output_path, 'w', encoding='utf-8') as fh:
+            fh.write(packet.to_json())
+            fh.write('\n')
+    except OSError as exc:
+        print(f"ERROR: could not write to {output_path!r}: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"packet_id          : {packet.packet_id[:16]}\n"
+        f"assembly_id        : {packet.substrate_assembly_id}\n"
+        f"assembly_hash      : {packet.substrate_assembly_hash[:16]}\n"
+        f"total_entries      : {packet.budget_summary.entry_count}\n"
+        f"total_chars        : {packet.budget_summary.total_chars}\n"
+        f"output             : {output_path}"
+    )
+    return 0
+
+
+def cmd_run_model_task(args: argparse.Namespace) -> int:
+    """
+    Execute a model task on a ContextPacket file.
+
+    File-only: does NOT query the DB. The packet is self-contained.
+    Writes a ModelTaskResult JSON file.
+    """
+    from integration.models import ContextPacket
+    from integration.adapters import EchoPacketAdapter, run_packet_task
+
+    packet_path = args.packet
+    output_path = args.output
+    adapter_name = args.adapter
+    requested_by = getattr(args, 'requested_by', 'operator')
+
+    if not packet_path:
+        print("ERROR: --packet is required", file=sys.stderr)
+        return 1
+    if not output_path:
+        print("ERROR: --output is required", file=sys.stderr)
+        return 1
+
+    try:
+        with open(packet_path, encoding='utf-8') as fh:
+            packet = ContextPacket.from_json(fh.read())
+    except FileNotFoundError:
+        print(f"ERROR: packet file not found: {packet_path!r}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"ERROR: could not read packet: {exc}", file=sys.stderr)
+        return 1
+
+    if adapter_name == 'echo':
+        adapter = EchoPacketAdapter()
+    else:
+        print(
+            f"ERROR: adapter {adapter_name!r} is not available. "
+            f"Currently supported: echo",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        result = run_packet_task(packet, adapter, requested_by=requested_by)
+    except Exception as exc:
+        print(f"ERROR: model task execution failed: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        with open(output_path, 'w', encoding='utf-8') as fh:
+            fh.write(result.to_json())
+            fh.write('\n')
+    except OSError as exc:
+        print(f"ERROR: could not write to {output_path!r}: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"result_id          : {result.result_id[:16]}\n"
+        f"packet_id          : {result.packet_id[:16]}\n"
+        f"adapter_target     : {result.adapter_target}\n"
+        f"parse_status       : {result.parse_status}\n"
+        f"parsed_candidates  : {len(result.parsed_candidates)}\n"
+        f"output             : {output_path}"
+    )
+    return 0
+
+
+def cmd_ingest_model_output(args: argparse.Namespace) -> int:
+    """
+    Ingest a ModelTaskResult into the semantic candidate ledger.
+
+    Default is dry-run (read-only). Requires --commit to write.
+    governance_rule candidates require --allow-governance-candidates AND --commit.
+    Stale assembly detection uses hash comparison, not ID comparison.
+    """
+    from integration.models import ModelTaskResult
+    from integration.ingest import dry_run_ingest, commit_ingest
+
+    task_result_path = args.task_result
+    db = args.db
+    do_commit = getattr(args, 'commit', False)
+    allow_gov = getattr(args, 'allow_governance_candidates', False)
+    max_cands = getattr(args, 'max_candidates', 20)
+    force_stale = getattr(args, 'force_stale', False)
+
+    if not task_result_path:
+        print("ERROR: --task-result is required", file=sys.stderr)
+        return 1
+
+    try:
+        with open(task_result_path, encoding='utf-8') as fh:
+            task_result = ModelTaskResult.from_json(fh.read())
+    except FileNotFoundError:
+        print(f"ERROR: task result file not found: {task_result_path!r}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"ERROR: could not read task result: {exc}", file=sys.stderr)
+        return 1
+
+    if not do_commit:
+        report = dry_run_ingest(
+            task_result,
+            allow_governance_candidates=allow_gov,
+            max_candidates=max_cands,
+        )
+    else:
+        if not db:
+            print("ERROR: --db is required with --commit", file=sys.stderr)
+            return 1
+        report = commit_ingest(
+            db_path=db,
+            task_result=task_result,
+            allow_governance_candidates=allow_gov,
+            max_candidates=max_cands,
+            force_stale=force_stale,
+        )
+
+    for line in report.summary_lines():
+        print(line)
+
+    if report.errors:
+        return 1
+    return 0
+
+
 def main(argv: List[str] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -2127,6 +2429,9 @@ def main(argv: List[str] = None) -> int:
         'memory-review': cmd_memory_review,
         'semantic-workflow': cmd_semantic_workflow,
         'dispatch': cmd_dispatch,
+        'generate-context-packet': cmd_generate_context_packet,
+        'run-model-task': cmd_run_model_task,
+        'ingest-model-output': cmd_ingest_model_output,
     }
     return dispatch[args.command](args)
 
