@@ -2631,3 +2631,145 @@ L1-C9 CONDITIONAL PASS upgraded to: **PASS** (conditional flag resolved by Layer
 ---
 
 *§23 written 2026-05-28. L1-C9 declared CONDITIONAL PASS. Layer 6 resolution appended 2026-05-28.*
+
+---
+
+## §24 — L1-C10 Evaluation
+
+**Gate:** L1-C10 approved 2026-05-28. Conditions: Layer 6 validated (Contract A, sub-budget mode active). Pre-ingestion Tier-0 baseline: governance_rules [557, 548, 534, 476, 227] = 4,482/4,500 chars (18 chars headroom); ADRs [575, 517, 461] = 3,370/3,500; overall 11,685/12,000. Assembly anomaly (dual-active rows 5/6) confirmed benign — distinct policies (min_confidence=2 vs 1). Governance_rule ingestion allowed; displacement is an observed cognition-economics effect, not a suppression condition.
+
+**Corpus:** Two documents — 2026-11-20-q4-mid-quarter-review.md, 2026-11-28-trace-sampling-staging-mandate.md. Expected event types: validation_result, implementation_note, open_question, governance_rule, architecture_decision. The staging mandate document is expected to generate a governance_rule that will deterministically displace an existing rule from Tier-0 (18 chars remaining in rule sub-budget).
+
+**Stop conditions active:** replay divergence, export/import failure, rejected/superseded in any section, Layer 6 compat regression, schema/retrieval changes required.
+
+### §24.1 Corpus Documents Authored
+
+Two documents — November 2026 narrative continuation:
+
+1. `2026-11-20-q4-mid-quarter-review.md` — Q4 mid-quarter engineering review: OTel Phase 3 60-day stability, ADR-012 header compliance check, first monthly throughput review (Rule [557]), per-event sampling investigation progress, configurable mode scoping, Helix-Commander buffer open question.
+2. `2026-11-28-trace-sampling-staging-mandate.md` — New governance decision: 7-day mandatory staging validation for any OTel trace sampling parameter change, binding pre-condition for ADR-013. ADR-013 November status assessment.
+
+### §24.2 Ingestion Results
+
+| Source | Candidates | Active | Rejected |
+|---|---|---|---|
+| 2026-11-20-q4-mid-quarter-review.md | 17 | 6 | 11 |
+| 2026-11-28-trace-sampling-staging-mandate.md | 18 | 3 | 15 |
+| **Total L1-C10** | **35** | **9** | **26** |
+
+Rejection rate: 74% (26/35). High rate reflects extractor over-extraction: fragments, reformulations, and table metadata. Substantive events retained: 3 validation_results [581, 584, 588], 2 implementation_notes [589, 590], 1 open_question [593], 1 governance_rule [600], 1 architecture_decision [606], 1 implementation_note [611].
+
+### §24.3 Operator Review
+
+All 35 proposed events reviewed. None remain in proposed status.
+
+Active events approved:
+- [581] `validation_result` — Helix-Router trace infrastructure 60-day stability (conf=3)
+- [584] `validation_result` — ADR-012 header compliance November check (conf=3)
+- [588] `validation_result` — Throughput monitoring first monthly review, +6.3% growth within range (conf=3)
+- [589] `implementation_note` — Per-event sampling investigation progress, staging test scheduled 2026-12-01 (conf=2)
+- [590] `implementation_note` — Configurable per-event mode scoping: Helix-Router only, runtime toggle, not a schema change (conf=2)
+- [593] `open_question` — Should Helix-Commander buffer increase from 2048→4096 bytes pre-ADR-013? Owner: Jordan Kim, due 2026-12-15 (conf=3)
+- [600] `governance_rule` — **NEW RULE**: Before any OTel trace sampling parameter change, minimum 7-day staging validation required (conf=3)
+- [606] `architecture_decision` — ADR-013 candidate November 2026 status: planning, blocked on 2026-12-15 recommendation (conf=4)
+- [611] `implementation_note` — ADR-013 staging gate binding pre-condition recorded (conf=2)
+
+### §24.4 Tier-0 Composition — Pre/Post L1-C10
+
+**Pre-L1-C10 baseline:**
+
+| ID | Type | Chars | Status |
+|---|---|---|---|
+| [557] | governance_rule | 1,142 | active |
+| [548] | governance_rule | 1,238 | active |
+| [534] | governance_rule | 765 | active |
+| [476] | governance_rule | 785 | active |
+| [227] | governance_rule | 552 | active |
+| [575] | architecture_decision | 1,372 | active |
+| [517] | architecture_decision | 1,338 | active |
+| [461] | architecture_decision | 660 | active |
+
+rule: 4,482/4,500 (18 chars headroom) · adr: 3,370/3,500 · overall: 11,685/12,000
+
+**Post-L1-C10 composition:**
+
+| ID | Type | Chars | Status | Note |
+|---|---|---|---|---|
+| [600] | governance_rule | 1,406 | active | **NEW — entered L1-C10** |
+| [557] | governance_rule | 1,142 | active | retained |
+| [548] | governance_rule | 1,238 | active | retained |
+| [227] | governance_rule | 552 | active | retained (jigsaw survivor) |
+| [606] | architecture_decision | 414 | active | **NEW — entered L1-C10** |
+| [575] | architecture_decision | 1,372 | active | retained |
+| [517] | architecture_decision | 1,338 | active | **ADR-012 retained** ✓ |
+
+rule: 4,338/4,500 (162 chars headroom) · adr: 3,124/3,500 · overall: 11,665/12,000
+
+**Displacement record (deterministic cognition-economics, not a defect):**
+
+| Displaced ID | Type | Chars | Title (truncated) | Displacement cause |
+|---|---|---|---|---|
+| [534] | governance_rule | 765 | Effective Q4 2026, all superseded ADRs must… | [600] (1,406c) entered; [534] at activation rank 3 exceeds remaining rule budget |
+| [476] | governance_rule | 785 | Operational-limits re-evaluation conditions… | Same — [600] entry pushed [476] over budget |
+| [461] | architecture_decision | 660 | Amara: Phase 3 (Helix-Router) started… | [606] (414c) entered at higher activation rank; [461] at 3,124+660=3,784 > 3,500 |
+
+Jigsaw behavior confirmed: [227] (552c) fits after [534] and [476] are skipped — loop continued correctly past displacement events.
+
+Layer 6 integrity confirmed: ADR-012 [517] **remains visible** after L1-C10 displacement pressure. Sub-budget mode held under real governance_rule addition.
+
+### §24.5 Assembly and Replay
+
+**Assembly hash:** `d12d1f94e271b39ebea9d3cd79900d11`  
+**JSON fingerprint:** `7c94f8a2b26357fea05f60ced4172dbf`  
+**3× replay:** PASS — identical assembly_hash, fingerprint, and governance_context IDs across all runs.
+
+### §24.6 Export/Import Round-Trip
+
+- Export: bundle `d6489344532936b5`, 615 events, 5 sources, 10 runs
+- Dry-run: 615 events, 0 collisions, 1 expected warning (compression_artifact provenance ref, pre-existing from prior cycles)
+- Live import: 615 events imported, 0 skipped, 0 collisions
+- Recovered DB reconstruction: governance_context IDs [600, 557, 548, 227, 606, 575, 517] — identical to source
+- Event counts: active=232, rejected=371, superseded=12 — identical source and recovered
+- Fingerprint divergence: expected — session_id is keyed to db_path; content-equivalent reconstruction confirmed by ID and count match
+- **PASS**
+
+### §24.7 Lineage Integrity
+
+`lineage_integrity=OK  total_broken=0` — all FK chains clean.
+
+### §24.8 DB State Delta
+
+| Metric | Pre-L1-C10 | Post-L1-C10 | Delta |
+|---|---|---|---|
+| Total events | 580 | 615 | +35 |
+| Active | 223 | 232 | +9 |
+| Rejected | 345 | 371 | +26 |
+| Superseded | 12 | 12 | 0 |
+
+Session test suite: 441 passed.
+
+### §24.9 L1-C10 Verdict
+
+**PASS**
+
+All validation requirements met:
+- Operator review complete: 0 events remaining in proposed status ✓
+- Replay ×3 deterministic: `d12d1f94e271b39ebea9d3cd79900d11` stable ✓
+- No rejected/superseded events in any section ✓
+- Export/import round-trip: 615 events, 0 collisions ✓
+- Lineage integrity: 0 violations ✓
+- Layer 6 compatibility: ADR-012 [517] visible through Tier-0 displacement pressure ✓
+- Session tests: 441 passed ✓
+
+Governance_rule displacement observed and logged as expected: rules [534] and [476] displaced by new rule [600]; ADR [461] displaced by new ADR [606]. Displacement is deterministic and correct. No budget tuning performed. No governance suppression occurred.
+
+**Remaining Tier-0 headroom post-L1-C10:**
+- governance_rule: 162/4,500 chars (3.6%) — next governance_rule addition will again trigger displacement
+- architecture_decision: 376/3,500 chars (10.7%)
+- Overall: 335/12,000 chars (2.8%)
+
+Budget pressure remains critical. L1-C11 governance_rule additions will continue to displace existing rules deterministically.
+
+---
+
+*§24 written 2026-05-28. L1-C10 declared PASS.*
