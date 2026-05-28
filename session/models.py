@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Tuple
 CONTEXT_ASSEMBLY_VERSION = '1.2.0'
 CHAR_BUDGET_DEFAULT = 12000
 ENTRY_BUDGET_DEFAULT = 60
+GOVERNANCE_CHAR_BUDGET_DEFAULT = 6000
 
 # ---------------------------------------------------------------------------
 # Cognition session constants
@@ -223,12 +224,10 @@ class ContextActivationPolicy:
     max_chars: int = CHAR_BUDGET_DEFAULT
     max_entries: int = ENTRY_BUDGET_DEFAULT
 
-    # Optional cap on chars consumed by the governance tier (Tier 0).
-    # 0 means uncapped (default: governance fills as much of max_chars as it needs).
-    # Set to a positive value to reserve budget for lower-priority tiers.
-    # Analogous to continuity_char_budget: a per-tier budget that does not overlap
-    # with the main max_chars accounting.
-    max_governance_chars: int = 0
+    # Governance tier char budget. When > 0, governance entries stop accumulating
+    # after this many chars, freeing remaining budget for Tier 1+ (unresolved, etc.).
+    # Default: GOVERNANCE_CHAR_BUDGET_DEFAULT (6000). Set to 0 for legacy uncapped behavior.
+    max_governance_chars: int = GOVERNANCE_CHAR_BUDGET_DEFAULT
 
     def to_dict(self) -> dict:
         return {

@@ -340,7 +340,41 @@ def test_max_governance_chars_still_respects_overall_budget():
     assert len(result.relevant_memory) == 0
 
 
-def test_max_governance_chars_default_is_uncapped():
-    """ContextActivationPolicy default must have max_governance_chars=0 (uncapped)."""
+def test_max_governance_chars_default_is_6000():
+    """Default max_governance_chars must be GOVERNANCE_CHAR_BUDGET_DEFAULT (6000)."""
+    from session.models import GOVERNANCE_CHAR_BUDGET_DEFAULT
     policy = _policy()
-    assert policy.max_governance_chars == 0
+    assert policy.max_governance_chars == GOVERNANCE_CHAR_BUDGET_DEFAULT
+    assert policy.max_governance_chars == 6000
+
+
+def test_max_governance_chars_zero_preserves_uncapped_behavior():
+    """max_governance_chars=0 must still produce uncapped governance behavior."""
+    gov_items = [_governance(i) for i in range(5)]
+    result = _budget(
+        policy=_policy(max_governance_chars=0, max_chars=999999),
+        governance_context=gov_items,
+    )
+    assert len(result.governance_context) == 5
+
+
+def test_governance_cap_releases_budget_for_unresolved():
+    """Governance cap must leave budget for unresolved items."""
+    gov_items = [_governance(i) for i in range(20)]
+    unres_items = [_unresolved(i + 100) for i in range(3)]
+    one_gov_chars = len(gov_items[0].render()) + 4
+    result = _budget(
+        policy=_policy(max_governance_chars=one_gov_chars, max_chars=999999),
+        governance_context=gov_items,
+        unresolved_items=unres_items,
+    )
+    assert len(result.governance_context) == 1
+    assert len(result.unresolved_items) == 3
+
+
+def test_from_dict_missing_max_governance_chars_uses_new_default():
+    """Old policy dict without max_governance_chars must deserialize to GOVERNANCE_CHAR_BUDGET_DEFAULT."""
+    from session.models import GOVERNANCE_CHAR_BUDGET_DEFAULT
+    old_dict = {'max_chars': 12000, 'max_entries': 60}
+    policy = ContextActivationPolicy.from_dict(old_dict)
+    assert policy.max_governance_chars == GOVERNANCE_CHAR_BUDGET_DEFAULT

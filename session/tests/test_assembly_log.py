@@ -15,6 +15,7 @@ from session.models import (
     CHAR_BUDGET_DEFAULT,
     CONTEXT_ASSEMBLY_VERSION,
     ENTRY_BUDGET_DEFAULT,
+    GOVERNANCE_CHAR_BUDGET_DEFAULT,
     ContextActivationPolicy,
     SessionReconstruction,
 )
@@ -412,15 +413,24 @@ class TestBudgetConstants:
     def test_entry_budget_default_is_60(self):
         assert ENTRY_BUDGET_DEFAULT == 60
 
+    def test_governance_char_budget_default_is_6000(self):
+        assert GOVERNANCE_CHAR_BUDGET_DEFAULT == 6000
+
     def test_default_policy_uses_named_constants(self):
         policy = ContextActivationPolicy()
         assert policy.max_chars == CHAR_BUDGET_DEFAULT
         assert policy.max_entries == ENTRY_BUDGET_DEFAULT
+        assert policy.max_governance_chars == GOVERNANCE_CHAR_BUDGET_DEFAULT
 
     def test_constants_importable_from_session_models(self):
-        from session.models import CHAR_BUDGET_DEFAULT as CBD, ENTRY_BUDGET_DEFAULT as EBD
+        from session.models import (
+            CHAR_BUDGET_DEFAULT as CBD,
+            ENTRY_BUDGET_DEFAULT as EBD,
+            GOVERNANCE_CHAR_BUDGET_DEFAULT as GCD,
+        )
         assert CBD == 12000
         assert EBD == 60
+        assert GCD == 6000
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +479,8 @@ class TestBackwardCompat:
         policy = ContextActivationPolicy.from_dict(old_policy_dict)
         assert policy.include_unresolved is True
         assert not hasattr(policy, 'include_governance')
+        # Old snapshots without max_governance_chars must deserialize to new default
+        assert policy.max_governance_chars == GOVERNANCE_CHAR_BUDGET_DEFAULT
 
     def test_context_assembly_version_is_1_1_0(self):
         assert CONTEXT_ASSEMBLY_VERSION == '1.2.0'
