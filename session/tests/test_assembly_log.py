@@ -12,10 +12,12 @@ import pytest
 from memory import service as mem_service
 from session.models import (
     AssemblyDivergenceReport,
+    ARCHITECTURE_DECISION_CHAR_BUDGET_DEFAULT,
     CHAR_BUDGET_DEFAULT,
     CONTEXT_ASSEMBLY_VERSION,
     ENTRY_BUDGET_DEFAULT,
     GOVERNANCE_CHAR_BUDGET_DEFAULT,
+    GOVERNANCE_RULE_CHAR_BUDGET_DEFAULT,
     ContextActivationPolicy,
     SessionReconstruction,
 )
@@ -432,6 +434,20 @@ class TestBudgetConstants:
         assert EBD == 60
         assert GCD == 6500
 
+    def test_governance_rule_char_budget_default_is_4500(self):
+        assert GOVERNANCE_RULE_CHAR_BUDGET_DEFAULT == 4500
+
+    def test_architecture_decision_char_budget_default_is_3500(self):
+        assert ARCHITECTURE_DECISION_CHAR_BUDGET_DEFAULT == 3500
+
+    def test_default_policy_enables_sub_budget_mode(self):
+        """Default policy has both sub-budget fields > 0, activating Contract A sub-budget mode."""
+        policy = ContextActivationPolicy()
+        assert policy.max_governance_rule_chars == GOVERNANCE_RULE_CHAR_BUDGET_DEFAULT
+        assert policy.max_architecture_decision_chars == ARCHITECTURE_DECISION_CHAR_BUDGET_DEFAULT
+        assert policy.max_governance_rule_chars > 0
+        assert policy.max_architecture_decision_chars > 0
+
 
 # ---------------------------------------------------------------------------
 # Backward compat — tests 19 & 20
@@ -481,6 +497,10 @@ class TestBackwardCompat:
         assert not hasattr(policy, 'include_governance')
         # Old snapshots without max_governance_chars must deserialize to new default
         assert policy.max_governance_chars == GOVERNANCE_CHAR_BUDGET_DEFAULT
+        # Old snapshots without sub-budget keys must resolve to 0 (legacy mode),
+        # NOT to the dataclass defaults — preserves verify_assembly determinism.
+        assert policy.max_governance_rule_chars == 0
+        assert policy.max_architecture_decision_chars == 0
 
     def test_context_assembly_version_is_1_1_0(self):
         assert CONTEXT_ASSEMBLY_VERSION == '1.2.0'

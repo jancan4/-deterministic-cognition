@@ -21,6 +21,8 @@ CHAR_BUDGET_DEFAULT = 12000
 ENTRY_BUDGET_DEFAULT = 60
 GOVERNANCE_CHAR_BUDGET_DEFAULT = 6500
 INVESTIGATION_CHAR_BUDGET_DEFAULT = 3500
+GOVERNANCE_RULE_CHAR_BUDGET_DEFAULT       = 4500
+ARCHITECTURE_DECISION_CHAR_BUDGET_DEFAULT = 3500
 
 # ---------------------------------------------------------------------------
 # Cognition session constants
@@ -236,6 +238,26 @@ class ContextActivationPolicy:
     # Default: INVESTIGATION_CHAR_BUDGET_DEFAULT (3500). Set to 0 for uncapped behavior.
     max_investigation_chars: int = INVESTIGATION_CHAR_BUDGET_DEFAULT
 
+    # Tier-0 governance budget mode (Layer 6, Contract A):
+    #
+    #   Legacy mode (either field is 0):
+    #     max_governance_chars is the single Tier-0 total envelope for all governance
+    #     items (governance_rule and architecture_decision combined).
+    #
+    #   Sub-budget mode (both fields > 0):
+    #     Each governance type is governed by its own independent cap.
+    #     max_governance_chars is NOT applied to Tier-0 in this mode; it is
+    #     retained in the policy for legacy compatibility only.
+    #
+    # Governance sub-budget for governance_rule items only.
+    # Set to 0 to disable sub-budget mode and fall back to max_governance_chars.
+    max_governance_rule_chars: int = GOVERNANCE_RULE_CHAR_BUDGET_DEFAULT
+
+    # Governance sub-budget for architecture_decision items only.
+    # See max_governance_rule_chars for full mode documentation.
+    # Set to 0 to disable sub-budget mode.
+    max_architecture_decision_chars: int = ARCHITECTURE_DECISION_CHAR_BUDGET_DEFAULT
+
     def to_dict(self) -> dict:
         return {
             'tags': list(self.tags),
@@ -258,13 +280,29 @@ class ContextActivationPolicy:
             'max_entries': self.max_entries,
             'max_governance_chars': self.max_governance_chars,
             'max_investigation_chars': self.max_investigation_chars,
+            'max_governance_rule_chars': self.max_governance_rule_chars,
+            'max_architecture_decision_chars': self.max_architecture_decision_chars,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> 'ContextActivationPolicy':
-        """Deserialize from a dict; unknown keys (e.g. include_governance from old logs) are ignored."""
+        """Deserialize from a dict; unknown keys (e.g. include_governance from old logs) are ignored.
+
+        Sub-budget fields absent from a stored policy dict are set to 0 (legacy mode),
+        NOT to the dataclass defaults. This preserves assembly verification integrity:
+        verify_assembly_against_current_db() re-runs reconstruct() with the stored policy;
+        absent sub-budget keys must produce the same legacy-mode budget logic the original
+        assembly used, not the new sub-budget logic.
+
+        All other absent fields receive their dataclass defaults (existing behaviour).
+        """
         known = {f.name for f in _dataclass_fields(cls)}
-        return cls(**{k: v for k, v in d.items() if k in known})
+        kwargs = {k: v for k, v in d.items() if k in known}
+        if 'max_governance_rule_chars' not in d:
+            kwargs['max_governance_rule_chars'] = 0
+        if 'max_architecture_decision_chars' not in d:
+            kwargs['max_architecture_decision_chars'] = 0
+        return cls(**kwargs)
 
 
 # ---------------------------------------------------------------------------

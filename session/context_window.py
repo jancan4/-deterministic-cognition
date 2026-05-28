@@ -87,13 +87,27 @@ def apply_context_budget(
     """
     max_chars = policy.max_chars
     max_entries = policy.max_entries
-    max_governance_chars = policy.max_governance_chars      # 0 = uncapped
+    max_governance_chars = policy.max_governance_chars      # 0 = uncapped (legacy)
     max_investigation_chars = policy.max_investigation_chars  # 0 = uncapped
+    max_governance_rule_chars       = policy.max_governance_rule_chars
+    max_architecture_decision_chars = policy.max_architecture_decision_chars
 
     chars_used = 0
     entries_used = 0
     governance_chars_used = 0
     investigation_chars_used = 0
+    governance_rule_chars_used       = 0
+    architecture_decision_chars_used = 0
+
+    # Contract A — Tier-0 budget mode:
+    #   Sub-budget mode (both fields > 0): governance_rule and architecture_decision
+    #     are each governed by their own sub-budget independently.
+    #     max_governance_chars is NOT applied to Tier-0 in this mode.
+    #   Legacy mode (either field is 0): max_governance_chars is the single
+    #     Tier-0 total envelope for all governance items.
+    _sub_budget_mode = (
+        max_governance_rule_chars > 0 and max_architecture_decision_chars > 0
+    )
 
     total_candidates = (
         len(governance_context)
@@ -116,16 +130,30 @@ def apply_context_budget(
         chars_used += _char_count(text)
         entries_used += 1
 
-    def _governance_fits(text: str) -> bool:
+    def _governance_fits(text: str, event_type: str) -> bool:
         if not _fits(text):
             return False
+        n = _char_count(text)
+        if _sub_budget_mode:
+            # Sub-budget mode: each type checked against its own cap only.
+            # max_governance_chars is not applied in this mode.
+            if event_type == 'governance_rule':
+                return governance_rule_chars_used + n <= max_governance_rule_chars
+            return architecture_decision_chars_used + n <= max_architecture_decision_chars
+        # Legacy mode: max_governance_chars is the single Tier-0 total envelope.
         if max_governance_chars > 0:
-            return governance_chars_used + _char_count(text) <= max_governance_chars
+            return governance_chars_used + n <= max_governance_chars
         return True
 
-    def _accept_governance(text: str) -> None:
-        nonlocal governance_chars_used
-        governance_chars_used += _char_count(text)
+    def _accept_governance(text: str, event_type: str) -> None:
+        nonlocal governance_chars_used, governance_rule_chars_used, architecture_decision_chars_used
+        n = _char_count(text)
+        governance_chars_used += n
+        if _sub_budget_mode:
+            if event_type == 'governance_rule':
+                governance_rule_chars_used += n
+            else:
+                architecture_decision_chars_used += n
         _accept(text)
 
     def _investigation_fits(text: str) -> bool:
@@ -148,12 +176,14 @@ def apply_context_budget(
     out_lin: List[ActiveWorkflow] = []
     out_rt: List[RuntimeSnapshot] = []
 
-    # Tier 0: governance — preserved first (optionally capped by max_governance_chars)
+    # Tier 0: governance — evaluated in activation_rank order (rules first, then ADRs).
+    # Budget mode is determined by max_governance_rule_chars and max_architecture_decision_chars.
+    # See Contract A in apply_context_budget docstring and ContextActivationPolicy fields.
     for item in governance_context:
         rendered = item.render()
-        if _governance_fits(rendered):
+        if _governance_fits(rendered, item.event_type):
             out_gov.append(item)
-            _accept_governance(rendered)
+            _accept_governance(rendered, item.event_type)
 
     # Tier 1: unresolved — preserved second
     for item in unresolved_items:

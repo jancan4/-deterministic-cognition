@@ -7,6 +7,8 @@ from session.models import (
     ActiveWorkflow,
     ContextActivationPolicy,
     RuntimeSnapshot,
+    GOVERNANCE_RULE_CHAR_BUDGET_DEFAULT,
+    ARCHITECTURE_DECISION_CHAR_BUDGET_DEFAULT,
 )
 
 
@@ -294,13 +296,18 @@ def test_max_governance_chars_zero_is_uncapped():
 
 
 def test_max_governance_chars_limits_governance_tier():
-    """When max_governance_chars is set, governance entries stop at the cap."""
+    """In legacy mode, max_governance_chars caps governance entries at the total envelope."""
     gov1 = _governance(1)
     gov2 = _governance(2)
     gov3 = _governance(3)
     # Set the cap to fit gov1 but not gov1+gov2
     one_entry_chars = len(gov1.render()) + 4
-    policy = _policy(max_governance_chars=one_entry_chars, max_chars=999999)
+    policy = _policy(
+        max_governance_chars=one_entry_chars,
+        max_governance_rule_chars=0,        # force legacy mode
+        max_architecture_decision_chars=0,
+        max_chars=999999,
+    )
 
     result = _budget(policy=policy, governance_context=[gov1, gov2, gov3])
     assert len(result.governance_context) == 1
@@ -308,13 +315,15 @@ def test_max_governance_chars_limits_governance_tier():
 
 
 def test_max_governance_chars_leaves_budget_for_memory():
-    """After capping governance, relevant_memory must fill the remaining budget."""
+    """In legacy mode, capping governance with max_governance_chars leaves budget for memory."""
     gov_items = [_governance(i) for i in range(10)]
     mem_items = [_mem(i + 100) for i in range(5)]
 
     one_gov_chars = len(gov_items[0].render()) + 4
     policy = _policy(
         max_governance_chars=one_gov_chars,  # cap: only 1 governance entry
+        max_governance_rule_chars=0,         # force legacy mode
+        max_architecture_decision_chars=0,
         max_chars=999999,
     )
     result = _budget(policy=policy, governance_context=gov_items, relevant_memory=mem_items)
@@ -359,12 +368,17 @@ def test_max_governance_chars_zero_preserves_uncapped_behavior():
 
 
 def test_governance_cap_releases_budget_for_unresolved():
-    """Governance cap must leave budget for unresolved items."""
+    """In legacy mode, governance cap leaves budget for unresolved items."""
     gov_items = [_governance(i) for i in range(20)]
     unres_items = [_unresolved(i + 100) for i in range(3)]
     one_gov_chars = len(gov_items[0].render()) + 4
     result = _budget(
-        policy=_policy(max_governance_chars=one_gov_chars, max_chars=999999),
+        policy=_policy(
+            max_governance_chars=one_gov_chars,
+            max_governance_rule_chars=0,        # force legacy mode
+            max_architecture_decision_chars=0,
+            max_chars=999999,
+        ),
         governance_context=gov_items,
         unresolved_items=unres_items,
     )
@@ -415,7 +429,12 @@ def test_layer5_adr012_sized_item_fits_at_6500():
     rules = [_governance_with_summary(i, 670) for i in range(1, 7)]
     adr012 = _governance_with_summary(100, 1334)
 
-    policy = _policy(max_governance_chars=6500, max_chars=999999)
+    policy = _policy(
+        max_governance_chars=6500,
+        max_governance_rule_chars=0,        # force legacy mode: max_governance_chars governs
+        max_architecture_decision_chars=0,
+        max_chars=999999,
+    )
     result = _budget(policy=policy, governance_context=rules + [adr012])
 
     included_ids = [m.memory_id for m in result.governance_context]
@@ -435,7 +454,12 @@ def test_layer5_next_adr_still_excluded_at_6500():
     adr012 = _governance_with_summary(100, 1334)
     adr_next = _governance_with_summary(101, 1219)
 
-    policy = _policy(max_governance_chars=6500, max_chars=999999)
+    policy = _policy(
+        max_governance_chars=6500,
+        max_governance_rule_chars=0,        # force legacy mode
+        max_architecture_decision_chars=0,
+        max_chars=999999,
+    )
     result = _budget(policy=policy, governance_context=rules + [adr012, adr_next])
 
     included_ids = [m.memory_id for m in result.governance_context]
@@ -456,11 +480,21 @@ def test_layer5_adr012_excluded_at_6000_included_at_6500():
     all_gov = rules + [adr012]
 
     result_old = _budget(
-        policy=_policy(max_governance_chars=6000, max_chars=999999),
+        policy=_policy(
+            max_governance_chars=6000,
+            max_governance_rule_chars=0,    # force legacy mode
+            max_architecture_decision_chars=0,
+            max_chars=999999,
+        ),
         governance_context=all_gov,
     )
     result_new = _budget(
-        policy=_policy(max_governance_chars=6500, max_chars=999999),
+        policy=_policy(
+            max_governance_chars=6500,
+            max_governance_rule_chars=0,    # force legacy mode
+            max_architecture_decision_chars=0,
+            max_chars=999999,
+        ),
         governance_context=all_gov,
     )
 
@@ -623,3 +657,277 @@ def test_investigation_cap_deterministic_same_inputs():
     assert [m.memory_id for m in r1.active_investigations] == [m.memory_id for m in r2.active_investigations]
     assert [m.memory_id for m in r1.relevant_memory] == [m.memory_id for m in r2.relevant_memory]
     assert r1.chars_used == r2.chars_used
+
+
+# ---------------------------------------------------------------------------
+# Layer 6: Tier-0 sub-budget mode (Contract A)
+#
+# Contract A:
+#   Legacy mode (either sub-budget field is 0): max_governance_chars is the
+#   single Tier-0 total envelope for all governance items.
+#   Sub-budget mode (both fields > 0): governance_rule and architecture_decision
+#   are each governed by their own sub-budget; max_governance_chars is NOT
+#   applied to Tier-0 in this mode.
+# ---------------------------------------------------------------------------
+
+def _rule_with_summary(id_: int, summary_len: int) -> ActivatedMemory:
+    """governance_rule item with a specific rendered summary length for Layer 6 tests."""
+    return ActivatedMemory(
+        memory_id=id_, event_type='governance_rule', title=f'Rule-{id_}',
+        summary='x' * summary_len, evidence=None, confidence=5,
+        status='active', tags=[], source='test', related_ids=[],
+        created_at='2026-01-01T00:00:00Z', updated_at='2026-01-01T00:00:00Z',
+        is_expanded=False, tag_overlap=0,
+        activation_rank=(0, 1, -5, id_, 0, id_),
+    )
+
+
+def test_sub_budget_mode_requires_both_fields_positive():
+    """Sub-budget mode activates only when both fields are > 0; either zero → legacy mode."""
+    rule = _rule_with_summary(1, 100)
+    adr  = _governance_with_summary(100, 100)
+    one_char = len(rule.render()) + 4
+
+    # One field zero → legacy mode: max_governance_chars=one_char fits only 1 item
+    r1 = _budget(
+        policy=_policy(max_governance_rule_chars=0, max_architecture_decision_chars=3500,
+                       max_governance_chars=one_char, max_chars=999999),
+        governance_context=[rule, adr],
+    )
+    r2 = _budget(
+        policy=_policy(max_governance_rule_chars=4500, max_architecture_decision_chars=0,
+                       max_governance_chars=one_char, max_chars=999999),
+        governance_context=[rule, adr],
+    )
+    assert len(r1.governance_context) == 1, "Legacy mode (rule_chars=0): max_governance_chars governs"
+    assert len(r2.governance_context) == 1, "Legacy mode (adr_chars=0): max_governance_chars governs"
+
+    # Both > 0 → sub-budget mode: max_governance_chars=one_char is not applied
+    r3 = _budget(
+        policy=_policy(max_governance_rule_chars=4500, max_architecture_decision_chars=3500,
+                       max_governance_chars=one_char, max_chars=999999),
+        governance_context=[rule, adr],
+    )
+    assert len(r3.governance_context) == 2, "Sub-budget mode: max_governance_chars ignored"
+
+
+def test_governance_rule_sub_budget_caps_rules():
+    """In sub-budget mode, governance_rule items stop at max_governance_rule_chars."""
+    rules = [_rule_with_summary(i, 200) for i in range(1, 6)]
+    one_rule_chars = len(rules[0].render()) + 4
+    p = _policy(
+        max_governance_rule_chars=one_rule_chars * 2,  # fits exactly 2 rules
+        max_architecture_decision_chars=3500,
+        max_chars=999999,
+    )
+    result = _budget(policy=p, governance_context=rules)
+    included_ids = [m.memory_id for m in result.governance_context]
+    assert included_ids == [1, 2], f"Expected [1, 2]; got {included_ids}"
+
+
+def test_architecture_decision_sub_budget_caps_adrs():
+    """In sub-budget mode, architecture_decision items stop at max_architecture_decision_chars."""
+    adrs = [_governance_with_summary(100 + i, 200) for i in range(5)]
+    one_adr_chars = len(adrs[0].render()) + 4
+    p = _policy(
+        max_governance_rule_chars=4500,
+        max_architecture_decision_chars=one_adr_chars * 2,  # fits exactly 2 ADRs
+        max_chars=999999,
+    )
+    result = _budget(policy=p, governance_context=adrs)
+    assert len(result.governance_context) == 2
+
+
+def test_rule_budget_exhaustion_does_not_block_adr_evaluation():
+    """Rule budget exhaustion must not prevent ADRs from being evaluated against their own budget."""
+    rules = [_rule_with_summary(i, 800) for i in range(1, 4)]  # 3 rules
+    adr   = _governance_with_summary(100, 200)
+    one_rule_chars = len(rules[0].render()) + 4
+
+    # Rule budget fits exactly 2 rules; ADR budget is generous
+    p = _policy(
+        max_governance_rule_chars=one_rule_chars * 2,
+        max_architecture_decision_chars=3500,
+        max_chars=999999,
+    )
+    result = _budget(policy=p, governance_context=rules + [adr])
+    rule_ids = [m.memory_id for m in result.governance_context if m.event_type == 'governance_rule']
+    adr_ids  = [m.memory_id for m in result.governance_context if m.event_type == 'architecture_decision']
+    assert rule_ids == [1, 2], f"Expected [1, 2]; got {rule_ids}"
+    assert adr_ids  == [100], f"Expected [100]; got {adr_ids}"
+
+
+def test_adr_budget_exhaustion_does_not_block_rule_evaluation():
+    """ADR budget exhaustion must not prevent governance_rules from being evaluated."""
+    adrs  = [_governance_with_summary(100 + i, 800) for i in range(3)]  # 3 ADRs
+    rule  = _rule_with_summary(1, 200)
+    one_adr_chars = len(adrs[0].render()) + 4
+
+    # ADR budget fits exactly 2 ADRs; rule budget is generous
+    p = _policy(
+        max_governance_rule_chars=4500,
+        max_architecture_decision_chars=one_adr_chars * 2,
+        max_chars=999999,
+    )
+    result = _budget(policy=p, governance_context=[rule] + adrs)
+    rule_ids = [m.memory_id for m in result.governance_context if m.event_type == 'governance_rule']
+    adr_ids  = [m.memory_id for m in result.governance_context if m.event_type == 'architecture_decision']
+    assert rule_ids == [1], f"Expected [1]; got {rule_ids}"
+    assert len(adr_ids) == 2, f"Expected 2 ADRs; got {adr_ids}"
+
+
+def test_jigsaw_within_rule_sub_budget():
+    """Large rule skipped due to rule budget; smaller subsequent rule still fits (jigsaw)."""
+    rule_small  = _rule_with_summary(1, 100)
+    rule_large  = _rule_with_summary(2, 900)
+    rule_small2 = _rule_with_summary(3, 100)
+    small_chars = len(rule_small.render()) + 4
+    budget = small_chars * 2 + 50  # fits 2 smalls; not 1 small + large
+
+    p = _policy(
+        max_governance_rule_chars=budget,
+        max_architecture_decision_chars=3500,
+        max_chars=999999,
+    )
+    result = _budget(policy=p, governance_context=[rule_small, rule_large, rule_small2])
+    included_ids = [m.memory_id for m in result.governance_context]
+    assert 1 in included_ids,     "rule_small (id=1) must be included"
+    assert 2 not in included_ids, "rule_large (id=2) must be skipped by rule budget"
+    assert 3 in included_ids,     "rule_small2 (id=3) must be included (jigsaw: loop continues)"
+
+
+def test_jigsaw_within_adr_sub_budget():
+    """Large ADR skipped due to ADR budget; smaller subsequent ADR still fits (jigsaw)."""
+    adr_small  = _governance_with_summary(100, 100)
+    adr_large  = _governance_with_summary(101, 900)
+    adr_small2 = _governance_with_summary(102, 100)
+    small_chars = len(adr_small.render()) + 4
+    budget = small_chars * 2 + 50
+
+    p = _policy(
+        max_governance_rule_chars=4500,
+        max_architecture_decision_chars=budget,
+        max_chars=999999,
+    )
+    result = _budget(policy=p, governance_context=[adr_small, adr_large, adr_small2])
+    included_ids = [m.memory_id for m in result.governance_context]
+    assert 100 in included_ids,     "adr_small (id=100) must be included"
+    assert 101 not in included_ids, "adr_large (id=101) must be skipped by ADR budget"
+    assert 102 in included_ids,     "adr_small2 (id=102) must be included (jigsaw)"
+
+
+def test_policy_defaults_enable_sub_budget_mode():
+    """Policy() defaults must activate sub-budget mode (both fields > 0)."""
+    policy = _policy()
+    assert policy.max_governance_rule_chars == GOVERNANCE_RULE_CHAR_BUDGET_DEFAULT
+    assert policy.max_architecture_decision_chars == ARCHITECTURE_DECISION_CHAR_BUDGET_DEFAULT
+    assert policy.max_governance_rule_chars > 0
+    assert policy.max_architecture_decision_chars > 0
+
+
+def test_from_dict_absent_sub_budget_keys_yield_zero():
+    """Old policy dicts without sub-budget keys must deserialize to 0 (legacy mode).
+
+    Opposite of the max_governance_chars precedent. Justified by
+    verify_assembly_against_current_db(): stored assemblies must re-verify
+    with the same legacy-mode budget logic they were originally created with.
+    """
+    old_dict = {'max_chars': 12000, 'max_entries': 60}
+    policy = ContextActivationPolicy.from_dict(old_dict)
+    assert policy.max_governance_rule_chars == 0, (
+        f"Absent key must deserialize to 0 (legacy mode); got {policy.max_governance_rule_chars}"
+    )
+    assert policy.max_architecture_decision_chars == 0, (
+        f"Absent key must deserialize to 0 (legacy mode); got {policy.max_architecture_decision_chars}"
+    )
+
+
+def test_from_dict_explicit_sub_budget_values_preserved():
+    """Explicit sub-budget values in a policy dict must round-trip correctly."""
+    d = {'max_chars': 12000, 'max_entries': 60,
+         'max_governance_rule_chars': 2000, 'max_architecture_decision_chars': 1500}
+    policy = ContextActivationPolicy.from_dict(d)
+    assert policy.max_governance_rule_chars == 2000
+    assert policy.max_architecture_decision_chars == 1500
+
+
+def test_layer6_sub_budget_mode_uses_explicit_sub_budget_total_not_legacy_governance_envelope():
+    """Contract A: in sub-budget mode, Tier-0 total is governed by the two explicit sub-budgets.
+    max_governance_chars is the legacy Tier-0 envelope and is NOT applied in sub-budget mode.
+    Total rule_chars + adr_chars may exceed max_governance_chars by design.
+    """
+    # 4 rules + 3 ADRs; each at summary_len=900 → ~998 chars per item.
+    # Combined ~6986 chars exceeds max_governance_chars=6500.
+    # Rule sub-total ~3992 ≤ 4500; ADR sub-total ~2994 ≤ 3500.
+    rules = [_rule_with_summary(i, 900) for i in range(1, 5)]
+    adrs  = [_governance_with_summary(100 + i, 900) for i in range(3)]
+    all_gov = rules + adrs
+
+    rule_chars  = sum(len(m.render()) + 4 for m in rules)
+    adr_chars   = sum(len(m.render()) + 4 for m in adrs)
+    total_chars = rule_chars + adr_chars
+    assert total_chars > 6500, (
+        f"Calibration: total {total_chars} must exceed 6500 — increase summary_len"
+    )
+    assert rule_chars <= 4500, (
+        f"Calibration: rule total {rule_chars} must be ≤ 4500"
+    )
+    assert adr_chars <= 3500, (
+        f"Calibration: adr total {adr_chars} must be ≤ 3500"
+    )
+
+    # Sub-budget mode: max_governance_chars=6500 is not applied; all 7 items fit
+    result_sub = _budget(
+        policy=_policy(max_governance_rule_chars=4500, max_architecture_decision_chars=3500,
+                       max_governance_chars=6500, max_chars=999999),
+        governance_context=all_gov,
+    )
+    assert len(result_sub.governance_context) == 7, (
+        f"Sub-budget mode: all 7 items expected; got {len(result_sub.governance_context)}"
+    )
+
+    # Legacy mode: max_governance_chars=6500 is the total envelope; fewer than 7 fit
+    result_legacy = _budget(
+        policy=_policy(max_governance_rule_chars=0, max_architecture_decision_chars=0,
+                       max_governance_chars=6500, max_chars=999999),
+        governance_context=all_gov,
+    )
+    assert len(result_legacy.governance_context) < 7, (
+        "Legacy mode: max_governance_chars=6500 must exclude items when total > 6500"
+    )
+
+
+def test_layer6_adr_restored_with_sub_budgets():
+    """Integration: sub-budget mode includes ADRs excluded by legacy total cap.
+
+    Calibrated to mirror the L1-C9 governance pressure scenario: 5 governance_rules
+    fill the rule sub-budget; 2 ADRs (including the ADR-012 stand-in at id=517) fit
+    within the ADR sub-budget. Combined total exceeds max_governance_chars=6500.
+    """
+    # 5 rules at summary_len=800 → ~888 chars each → rule total ~4440 ≤ 4500
+    rules = [_rule_with_summary(i, 800) for i in range(1, 6)]
+    # 2 ADRs at summary_len=1200 → ~1294 chars each → adr total ~2588 ≤ 3500
+    adrs  = [_governance_with_summary(200, 1200), _governance_with_summary(517, 1200)]
+    all_gov = rules + adrs
+
+    rule_chars = sum(len(m.render()) + 4 for m in rules)
+    adr_chars  = sum(len(m.render()) + 4 for m in adrs)
+    assert rule_chars <= 4500, f"Calibration: rule total {rule_chars} must be ≤ 4500"
+    assert adr_chars  <= 3500, f"Calibration: adr total {adr_chars} must be ≤ 3500"
+    assert rule_chars + adr_chars > 6500, (
+        f"Calibration: combined {rule_chars + adr_chars} must exceed 6500"
+    )
+
+    p = _policy(
+        max_governance_rule_chars=4500,
+        max_architecture_decision_chars=3500,
+        max_governance_chars=6500,
+        max_chars=999999,
+    )
+    result = _budget(policy=p, governance_context=all_gov)
+    included = [m.memory_id for m in result.governance_context]
+
+    assert 517 in included, f"ADR-012 stand-in [517] must be included; got {included}"
+    assert all(i in included for i in range(1, 6)), f"All 5 rules must be included; got {included}"
+    assert all(m.status == 'active' for m in result.governance_context), \
+        "No rejected or superseded events must appear in governance_context"
