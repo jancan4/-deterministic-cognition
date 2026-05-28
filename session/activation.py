@@ -26,6 +26,12 @@ GOVERNANCE_EVENT_TYPES = frozenset({'governance_rule', 'architecture_decision'})
 # Statuses that indicate an unresolved item
 UNRESOLVED_STATUSES = frozenset({'unresolved', 'proposed'})
 
+# Terminal-negative statuses excluded from the governance_context partition.
+# Events with these statuses have been explicitly rejected or superseded and
+# must not consume governance tier budget or displace active institutional
+# knowledge. (EI-006 fix)
+GOVERNANCE_EXCLUDE_STATUSES = frozenset({'rejected', 'superseded', 'archived', 'deprecated'})
+
 
 def _doctrine_rank(event_type: str) -> int:
     return DOCTRINE_PRIORITY.get(event_type, _DEFAULT_DOCTRINE_RANK)
@@ -189,7 +195,7 @@ def partition_by_section(
     }
     for mem in activated:
         placed = False
-        if mem.event_type in GOVERNANCE_EVENT_TYPES:
+        if mem.event_type in GOVERNANCE_EVENT_TYPES and mem.status not in GOVERNANCE_EXCLUDE_STATUSES:
             sections['governance_context'].append(mem)
             placed = True
         if _is_unresolved_mem(mem):

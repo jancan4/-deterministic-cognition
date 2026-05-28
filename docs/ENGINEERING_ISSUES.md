@@ -3,7 +3,7 @@
 Tracked here: deferred defects and improvement requests that are non-blocking for the current substrate baseline but require engineering resolution before the next major validation milestone.
 
 **Substrate baseline:** 9245ee7  
-**Last updated:** 2026-05-27 (EI-004 remediated; EI-006 opened)
+**Last updated:** 2026-05-28 (EI-004 remediated; EI-006 remediated post-L1-C2)
 
 ---
 
@@ -131,9 +131,10 @@ On the Run #2 frozen corpus, `source_reference` rejection rate in operator revie
 ## EI-006 — Governance partition includes rejected and superseded events from general retrieval path
 
 **Class:** Non-blocking — retrieval/noise issue  
-**Priority:** Low  
-**Status:** Deferred — non-blocking  
-**Opened:** 2026-05-27 (identified during EI-004 remediation, Longitudinal Run L1)
+**Priority:** High (reclassified after L1-C2 — governance tier collapsed to 6 rejected + 1 active)  
+**Status:** Remediated — 2026-05-28  
+**Opened:** 2026-05-27 (identified during EI-004 remediation, Longitudinal Run L1)  
+**Remediated:** 2026-05-28 — `session/activation.py` + 9 regression tests in `session/tests/test_activation.py`
 
 **Symptom:**
 After the EI-004 fix to `retrieve_governance()`, the governance context tier still surfaces a bounded number of rejected and superseded events. Observed in `longitudinal_v1.db` post-EI-004-fix: events with status `rejected` (ids 20, 36, 63 — EI-001 `must not` fragments, conf=3) and `superseded` (ids 25, 31 — pre-ADR-007 Kafka decisions) appear alongside active governance events in the assembled governance tier.
@@ -150,32 +151,36 @@ After deduplication by `seen_ids`, `governance_rule` and `architecture_decision`
 - `session/activation.py` — `activate_memory()` general retrieval query (lines ~153–159): no `statuses` filter
 - `session/activation.py` — `partition_by_section()` (lines ~192–193): routes by `event_type` only, not by `status`
 
-**Current operational impact:**
-The governance tier is semantically noisy. Rejected and superseded entries consume governance tier budget and may displace additional active events. Impact is bounded: at the standard `max_governance_chars=4000` policy, the L1 corpus produces a 7-entry governance tier with 2 active, 3 rejected (small `must not` verb fragments), and 2 superseded entries.
+**L1-C2 operational impact (escalation that triggered remediation):**
+At L1-C2 (215 events, 7 corpus batches), governance tier = 6 rejected + 1 active under the standard 4000-char budget. The tier was semantically collapsed — 6 of 7 slots occupied by rejected fragments (EI-001 `must not` verb fragments, `must not`-form sentence continuations, and table-header artifacts from prior batches). Active governance decisions were displaced. Budget waste: 3903/4000 chars used on non-actionable events; only 7 of 77 candidates included in assembly vs 28 post-fix.
 
 **Why EI-004 fixed the primary blocker:**
-EI-004's root cause was `retrieve_governance()` returning unfiltered results ordered by `id DESC`, allowing late-ingested high-ID rejected table-header artifacts (ids 117, 119, 120, conf=4) to consume the entire governance tier budget and produce 0 active events in assembly. The EI-004 fix eliminates that specific path. The residual events (20, 36, 63, 25, 31) enter via the general retrieval path, are lower-confidence fragments, and do not exhaust the budget — active events now surface.
+EI-004's root cause was `retrieve_governance()` returning unfiltered results ordered by `id DESC`, allowing late-ingested high-ID rejected table-header artifacts (ids 117, 119, 120, conf=4) to consume the entire governance tier budget and produce 0 active events in assembly. The EI-004 fix eliminated that specific path. The residual events (20, 36, 63, 25, 31) enter via the general retrieval path and were bounded at L1-C1 but grew to 6 of 7 slots at L1-C2.
 
-**Why EI-006 is deferred:**
-- The governance tier is no longer collapsed (0 active → 2 active after EI-004).
-- The residual rejected/superseded entries are bounded and predictable.
-- The issue does not affect lineage integrity, replay determinism, or continuity portability.
-- Fixing requires modifying `partition_by_section()` routing logic, which has broad test coverage implications. Conservative approach: defer pending a dedicated retrieval-partitioning review.
-
-**Recommended future remediation:**
-Add a status exclusion guard in `partition_by_section()` in `session/activation.py`:
+**Remediation applied (2026-05-28):**
+Added `GOVERNANCE_EXCLUDE_STATUSES` constant and status exclusion guard in `partition_by_section()`:
 
 ```python
-EXCLUDE_FROM_GOVERNANCE = frozenset({'rejected', 'superseded', 'archived', 'deprecated'})
+GOVERNANCE_EXCLUDE_STATUSES = frozenset({'rejected', 'superseded', 'archived', 'deprecated'})
 
-if mem.event_type in GOVERNANCE_EVENT_TYPES and mem.status not in EXCLUDE_FROM_GOVERNANCE:
+if mem.event_type in GOVERNANCE_EVENT_TYPES and mem.status not in GOVERNANCE_EXCLUDE_STATUSES:
     sections['governance_context'].append(mem)
+    placed = True
 ```
 
-This preserves `active`, `accepted`, `unresolved`, and `proposed` governance events while excluding terminal-status events. Requires regression tests covering: rejected governance_rule excluded from tier, superseded architecture_decision excluded, unresolved governance_rule still included.
+This preserves `active`, `accepted`, `unresolved`, and `proposed` governance events while excluding terminal-negative-status events. The excluded events fall through to `relevant_memory` — no data is dropped. Nine regression tests added covering all excluded statuses, preservation cases (unresolved, accepted), and the mixed coexistence scenario (active + rejected coexist → only active in governance_context).
 
-**Acceptance criterion:**
-After fix, governance context tier contains zero events with status in `{'rejected', 'superseded', 'archived', 'deprecated'}` under any activation policy.
+**Post-fix result (L1-C2 longitudinal_v1.db, max_chars=16000, min_confidence=2):**
+
+| Metric | Before (EI-006 open) | After (EI-006 remediated) |
+|---|---|---|
+| governance_context entries | 7 (6 rejected, 1 active) | 7 (all active) |
+| chars_used | 3903 / 16000 | 15777 / 16000 |
+| included_entries | 7 | 28 |
+| round-trip identity | N/A | PASS |
+| replay determinism | N/A | PASS |
+
+**Acceptance criterion:** Met. Governance context tier contains zero events with status in `{'rejected', 'superseded', 'archived', 'deprecated'}`. Full suite: **3194 passed**.
 
 **Not replay-affecting, not continuity-corrupting.**
 

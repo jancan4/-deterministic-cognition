@@ -4,6 +4,7 @@ import pytest
 from memory import service as mem_service
 from session.activation import (
     GOVERNANCE_EVENT_TYPES,
+    GOVERNANCE_EXCLUDE_STATUSES,
     INVESTIGATION_EVENT_TYPES,
     UNRESOLVED_STATUSES,
     activate_memory,
@@ -241,3 +242,97 @@ def test_partition_governance_unresolved_overlap():
 def test_partition_empty():
     sections = partition_by_section([])
     assert all(v == [] for v in sections.values())
+
+
+# ---------------------------------------------------------------------------
+# EI-006 regression: partition_by_section must exclude terminal-status events
+# from governance_context
+# ---------------------------------------------------------------------------
+
+def test_ei006_rejected_governance_rule_excluded():
+    """A rejected governance_rule must not appear in governance_context."""
+    mem = _make_mem(10, 'governance_rule', 'rejected')
+    sections = partition_by_section([mem])
+    assert mem not in sections['governance_context'], (
+        "EI-006 regression: rejected governance_rule appeared in governance_context"
+    )
+
+
+def test_ei006_superseded_governance_rule_excluded():
+    """A superseded governance_rule must not appear in governance_context."""
+    mem = _make_mem(11, 'governance_rule', 'superseded')
+    sections = partition_by_section([mem])
+    assert mem not in sections['governance_context'], (
+        "EI-006 regression: superseded governance_rule appeared in governance_context"
+    )
+
+
+def test_ei006_rejected_architecture_decision_excluded():
+    """A rejected architecture_decision must not appear in governance_context."""
+    mem = _make_mem(12, 'architecture_decision', 'rejected')
+    sections = partition_by_section([mem])
+    assert mem not in sections['governance_context'], (
+        "EI-006 regression: rejected architecture_decision appeared in governance_context"
+    )
+
+
+def test_ei006_archived_governance_excluded():
+    """An archived governance_rule must not appear in governance_context."""
+    mem = _make_mem(13, 'governance_rule', 'archived')
+    sections = partition_by_section([mem])
+    assert mem not in sections['governance_context']
+
+
+def test_ei006_deprecated_governance_excluded():
+    """A deprecated architecture_decision must not appear in governance_context."""
+    mem = _make_mem(14, 'architecture_decision', 'deprecated')
+    sections = partition_by_section([mem])
+    assert mem not in sections['governance_context']
+
+
+def test_ei006_active_governance_survives_with_rejected():
+    """Primary EI-006 regression: when rejected and active governance events
+    coexist, only the active event appears in governance_context."""
+    active_mem = _make_mem(20, 'governance_rule', 'active')
+    rejected_mem = _make_mem(21, 'governance_rule', 'rejected')
+    superseded_mem = _make_mem(22, 'architecture_decision', 'superseded')
+
+    sections = partition_by_section([active_mem, rejected_mem, superseded_mem])
+
+    assert active_mem in sections['governance_context'], (
+        "Active governance_rule must be in governance_context"
+    )
+    assert rejected_mem not in sections['governance_context'], (
+        "EI-006 regression: rejected governance_rule displaced active event"
+    )
+    assert superseded_mem not in sections['governance_context'], (
+        "EI-006 regression: superseded architecture_decision in governance_context"
+    )
+
+
+def test_ei006_rejected_governance_falls_to_relevant_memory():
+    """A rejected governance event excluded from governance_context falls to
+    relevant_memory (documents the post-fix fallthrough behavior)."""
+    mem = _make_mem(30, 'governance_rule', 'rejected')
+    sections = partition_by_section([mem])
+    assert mem not in sections['governance_context']
+    assert mem in sections['relevant_memory']
+
+
+def test_ei006_unresolved_governance_still_included():
+    """An unresolved governance_rule is NOT excluded — it remains in
+    governance_context (preserves the existing overlap behavior)."""
+    mem = _make_mem(40, 'governance_rule', 'unresolved')
+    sections = partition_by_section([mem])
+    assert mem in sections['governance_context'], (
+        "Unresolved governance_rule must still appear in governance_context"
+    )
+    assert mem in sections['unresolved_items']
+
+
+def test_ei006_accepted_governance_still_included():
+    """An accepted governance_rule is not excluded — accepted is a valid
+    terminal-positive status."""
+    mem = _make_mem(41, 'architecture_decision', 'accepted')
+    sections = partition_by_section([mem])
+    assert mem in sections['governance_context']

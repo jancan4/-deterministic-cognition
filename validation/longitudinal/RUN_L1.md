@@ -73,8 +73,8 @@ Secondary:
 | Checkpoint | Trigger | Contents |
 |---|---|---|
 | L1-C1 | After initial batch ingestion + review | Event counts, approval rate, governance, assembly, round-trip |
-| L1-C2 | After supersession/contradiction exercises | Supersession lineage, contradiction graph, assembly divergence |
-| L1-C3 | After compression exercise | Compression artifact quality, reconstructed context post-compression |
+| L1-C2 | After corpus accumulation + multi-session workflows | Event growth, supersession, contradiction, compression, assembly, EI-006 impact |
+| L1-C3 | After EI-006 remediation + larger corpus | Governance tier quality post-fix, assembly interpretability under growth |
 
 ---
 
@@ -362,3 +362,290 @@ Primary offenders eliminated (ids 117, 119, 120 — table-header artifacts). Act
 ### 9.3 L1-C2 readiness
 
 EI-004 primary failure resolved. Full test suite passes (3185). Assembly determinism confirmed. Fresh export round-trip confirmed. L1-C2 may proceed.
+
+---
+
+## 10. Checkpoint L1-C2
+
+**Checkpoint date:** 2026-05-28  
+**DB:** validation/longitudinal/runs/longitudinal_v1.db  
+**Bundle:** validation/longitudinal/exports/longitudinal_v1_bundle_L1C2.json  
+**Substrate commit:** 56e594b (EI-004 fix applied)
+
+---
+
+### 10.1 Corpus batch 2
+
+**Documents added:** 7 (covering 2026-03 to 2026-04 timeline arc)
+
+| Document | Category | Description |
+|---|---|---|
+| ADR-008-replica-scaling-revision.md | adrs | Raises max replicas 3→5, min 1→2; supersedes ADR-005 §3.1 |
+| ADR-009-observability-tracing.md | adrs | Adopts OpenTelemetry for distributed tracing |
+| INC-005-2026-03-14-redis-streams-backpressure.md | incidents | Consumer lag backpressure, 62-min MTTI |
+| 2026-03-07-q1-retrospective.md | meetings | Q1 retrospective, ADR-008/ADR-009 decisions |
+| 2026-04-11-q2-planning-kickoff.md | meetings | Q2 priorities confirmed |
+| 2026-Q2-roadmap.md | planning | Q2 roadmap; schema versioning carried over from Q1 |
+| operational-limits-v2.md | references | Updated limits reflecting ADR-008 and INC-005 actions |
+
+**Batch 2 ingestion:**
+- Chunks: 246
+- Candidates: 87 (78 proposed + 9 unresolved incident type)
+
+---
+
+### 10.2 Event counts
+
+| Metric | After L1-C1 | After L1-C2 | Delta |
+|---|---|---|---|
+| Total events | 127 | 215 | +88 |
+| Active | 34 | 60 | +26 |
+| Superseded | 2 | 5 | +3 |
+| Rejected | 91 | 150 | +59 |
+
+**Active events by type (L1-C2 state):**
+- architecture_decision: 49 (22 L1-C1 + 27 L1-C2)
+- incident: 6 (unchanged)
+- open_question: 2 (unchanged)
+- validation_result: 2 (unchanged)
+- implementation_note: 2 (1 L1-C1 + 1 L1-C2 compression-derived)
+- rejected_idea: 1 (unchanged)
+
+---
+
+### 10.3 Batch 2 review analysis
+
+**Approval rate: 32% (28/87)** — marginal improvement over L1-C1 (28%), driven by the more decision-dense ADR and planning corpus.
+
+**Rejection categories:**
+1. **EI-002 pattern (29 rejects):** `architecture_decision` table-header artifacts: "Source: ADR-xxx" rows, "ADR: ADR-xxx (accepted)" metadata headers, word-wrap artifacts ("headroom" → "oom"). 51% of all architecture_decision candidates rejected.
+2. **EI-003 pattern (8 rejects):** All 8 `source_reference` events rejected — table "Source:" cell citations, bare ADR reference rows.
+3. **EI-001 residual (5 rejects):** Five new `governance_rule` must-not verb fragments: "request more than 5 replicas...", "be used as a reference limit...", "add more than 2ms to the p99 request latency...", "be increased without validating...", "be changed by configuration alone."
+4. **Unresolved incident fragments (9 rejects):** NEW. Incident PatternRule fires on the word "incident" mid-paragraph in retrospective and planning documents (e.g., "incident response procedures", "incident MTTI breakdown:", "four incidents"). All 9 committed as `status='unresolved'`, absent from the `proposed` review queue. Operator must inspect `unresolved` separately. See §10.9 (EI-007).
+
+---
+
+### 10.4 Governance report (post-review)
+
+- **CRITICAL:** 0
+- **WARNING:** 11
+  - 8 `duplicate_title` — pre-existing L1-C1 artifacts (Commander: Jordan Kim, Owner Action Due, Parameter Value Source)
+  - 3 `low_confidence_active` — ids 109 (conf=2), 123 (conf=2), 190 (conf=2, new)
+- **INFO:** 209 `orphaned_event` — expected; most events lack links
+
+No new CRITICAL or new WARNING patterns in L1-C2 batch.
+
+---
+
+### 10.5 Lineage integrity
+
+- **all_ok: True** (source DB)
+- **total_broken: 0**
+
+---
+
+### 10.6 Supersession and contradiction exercise
+
+**ADR-008 supersedes ADR-005 replica constraints:**
+
+| Action | Result |
+|---|---|
+| Contradiction link: id=17 ↔ id=135 | Created (link id=5) |
+| Contradiction link: id=97 ↔ id=135 | Created (link id=6) |
+| id=17 status → superseded | OK |
+| id=97 status → superseded | OK |
+| id=132 supersedes id=17 | Link created (link id=7) |
+| id=132 supersedes id=97 | Link created (link id=8) |
+
+**EI-005 protocol observed:** Contradiction links created BEFORE supersession. Both links succeeded. Supersession completed without friction.
+
+**L1-C1 gap corrected:**
+id=29 status set to `superseded` — the id=27→id=29 supersedes link was created in L1-C1 but the status change was missed. Corrected in L1-C2.
+
+**Retrieval quality of supersession:**
+"replica" query: 17 active results + 2 superseded (ids 17, 97) correctly labeled. Active ADR-008 events (ids 198, 166, 135) surface prominently. Supersession chain is navigable.
+
+---
+
+### 10.7 Assembly spot check
+
+**Policy:** max_chars=16000, min_confidence=2, max_governance_chars=4000, no workflows/runtime
+
+| Metric | L1-C1 (pre-EI-004 fix) | L1-C1 (post-EI-004 fix) | L1-C2 |
+|---|---|---|---|
+| total_candidates | 50 | 53 | 77 |
+| included_entries | 6 | 7 | 7 |
+| chars_used | 3888 | 3971 | 3903 |
+| governance entries | 6 | 7 | 7 |
+| active events in governance | 0 | 2 | 1 |
+| unresolved_items | 0 | 0 | 0 |
+
+**EI-006 escalation observed (see §10.8):**
+Governance tier: [213, 201, 144, 137, 134, 63, 197] — 6 rejected governance_rule + 1 active architecture_decision. Only id=197 ("[REVISED] Previous limits (ADR-005)") is active. Five new rejected governance_rule fragments from batch 2 (ids 134, 137, 144, 201, 213) crowded out all but one active event from 59 active candidates. This is a regression from the L1-C2 post-fix state (2 active → 1 active in governance tier).
+
+**Assembly with compression artifact (policy: compression_artifact_ids=[1]):**
+- Continuity context: 1 entry (id=1, 1960 chars)
+- Main context unchanged: same 7 governance entries, same chars_used
+- Compression artifact correctly isolated in continuity_context tier, separate budget
+
+---
+
+### 10.8 EI-006 operational impact assessment
+
+**Current state:** 6 rejected governance_rule events consume ~3800 of the 4000-char governance budget, leaving room for 1 active event.
+
+**Trajectory:**
+- Batch 1 (27 docs): 3 rejected governance_rule fragments → 0 active in governance tier (pre-EI-004 fix), 2 active post-fix
+- Batch 2 (7 docs): 5 additional rejected governance_rule fragments → 1 active in governance tier
+
+Each ADR or reference document containing `must not`, `must always`, or `never` language adds 1-3 rejected fragments. At this rate:
+- A third batch of similar size will produce 4-7 more rejected fragments
+- These will consume the remaining 97 chars of governance budget
+- Active events will be fully excluded from the governance tier again
+
+**Severity reclassification:** EI-006 is no longer "bounded, non-fatal." With 60 active events in the corpus and only 1 surfacing in the governance tier, the governance context is effectively non-functional for an operator trying to understand the current architectural state. The trajectory to 0 active governance events is observable and near-term.
+
+**Recommended action before L1-C3:** Implement the EI-006 fix (`partition_by_section()` status exclusion) before the next corpus expansion. The governance tier degradation rate makes deferral increasingly costly.
+
+---
+
+### 10.9 New findings
+
+**EI-007 — Incident pattern generates unresolved fragments from non-incident corpus text**
+
+- **Class:** C — parser-quality
+- **Priority:** Low-Medium
+- **Symptom:** The `incident` PatternRule fires on the word "incident" wherever it appears mid-text: "incident response procedures", "incident MTTI breakdown:", "four incidents in the past quarter", etc. These fire in retrospective meetings, planning documents, and ADRs — not just incident reports. 9 events in batch 2, all fragments starting with word-wrap artifacts.
+- **Distinct behavior:** Incident events default to `status='unresolved'` (not `proposed`). They do not appear in the `proposed` operator review queue; the operator must inspect `unresolved` events separately. This creates review friction and a silent accumulation path.
+- **Affected path:** `ingestion/extractor.py` `incident` PatternRule; default status assignment for `incident` type.
+- **Not replay-affecting, not continuity-corrupting.**
+- **Proposed remediation:** Add a minimum context length requirement or a structural anchor (incident number pattern INC-XXX, severity keyword, or date header) before the incident pattern fires. Or assign `incident` events `status='proposed'` so they enter the standard review queue.
+- **Deferred:** Log only. Do not fix during run.
+
+---
+
+### 10.10 Multi-session workflow assessment
+
+| Operation | Result |
+|---|---|
+| Second assembly logged (id=3) | PASS |
+| Compression artifact created (id=1, method=operator_manual) | PASS |
+| Compression artifact promoted to active | PASS |
+| Memory seeded from compression (id=215, type=implementation_note) | PASS |
+| Assembly with compression artifact (continuity_context tier) | PASS |
+| Continuity artifact isolated in separate budget | PASS |
+| Assembly determinism (×2 reconstructions) | PASS |
+
+**Session continuation observation:** `ContextActivationPolicy.compression_artifact_ids` correctly gates continuity context into the assembly. The compression artifact (1960 chars) does not compete with the main governance/memory budget. This is the intended behavior and works correctly.
+
+**Operator ergonomics note:** Review fatigue is moderate. The `unresolved` queue for incident events requires a separate inspection pass. The operator must know to call `review_memory(status='unresolved')` in addition to `review_memory(status='proposed')`. This is undocumented and caused the 9 unresolved fragments to be missed in the initial review pass.
+
+---
+
+### 10.11 Retrieval quality
+
+| Query term | Active results | Quality |
+|---|---|---|
+| "replica" | 17 active + 2 superseded | Good — ADR-008 events prominent, superseded ADR-005 correctly labeled |
+| "ADR-008" | 11 active | Good — revision decisions surface correctly |
+| "OpenTelemetry" | 2 active | Limited — new topic, only 2 events from ADR-009 |
+| "schema" | 4 active | Adequate — Q2 scope and slippage note both surface |
+| "INC-005" | 8 active | Good — cross-references to ADR-005/ADR-008/ADR-007 constraints |
+| "backpressure" | 8 active | Good — new topic well-covered |
+| "kafka" | 10 active + 2 superseded | Good — cross-temporal: superseded decisions (25, 29) correctly labeled alongside active |
+
+Retrieval drift observation: the corpus growth is beginning to produce noise at moderate query breadth. "replica" returns 17 active events — many are cross-references rather than primary decisions. Operator must manually filter for primary constraint events. Substring matching limitation (known, no semantic ranking) is noticeable at 60+ active events.
+
+---
+
+### 10.12 Continuity round-trip
+
+- **Export:** 215 events, schema_version=1.2, lineage_integrity_checked=True
+- **Import:** 215 imported, 0 skipped, 0 collisions
+- **Reconstruction identity:** governance_context IDs [213, 201, 144, 137, 134, 63, 197] — identical on source and recovered DB
+- **chars_used:** 3903 == 3903 ✓
+- **Lineage integrity (recovered):** all_ok=True, total_broken=0
+- **ROUND-TRIP: PASS**
+
+Note: The EI-006 defect is replicated faithfully in the recovered DB. Round-trip determinism is confirmed including the governance tier degradation pattern.
+
+---
+
+### 10.13 Checkpoint assessment
+
+| Criterion | Status |
+|---|---|
+| Ingestion completes without crash | PASS |
+| All 87 batch 2 candidates committed | PASS |
+| Operator review completes (0 unreviewed) | PASS (includes 9 unresolved incident fragments) |
+| CRITICAL governance issues | 0 — PASS |
+| Lineage integrity | PASS |
+| Continuity round-trip | PASS |
+| Replay determinism | PASS |
+| Supersession workflow functional | PASS — EI-005 protocol observed, L1-C1 gap corrected |
+| Contradiction linking functional | PASS — 2 links created pre-supersession |
+| Compression workflow functional | PASS — artifact created, promoted, seeded, continuity tier verified |
+| Assembly produces useful context | CONDITIONAL — only 1 active governance event; EI-006 escalating |
+| EI-006 trajectory acceptable | FAIL — not bounded; governance tier will collapse again within 1-2 batches |
+
+**Checkpoint L1-C2 assessment: CONDITIONAL PASS**
+
+Substrate mechanics (ingestion, lineage, supersession, contradiction linking, compression, export/import, determinism) are all sound. Multi-session workflows function correctly. EI-006 is the primary concern: the rejected governance_rule fragment accumulation rate makes the governance tier operationally unusable on a predictable and near-term trajectory.
+
+**Recommendation before L1-C3:** Implement and commit EI-006 fix (`partition_by_section()` status exclusion) before the next corpus expansion. L1-C3 should focus on governance tier quality post-fix under continued accumulation pressure.
+
+**EI-007 opened:** Incident pattern fires on non-incident corpus text, producing unresolved fragment events that bypass the standard review queue. Low-Medium priority. Deferred.
+
+---
+
+## 11. Post-Checkpoint L1-C2 Remediation
+
+### 11.1 EI-006 fix — partition_by_section status exclusion
+
+**Date:** 2026-05-28  
+**Trigger:** L1-C2 CONDITIONAL PASS — governance tier 6 rejected + 1 active, escalating trajectory
+
+**Root cause (confirmed):**
+`partition_by_section()` routed by `event_type` only. Rejected/superseded governance events retrieved via the general path in `activate_memory()` entered the governance tier and displaced active decisions. The accumulation rate (~3–5 rejected fragments per 7-doc batch) made full tier collapse inevitable within 1–2 additional batches.
+
+**Fix applied:**
+- Added `GOVERNANCE_EXCLUDE_STATUSES = frozenset({'rejected', 'superseded', 'archived', 'deprecated'})` to `session/activation.py`
+- Added status exclusion guard in `partition_by_section()`: `and mem.status not in GOVERNANCE_EXCLUDE_STATUSES`
+- Excluded events fall through to `relevant_memory` — no data discarded
+- 9 regression tests added in `session/tests/test_activation.py`
+
+**Post-fix verification (longitudinal_v1.db, max_chars=16000, min_confidence=2):**
+
+| Metric | Before (EI-006 open) | After (EI-006 remediated) |
+|---|---|---|
+| governance_context entries | 7 (6 rejected, 1 active) | 7 (all active) |
+| chars_used | 3903 / 16000 | 15777 / 16000 |
+| included_entries | 7 | 28 |
+| round-trip identity | — | PASS (215 events, gov_ids identical) |
+| replay determinism | — | PASS (×2 identical) |
+
+**Governance tier post-fix (all active, all substantive decisions):**
+- id=214 active — Operational limits binding; limit changes require ADR update
+- id=209 active — OpenTelemetry distributed tracing limits (ADR-009)
+- id=206 active — Redis Streams consumer lag alert 5,000 / autoscaling 10,000 (ADR-007/INC-005)
+- id=198 active — Max 5 replicas hard ceiling; > 5 requires ADR update (ADR-008)
+- id=197 active — ADR-005 min-1/max-3 replica limits revised to min-2/max-5 (ADR-008)
+- id=191 active — API versioning documentation refresh
+- id=172 active — API versioning removed from Q2 scope
+
+**Test suite:** 3194 passed, 1 warning. Session tests: 390 passed.
+
+**Files changed:**
+- `session/activation.py` — `GOVERNANCE_EXCLUDE_STATUSES` constant + one-line status guard
+- `session/tests/test_activation.py` — 9 EI-006 regression tests + import update
+- `docs/ENGINEERING_ISSUES.md` — EI-006 status updated to Remediated
+
+### 11.2 L1-C3 readiness
+
+EI-006 fix applied and verified. Governance tier is fully active and substantive. Round-trip and determinism PASS. L1-C3 may proceed.
+
+L1-C3 focus: governance tier quality under continued accumulation pressure, EI-007 observation (incident pattern false positives), retrieval noise at 60+ active events.
+
+---
+
+*This document is the operator record for Longitudinal Run L1. Findings are recorded as observed; no remediation is performed during the run unless replay integrity, lineage, or determinism breaks.*
