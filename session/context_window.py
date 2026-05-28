@@ -87,11 +87,13 @@ def apply_context_budget(
     """
     max_chars = policy.max_chars
     max_entries = policy.max_entries
-    max_governance_chars = policy.max_governance_chars  # 0 = uncapped
+    max_governance_chars = policy.max_governance_chars      # 0 = uncapped
+    max_investigation_chars = policy.max_investigation_chars  # 0 = uncapped
 
     chars_used = 0
     entries_used = 0
     governance_chars_used = 0
+    investigation_chars_used = 0
 
     total_candidates = (
         len(governance_context)
@@ -126,6 +128,18 @@ def apply_context_budget(
         governance_chars_used += _char_count(text)
         _accept(text)
 
+    def _investigation_fits(text: str) -> bool:
+        if not _fits(text):
+            return False
+        if max_investigation_chars > 0:
+            return investigation_chars_used + _char_count(text) <= max_investigation_chars
+        return True
+
+    def _accept_investigation(text: str) -> None:
+        nonlocal investigation_chars_used
+        investigation_chars_used += _char_count(text)
+        _accept(text)
+
     out_gov: List[ActivatedMemory] = []
     out_unres: List[ActivatedMemory] = []
     out_wf: List[ActiveWorkflow] = []
@@ -155,12 +169,12 @@ def apply_context_budget(
             out_wf.append(item)
             _accept(rendered)
 
-    # Tier 3: active investigations
+    # Tier 3: active investigations (optionally capped by max_investigation_chars)
     for item in active_investigations:
         rendered = item.render()
-        if _fits(rendered):
+        if _investigation_fits(rendered):
             out_inv.append(item)
-            _accept(rendered)
+            _accept_investigation(rendered)
 
     # Tier 4: relevant memory (fills remaining budget)
     for item in relevant_memory:

@@ -20,6 +20,7 @@ CONTEXT_ASSEMBLY_VERSION = '1.2.0'
 CHAR_BUDGET_DEFAULT = 12000
 ENTRY_BUDGET_DEFAULT = 60
 GOVERNANCE_CHAR_BUDGET_DEFAULT = 6000
+INVESTIGATION_CHAR_BUDGET_DEFAULT = 3500
 
 # ---------------------------------------------------------------------------
 # Cognition session constants
@@ -230,6 +231,11 @@ class ContextActivationPolicy:
     # Default: GOVERNANCE_CHAR_BUDGET_DEFAULT (6000). Set to 0 for legacy uncapped behavior.
     max_governance_chars: int = GOVERNANCE_CHAR_BUDGET_DEFAULT
 
+    # Investigation tier char budget (Tier 3). When > 0, investigation entries stop
+    # accumulating after this many chars, freeing remaining budget for Tier 4 (relevant_memory).
+    # Default: INVESTIGATION_CHAR_BUDGET_DEFAULT (3500). Set to 0 for uncapped behavior.
+    max_investigation_chars: int = INVESTIGATION_CHAR_BUDGET_DEFAULT
+
     def to_dict(self) -> dict:
         return {
             'tags': list(self.tags),
@@ -251,6 +257,7 @@ class ContextActivationPolicy:
             'max_chars': self.max_chars,
             'max_entries': self.max_entries,
             'max_governance_chars': self.max_governance_chars,
+            'max_investigation_chars': self.max_investigation_chars,
         }
 
     @classmethod

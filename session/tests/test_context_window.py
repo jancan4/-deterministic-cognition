@@ -378,3 +378,157 @@ def test_from_dict_missing_max_governance_chars_uses_new_default():
     old_dict = {'max_chars': 12000, 'max_entries': 60}
     policy = ContextActivationPolicy.from_dict(old_dict)
     assert policy.max_governance_chars == GOVERNANCE_CHAR_BUDGET_DEFAULT
+
+
+# ---------------------------------------------------------------------------
+# Layer 4.5: max_investigation_chars cap
+# ---------------------------------------------------------------------------
+
+def _investigation(id_) -> ActivatedMemory:
+    """Investigation-type item for Layer 4.5 tests."""
+    return _mem(id_, event_type='open_question', status='active', confidence=3)
+
+
+def test_max_investigation_chars_default_is_3500():
+    """Default max_investigation_chars must be INVESTIGATION_CHAR_BUDGET_DEFAULT (3500)."""
+    from session.models import INVESTIGATION_CHAR_BUDGET_DEFAULT
+    policy = _policy()
+    assert policy.max_investigation_chars == INVESTIGATION_CHAR_BUDGET_DEFAULT
+    assert policy.max_investigation_chars == 3500
+
+
+def test_max_investigation_chars_zero_is_uncapped():
+    """max_investigation_chars=0 must behave identically to no cap: all investigation items included."""
+    inv_items = [_investigation(i) for i in range(5)]
+    result = _budget(
+        policy=_policy(max_investigation_chars=0, max_chars=999999),
+        active_investigations=inv_items,
+    )
+    assert len(result.active_investigations) == 5
+
+
+def test_max_investigation_chars_limits_investigation_tier():
+    """When max_investigation_chars is set, investigation entries stop at the cap."""
+    inv1 = _investigation(1)
+    inv2 = _investigation(2)
+    inv3 = _investigation(3)
+    one_entry_chars = len(inv1.render()) + 4
+    policy = _policy(max_investigation_chars=one_entry_chars, max_chars=999999)
+
+    result = _budget(policy=policy, active_investigations=[inv1, inv2, inv3])
+    assert len(result.active_investigations) == 1
+    assert result.active_investigations[0].memory_id == 1
+
+
+def test_max_investigation_chars_leaves_budget_for_relevant_memory():
+    """After capping investigations, relevant_memory must fill the remaining budget."""
+    inv_items = [_investigation(i) for i in range(10)]
+    mem_items = [_mem(i + 100) for i in range(5)]
+
+    one_inv_chars = len(inv_items[0].render()) + 4
+    policy = _policy(
+        max_investigation_chars=one_inv_chars,  # cap: only 1 investigation entry
+        max_chars=999999,
+    )
+    result = _budget(policy=policy, active_investigations=inv_items, relevant_memory=mem_items)
+
+    assert len(result.active_investigations) == 1
+    assert len(result.relevant_memory) == 5
+
+
+def test_max_investigation_chars_still_respects_overall_budget():
+    """max_investigation_chars does not override max_chars: the overall budget still applies."""
+    inv1 = _investigation(1)
+    one_entry_chars = len(inv1.render()) + 4
+    # overall budget fits 1 investigation entry exactly; investigation cap is larger
+    policy = _policy(max_chars=one_entry_chars, max_investigation_chars=one_entry_chars * 10)
+
+    result = _budget(
+        policy=policy,
+        active_investigations=[inv1, _investigation(2)],
+        relevant_memory=[_mem(10)],
+    )
+    assert len(result.active_investigations) == 1
+    assert len(result.relevant_memory) == 0
+
+
+def test_max_investigation_chars_preserves_unresolved_precedence():
+    """Unresolved items (Tier 1) must still precede investigations (Tier 3) when budget is tight."""
+    unres = _unresolved(1)
+    unres_chars = len(unres.render()) + 4
+    inv = _investigation(2)
+    inv_chars = len(inv.render()) + 4
+    # Budget fits exactly one item; unresolved must win over investigation
+    policy = _policy(max_chars=unres_chars, max_investigation_chars=999999)
+
+    result = _budget(
+        policy=policy,
+        unresolved_items=[unres],
+        active_investigations=[inv],
+    )
+    assert len(result.unresolved_items) == 1
+    assert len(result.active_investigations) == 0
+
+
+def test_from_dict_missing_max_investigation_chars_uses_new_default():
+    """Old policy dict without max_investigation_chars must deserialize to INVESTIGATION_CHAR_BUDGET_DEFAULT."""
+    from session.models import INVESTIGATION_CHAR_BUDGET_DEFAULT
+    old_dict = {'max_chars': 12000, 'max_entries': 60}
+    policy = ContextActivationPolicy.from_dict(old_dict)
+    assert policy.max_investigation_chars == INVESTIGATION_CHAR_BUDGET_DEFAULT
+
+
+def test_max_investigation_chars_in_to_dict():
+    """max_investigation_chars must appear in the serialized policy dict."""
+    policy = _policy(max_investigation_chars=2000)
+    d = policy.to_dict()
+    assert 'max_investigation_chars' in d
+    assert d['max_investigation_chars'] == 2000
+
+
+def test_relevant_memory_regains_visibility_under_investigation_cap():
+    """With investigations capped at one entry, relevant_memory must receive remaining budget."""
+    inv_items = [_investigation(i) for i in range(5)]
+    mem_items = [_mem(i + 100, summary_len=30) for i in range(3)]
+
+    one_inv_chars = len(inv_items[0].render()) + 4
+    policy = _policy(
+        max_investigation_chars=one_inv_chars,
+        max_chars=999999,
+    )
+    result = _budget(
+        policy=policy,
+        active_investigations=inv_items,
+        relevant_memory=mem_items,
+    )
+    assert len(result.active_investigations) == 1
+    assert len(result.relevant_memory) == 3
+
+
+def test_no_duplicate_ids_across_investigation_and_memory_sections():
+    """Memory IDs must not appear in both active_investigations and relevant_memory."""
+    inv_items = [_investigation(i) for i in range(3)]
+    mem_items = [_mem(i + 10) for i in range(3)]
+
+    result = _budget(
+        policy=_policy(max_chars=999999, max_investigation_chars=999999),
+        active_investigations=inv_items,
+        relevant_memory=mem_items,
+    )
+    inv_ids = {m.memory_id for m in result.active_investigations}
+    mem_ids = {m.memory_id for m in result.relevant_memory}
+    assert inv_ids & mem_ids == set()
+
+
+def test_investigation_cap_deterministic_same_inputs():
+    """Same inputs with an investigation cap must always produce the same output."""
+    inv_items = [_investigation(i) for i in range(10)]
+    mem_items = [_mem(i + 100, summary_len=20) for i in range(5)]
+    policy = _policy(max_investigation_chars=200, max_chars=999999)
+
+    r1 = _budget(policy=policy, active_investigations=inv_items, relevant_memory=mem_items)
+    r2 = _budget(policy=policy, active_investigations=inv_items, relevant_memory=mem_items)
+
+    assert [m.memory_id for m in r1.active_investigations] == [m.memory_id for m in r2.active_investigations]
+    assert [m.memory_id for m in r1.relevant_memory] == [m.memory_id for m in r2.relevant_memory]
+    assert r1.chars_used == r2.chars_used
