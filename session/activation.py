@@ -11,7 +11,7 @@ components are explicit and inspectable.
 """
 from typing import Dict, List, Optional, Set, Tuple
 
-from memory.retrieval import DOCTRINE_PRIORITY, ScoredEvent, RetrievalQuery, retrieve, retrieve_governance, retrieve_unresolved
+from memory.retrieval import DOCTRINE_PRIORITY, ScoredEvent, RetrievalQuery, retrieve, retrieve_governance, retrieve_investigations, retrieve_unresolved
 from memory.models import MemoryEvent, VALID_EVENT_TYPES
 from .models import ActivatedMemory, ContextActivationPolicy
 
@@ -130,8 +130,9 @@ def activate_memory(
     Combines:
     - Governance context (always — governance events are not filterable)
     - Unresolved items (if include_unresolved=True)
-    - Tag/type filtered relevant memory
+    - Active investigations: open_question/hypothesis (if include_investigations=True)
     - Adaptation events (if include_adaptations=True)
+    - Tag/type filtered relevant memory (non-governance general pass)
 
     Deduplicates by memory_id. Respects max_memory_candidates. Returns
     items sorted by activation_rank (lower = higher priority).
@@ -149,6 +150,13 @@ def activate_memory(
 
     if policy.include_unresolved:
         _add(retrieve_unresolved(memory_db_path, limit=policy.max_memory_candidates))
+
+    if policy.include_investigations:
+        _add(retrieve_investigations(
+            memory_db_path,
+            limit=policy.max_memory_candidates,
+            min_confidence=policy.min_confidence,
+        ))
 
     # Adaptation-specific retrieve (extra pass if include_adaptations=True)
     if policy.include_adaptations:

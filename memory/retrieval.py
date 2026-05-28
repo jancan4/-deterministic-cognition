@@ -234,6 +234,17 @@ def retrieve_governance(db_path: str, limit: int = 20) -> List[ScoredEvent]:
     return retrieve(db_path, query)
 
 
+def retrieve_investigations(db_path: str, limit: int = 20, min_confidence: int = 1) -> List[ScoredEvent]:
+    query = RetrievalQuery(
+        event_types=['open_question', 'hypothesis'],
+        statuses=['active', 'accepted'],
+        min_confidence=min_confidence,
+        limit=limit,
+        expand_related=False,
+    )
+    return retrieve(db_path, query)
+
+
 # ---------------------------------------------------------------------------
 # internal helpers
 # ---------------------------------------------------------------------------

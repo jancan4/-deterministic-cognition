@@ -190,6 +190,7 @@ class ContextActivationPolicy:
     tags: List[str] = field(default_factory=list)
     min_confidence: int = 1
     include_unresolved: bool = True
+    include_investigations: bool = True
     include_adaptations: bool = True
     expand_related: bool = True
 
@@ -234,6 +235,7 @@ class ContextActivationPolicy:
             'tags': list(self.tags),
             'min_confidence': self.min_confidence,
             'include_unresolved': self.include_unresolved,
+            'include_investigations': self.include_investigations,
             'include_adaptations': self.include_adaptations,
             'expand_related': self.expand_related,
             'compression_mode': self.compression_mode,

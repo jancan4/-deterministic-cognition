@@ -612,3 +612,121 @@ def test_layer3_rejected_governance_does_not_enter_general_retrieve_path(tmp_pat
     # Active non-governance must be present
     rel_titles = [m.title for m in sections['relevant_memory']]
     assert 'IMPL-ACTIVE' in rel_titles
+
+
+# ---------------------------------------------------------------------------
+# Layer 4: dedicated investigations retrieval pass
+# ---------------------------------------------------------------------------
+
+def test_layer4_investigations_surface_despite_doctrine_saturation(tmp_path):
+    """Active open_questions must appear in active_investigations even when
+    the general candidate pool (limit=50) is completely filled by higher-ranked
+    doctrine=3/6 event types.
+
+    Layer 4 fix: dedicated retrieve_investigations() pass runs independently
+    of the general_query slot limit.
+    """
+    db = _mem_db(tmp_path)
+    # Fill doctrine=3 and doctrine=6 slots beyond the 50-slot limit
+    for i in range(25):
+        _add(db, event_type='validation_result', title=f'VAL-{i}',
+             status='active', confidence=3)
+    for i in range(30):
+        _add(db, event_type='implementation_note', title=f'IMPL-{i}',
+             status='active', confidence=3)
+    # Add active open_questions — these would be excluded by slot competition
+    for i in range(3):
+        _add(db, event_type='open_question', title=f'OQ-{i}',
+             status='active', confidence=3)
+
+    result = activate_memory(db, _policy())
+    sections = partition_by_section(result)
+
+    inv_titles = [m.title for m in sections['active_investigations']]
+    assert len(inv_titles) == 3, (
+        f"Layer 4: expected 3 open_questions in active_investigations, "
+        f"got {len(inv_titles)}: {inv_titles}"
+    )
+    for i in range(3):
+        assert f'OQ-{i}' in inv_titles, (
+            f"Layer 4: OQ-{i} missing from active_investigations"
+        )
+
+
+def test_layer4_include_investigations_false_disables_pass(tmp_path):
+    """Setting include_investigations=False must suppress the investigations pass
+    and leave active_investigations empty when the general pool is saturated.
+    """
+    db = _mem_db(tmp_path)
+    for i in range(30):
+        _add(db, event_type='validation_result', title=f'VAL-{i}',
+             status='active', confidence=3)
+    for i in range(25):
+        _add(db, event_type='implementation_note', title=f'IMPL-{i}',
+             status='active', confidence=3)
+    _add(db, event_type='open_question', title='OQ-BLOCKED',
+         status='active', confidence=3)
+
+    policy = _policy(include_investigations=False)
+    result = activate_memory(db, policy)
+    sections = partition_by_section(result)
+
+    assert sections['active_investigations'] == [], (
+        "Layer 4: include_investigations=False should suppress the investigations pass; "
+        f"got: {[m.title for m in sections['active_investigations']]}"
+    )
+
+
+def test_layer4_unresolved_open_question_stays_in_unresolved_not_investigations(tmp_path):
+    """An open_question with status='unresolved' must appear in unresolved_items
+    only, NOT in active_investigations — even with the Layer 4 investigations pass active.
+
+    retrieve_investigations filters statuses=['active','accepted'], so unresolved
+    events are excluded from the investigations pass.
+    """
+    db = _mem_db(tmp_path)
+    _add(db, event_type='open_question', title='OQ-UNRES', status='unresolved', confidence=3)
+    _add(db, event_type='open_question', title='OQ-ACTIVE', status='active', confidence=3)
+
+    result = activate_memory(db, _policy())
+    sections = partition_by_section(result)
+
+    unres_titles = [m.title for m in sections['unresolved_items']]
+    inv_titles = [m.title for m in sections['active_investigations']]
+
+    assert 'OQ-UNRES' in unres_titles, "Unresolved open_question missing from unresolved_items"
+    assert 'OQ-UNRES' not in inv_titles, (
+        "Layer 4: unresolved open_question incorrectly placed in active_investigations"
+    )
+    assert 'OQ-ACTIVE' in inv_titles, "Active open_question missing from active_investigations"
+    assert 'OQ-ACTIVE' not in unres_titles, "Active open_question incorrectly in unresolved_items"
+
+
+def test_layer4_no_duplication_between_unresolved_and_investigations(tmp_path):
+    """When an open_question is unresolved, it must appear exactly once across
+    unresolved_items and active_investigations — never in both.
+
+    The deduplication set in activate_memory() plus the mutual-exclusion
+    guard in partition_by_section() together prevent double-counting.
+    """
+    db = _mem_db(tmp_path)
+    _add(db, event_type='open_question', title='OQ-UNRES', status='unresolved', confidence=3)
+    _add(db, event_type='hypothesis', title='HYP-UNRES', status='proposed', confidence=3)
+
+    policy = _policy(include_unresolved=True, include_investigations=True)
+    result = activate_memory(db, policy)
+    sections = partition_by_section(result)
+
+    # Each event must appear at most once in the collected candidates
+    all_ids = [m.memory_id for m in result]
+    assert len(all_ids) == len(set(all_ids)), (
+        "Layer 4: duplicate memory_ids in activated candidates — deduplication broken"
+    )
+
+    # No event should be in both unresolved_items and active_investigations
+    unres_ids = {m.memory_id for m in sections['unresolved_items']}
+    inv_ids = {m.memory_id for m in sections['active_investigations']}
+    overlap = unres_ids & inv_ids
+    assert overlap == set(), (
+        f"Layer 4: memory IDs appear in both unresolved_items and active_investigations: {overlap}"
+    )

@@ -19,6 +19,7 @@ from memory.retrieval import (
     retrieve,
     retrieve_adaptations,
     retrieve_governance,
+    retrieve_investigations,
     retrieve_unresolved,
 )
 
@@ -1553,3 +1554,57 @@ class TestCliRetrieve:
         capsys.readouterr()
         entries = list_retrieval_log(db)
         assert len(entries) == 1
+
+
+# ---------------------------------------------------------------------------
+# retrieve_investigations helper (Layer 4)
+# ---------------------------------------------------------------------------
+
+class TestRetrieveInvestigations:
+    def test_returns_open_question_and_hypothesis(self, tmp_path):
+        """retrieve_investigations must return open_question and hypothesis events."""
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        _add(db, event_type='open_question', status='active')
+        _add(db, event_type='hypothesis', status='active')
+        _add(db, event_type='implementation_note', status='active')
+        results = retrieve_investigations(db)
+        types = {s.event.event_type for s in results}
+        assert types == {'open_question', 'hypothesis'}
+
+    def test_excludes_non_investigation_types(self, tmp_path):
+        """retrieve_investigations must not return governance, impl_notes, incidents, etc."""
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        for etype in ('governance_rule', 'architecture_decision',
+                      'implementation_note', 'incident', 'validation_result',
+                      'rejected_idea', 'adaptation'):
+            _add(db, event_type=etype, status='active')
+        results = retrieve_investigations(db)
+        assert results == [], (
+            f"Non-investigation types returned: {[s.event.event_type for s in results]}"
+        )
+
+    def test_excludes_unresolved_status(self, tmp_path):
+        """retrieve_investigations uses statuses=['active','accepted']; unresolved events excluded."""
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        _add(db, event_type='open_question', status='unresolved')
+        _add(db, event_type='open_question', status='proposed')
+        _add(db, event_type='open_question', status='active')
+        results = retrieve_investigations(db)
+        assert len(results) == 1
+        assert results[0].event.status == 'active'
+
+    def test_empty_db(self, tmp_path):
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        assert retrieve_investigations(db) == []
+
+    def test_returns_accepted_investigations(self, tmp_path):
+        """retrieve_investigations must include 'accepted' status (consistent with governance)."""
+        db = str(tmp_path / 'mem.db')
+        service.init_db(db)
+        _add(db, event_type='open_question', status='accepted')
+        results = retrieve_investigations(db)
+        assert len(results) == 1

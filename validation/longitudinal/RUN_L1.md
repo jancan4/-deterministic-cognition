@@ -1823,4 +1823,447 @@ Layer 3 structural fix is complete. The relevant_memory candidate pool is popula
 
 ---
 
+## §20 — L1-C7: Paired Budget Comparison (max_chars=12,000 vs 20,000)
+
+**Run date:** 2026-05-28  
+**DB:** `longitudinal_v1.db` (restored from `runs/longitudinal_v1.db` after canonical path wiped to 0 bytes at session start — integrity verified by event count match)  
+**Corpus batch:** 4 documents (2026-08-01 decisions memo, INC-009, 2026-08-15 OTel Phase 2 kickoff, 2026-08-25 Q3 late-quarter review)  
+**Policy A:** max_chars=12,000, max_governance_chars=6,000 (default)  
+**Policy B:** max_chars=20,000, max_governance_chars=6,000 (governance cap unchanged)
+
+---
+
+### 20.1 DB State Post-Review
+
+| Status | Count |
+|---|---|
+| active | 196 |
+| rejected | 281 |
+| superseded | 9 |
+| unresolved | 0 |
+| **TOTAL** | **486** |
+
+**Active events by type:**
+
+| Event Type | Count | Doctrine Rank | Retrieval Path |
+|---|---|---|---|
+| architecture_decision | 91 | 2 | governance_context |
+| governance_rule | 5 | 1 | governance_context |
+| validation_result | 21 | 3 | relevant_memory |
+| implementation_note | 44 | 6 | relevant_memory |
+| incident | 11 | 7 (default) | relevant_memory |
+| open_question | 23 | 7 (default) | relevant_memory → active_investigations |
+| rejected_idea | 1 | 7 (default) | relevant_memory |
+
+Note: 0 unresolved events — the 3 prior unresolved items ([344], [374], [385]) were closed during L1-C7 review. New open questions from the L1-C7 batch (Q5a, Q5b, Q5c) were ingested as status=`active`, not `unresolved`.
+
+**Governance lineage:** `all_ok=True`, 0 broken links across all 4 FK checks.
+
+---
+
+### 20.2 Pre-Budget Candidate Pool
+
+`activate_memory()` retrieves up to `max_memory_candidates=50` per path (governance and general). The candidate pool is identical under both policies because `max_memory_candidates` is not varied.
+
+**Governance candidates (50 retrieved, 36,735 chars):**
+
+| Event Type | Count |
+|---|---|
+| governance_rule | 5 |
+| architecture_decision | 45 |
+| **Total** | **50** |
+
+46 architecture_decisions not retrieved (91 active − 45 in candidate pool). All 5 governance_rules retrieved.
+
+**Relevant-memory candidates (50 retrieved, 45,398 chars):**
+
+| Event Type | Count | Doctrine Rank |
+|---|---|---|
+| validation_result | 21 | 3 |
+| implementation_note | 29 | 6 |
+| **Total** | **50** | — |
+
+**Events absent from candidate pool (doctrine=7, all 50 slots filled by higher-ranked types):**
+
+| Event Type | Active Count | Reason |
+|---|---|---|
+| open_question | 23 | Candidate slots filled by val_results (21) + impl_notes (29) |
+| incident | 11 | Same |
+| rejected_idea | 1 | Same |
+| **Total absent** | **35** | — |
+
+Consequence: `active_investigations` is structurally empty under both policies. 23 active open_questions exist in the DB but are never retrieved because `max_memory_candidates=50` is exhausted by doctrine=3 and doctrine=6 types before doctrine=7 types are reached.
+
+---
+
+### 20.3 Post-Budget Comparison: Policy A vs Policy B
+
+| Section | Policy A (12k) items | Policy A chars | Policy B (20k) items | Policy B chars |
+|---|---|---|---|---|
+| governance_context | 7 | 5,965 | 7 | 5,965 |
+| unresolved_items | 0 | 0 | 0 | 0 |
+| active_investigations | 0 | 0 | 0 | 0 |
+| relevant_memory | 6 | 5,906 | 18 | 13,772 |
+| **TOTAL** | **13** | **11,871** | **25** | **19,737** |
+| Budget utilization | — | 98.9% | — | 98.7% |
+| Truncated | — | True | — | True |
+
+**governance_context (identical under both — governance cap=6,000 unchanged):**
+
+| Event Type | Count | Chars |
+|---|---|---|
+| governance_rule | 5 | ~4,082 |
+| architecture_decision | 2 | ~1,883 |
+| **Total** | **7** | **5,965** |
+
+43 governance candidates truncated by the 6,000-char cap. Expected behavior.
+
+**relevant_memory — Policy A (6 items, all validation_result):** IDs [483, 482, 468, 464, 460, 454]
+
+**relevant_memory — Policy B (18 items, all validation_result):** IDs [483, 482, 468, 464, 460, 454, 453, 441, 438, 437, 404, 402, 399, 388, 365, 342, 340, 234]
+
+**Surfaced only at 20k (+12 items):** IDs [453, 441, 438, 437, 404, 402, 399, 388, 365, 342, 340, 234] — all `validation_result`
+
+**Absent from both policies:**
+- All 29 implementation_notes (candidates present, but budget exhausted by validation_results first)
+- All 23 open_questions (not retrieved — doctrine=7, candidate pool full)
+- All 11 incidents (not retrieved — doctrine=7, candidate pool full)
+
+---
+
+### 20.4 Budget Exhaustion Mechanics
+
+**Policy A (12k):**
+
+```
+governance cap applied:          5,965 chars  (6,000 cap, 7 items)
+remaining budget:                6,035 chars
+validation_results [483..454]:   6 items, 5,906 chars
+remaining after 6 val_results:     129 chars
+7th val_result [453]:              444 chars → does not fit
+```
+
+6 validation_results surface. 0 implementation_notes surface (smallest candidate = 613 chars > 129 remaining).
+
+**Policy B (20k):**
+
+```
+governance cap applied:          5,965 chars  (same — cap=6,000 unchanged)
+remaining budget:               14,035 chars
+validation_results [483..234]:  18 items, 13,772 chars
+remaining after 18 val_results:    263 chars
+19th val_result [231]:             722 chars → does not fit
+```
+
+18 validation_results surface. 0 implementation_notes surface (smallest candidate = 613 chars > 263 remaining). The 20k budget is exhausted by validation_results before the first implementation_note is reached.
+
+For implementation_notes to surface: ~23,147 chars required (5,965 gov + 16,569 all-21 val_results + 613 smallest impl_note).
+
+---
+
+### 20.5 New Finding: Candidate-Pool Starvation for Doctrine=7 Types (Layer 4)
+
+Three distinct starvation mechanisms identified across L1 validation:
+
+| Layer | Starvation Type | Root Cause | Status |
+|---|---|---|---|
+| Layer 2 | Governance exhausting full budget | No governance tier char cap | Fixed (§17) |
+| Layer 3 | Governance events in general retrieve path | No event_type filter on general_query | Fixed (§19) |
+| **Layer 4** | **Doctrine=7 types never retrieved** | **max_memory_candidates=50 filled by doctrine=3+6 first** | **New — unresolved** |
+
+**Layer 4 mechanism:** The general_query retrieves non-governance events ordered by `activation_rank` (doctrine first). With 21 validation_results (doctrine=3) + 44 implementation_notes (doctrine=6) = 65 non-governance active events ranked above doctrine=7, the 50-slot candidate limit fills before any incident (doctrine=7), open_question (doctrine=7), or rejected_idea (doctrine=7) is reached.
+
+**`active_investigations` is structurally empty** at this corpus size. The 23 active open_questions cannot surface regardless of char budget, because they are not retrieved as candidates.
+
+**This is a design observation, not an emergency.** The 23 active open_questions represent answered/resolved propositions (status=`active`). Active open_questions that would represent ongoing investigations are covered when status=`unresolved` (via the separate `retrieve_unresolved()` path). However, any resolved open_question would also be absent from `active_investigations`, which is the intended surfacing point for historical investigation context.
+
+**Not fixing in L1-C7.** Candidate-selection policy decision; requires structural change (separate retrieval path for INVESTIGATION_EVENT_TYPES). Deferred to §21.
+
+---
+
+### 20.6 Replay Determinism
+
+3 independent runs per policy, fingerprinting section membership (memory_id + event_type per item):
+
+| Policy | Run 1 | Run 2 | Run 3 | DETERMINISTIC |
+|---|---|---|---|---|
+| A (12k) | `3246ade1b87fc00a` | `3246ade1b87fc00a` | `3246ade1b87fc00a` | ✓ |
+| B (20k) | `91884367fb63fc48` | `91884367fb63fc48` | `91884367fb63fc48` | ✓ |
+
+---
+
+### 20.7 Export / Round-Trip
+
+`context.to_dict()` → `reconstruct_from_dict()` round-trip:
+
+| Policy | Original fingerprint | Round-trip fingerprint | MATCH |
+|---|---|---|---|
+| A (12k) | `3246ade1b87fc00a` | `3246ade1b87fc00a` | ✓ |
+| B (20k) | `91884367fb63fc48` | `91884367fb63fc48` | ✓ |
+
+Portability verified for both policies.
+
+---
+
+### 20.8 Operational Usefulness Analysis
+
+**Policy A (12k) operator view:**
+- 5 governance_rules: all active constraints (incl. [476] re-evaluation deadline rule, [419] no-simultaneous-gate rule — both from L1-C7 batch)
+- 2 architecture_decisions: highest-ranked within 6,000-char governance cap
+- 6 validation_results: 6 most recent/highest-ranked empirical observations
+- **Absent:** 12 more validation_results, 29 implementation_notes, 23 open_questions, 11 incidents, 43 architecture_decisions
+
+**Policy B (20k) operator view (additional):**
+- 12 more validation_results: earlier validations (JWT 115-day observation, HPA load test, prior schema validations)
+- **Still absent:** all 29 implementation_notes, all incidents, all open_questions
+
+**Interpretability difference:**
+- 12k → 20k adds measurement depth (more validation_results), not operational process memory.
+- Neither budget surfaces implementation_notes, incident context, or open_question tracking.
+- The qualitative gap is structural: increasing budget does not address doctrine-rank ordering or candidate-pool exclusion.
+
+---
+
+### 20.9 Recommendation
+
+**Maintain default max_chars=12,000. Do not raise default to 20,000.**
+
+1. The 20k expansion adds 12 validation_results but 0 implementation_notes, incidents, or open_questions. The marginal value is more measurement history, not operational process coverage.
+2. Both policies exhaust their full budget (98.9% / 98.7%). Increasing budget shifts the saturation point within the validation_result set; it does not reduce waste or improve coverage of absent types.
+3. The missing operational memory (implementation_notes, incidents, open_questions) requires a structural fix (Layer 4), not a larger char budget. Additional chars all go to more validation_results because of doctrine-rank ordering.
+4. A 20k default would double the context footprint for 12 additional validation_results. The cost/benefit is unfavorable until Layer 4 is addressed.
+
+**Layer 4 action:** Evaluate a dedicated retrieval path for `INVESTIGATION_EVENT_TYPES` (open_question, hypothesis), analogous to the Layer 3 fix that separated general retrieve from governance retrieve. This would ensure active open_questions surface in `active_investigations` independent of doctrine-rank competition in the general candidate pool. Design diagnostics deferred to §21.
+
+---
+
+## §21 — Layer 4 Design Diagnostics: Investigation Candidate-Pool Starvation
+
+**Date:** 2026-05-28  
+**Scope:** Diagnostic only — no source changes, no commits.
+
+---
+
+### 21.1 Starvation Mechanism: Precise Trace
+
+**Entry point: `activate_memory()` in `session/activation.py`.**
+
+`activate_memory()` runs four sequential retrieval passes and deduplicates by `memory_id`:
+
+```
+Pass 1: retrieve_governance()     — event_types=['governance_rule','architecture_decision'], statuses=['active','accepted'], limit=50
+Pass 2: retrieve_unresolved()     — statuses=['unresolved','proposed'], limit=50   (if include_unresolved=True)
+Pass 3: retrieve() [adaptations]  — event_types=['adaptation'], limit=50           (if include_adaptations=True)
+Pass 4: retrieve() [general]      — event_types=_NON_GOVERNANCE_EVENT_TYPES, statuses=['active','accepted'], limit=50
+```
+
+**Pass 4 is where starvation occurs.**
+
+`_NON_GOVERNANCE_EVENT_TYPES` includes all event types except `governance_rule` and `architecture_decision`:
+
+```python
+['adaptation', 'hypothesis', 'implementation_note', 'incident',
+ 'open_question', 'rejected_idea', 'validation_result']
+```
+
+Inside `retrieve()` → `_fetch_candidates()`: SQL fetches ALL matching events (no LIMIT clause), then Python sorts by `composite_key` and truncates at `limit=50`:
+
+```python
+results = scored[start:end]   # start=0, end=50
+```
+
+`composite_key` primary sort: `doctrine_rank` (ascending = higher priority).
+
+**Doctrine ranks at current DB:**
+
+| Event Type | Doctrine Rank | Active Count | General-query position |
+|---|---|---|---|
+| validation_result | 3 | 21 | 1–21 |
+| implementation_note | 6 | 44 | 22–65 (29 fit within limit=50) |
+| incident | 7 | 11 | 66–76 — **excluded** |
+| open_question | 7 | 23 | 66–88 — **excluded** |
+| rejected_idea | 7 | 1 | 89 — **excluded** |
+
+21 + 44 = 65 doctrine=3+6 events fill positions 1–65. With `limit=50`, positions 51–65 are cut, and all 35 doctrine=7 events (positions 66+) are never returned.
+
+**Post-retrieval:** `partition_by_section()` routes `INVESTIGATION_EVENT_TYPES = {'open_question', 'hypothesis'}` to `active_investigations` — but no such events reach the partition step. `active_investigations` receives zero items regardless of char budget. The starvation is purely at the retrieval stage.
+
+**Threshold for doctrine=7 entry:** `max_memory_candidates ≥ 66` (one slot beyond doctrine=3+6 exhaustion at current corpus size).
+
+---
+
+### 21.2 Quantification
+
+**Direct retrieval of `INVESTIGATION_EVENT_TYPES` (bypassing general path):**
+
+```
+retrieve(event_types=['open_question','hypothesis'], statuses=['active','accepted'], limit=50)
+→ 23 results: all open_question, 0 hypothesis
+```
+
+All 23 are directly retrievable. The problem is not a DB or schema issue — it is purely candidate-pool slot competition.
+
+**Char profile of 23 open_questions (as ActivatedMemory):**
+
+| ID | Chars | | ID | Chars |
+|---|---|---|---|---|
+| [466] | 868 | | [312] | 867 |
+| [458] | 1016 | | [310] | 731 |
+| [444] | 1079 | | [298] | 677 |
+| [420] | 626 | | [297] | 757 |
+| [413] | 546 | | [295] | 691 |
+| [406] | 621 | | [294] | 961 |
+| [385] | 1067 | | [289] | 635 |
+| [374] | 709 | | [278] | 585 |
+| [344] | 1143 | | [277] | 523 |
+| [337] | 727 | | [82] | 575 |
+| [328] | 1009 | | [123] | 490 |
+| [324] | 1025 | | **Total** | **17,928** |
+
+Average: 779 chars/item. Total 23 items: 17,928 chars. Smallest: 490 chars [123].
+
+**Incident events (active, 11 total) — would route to `relevant_memory`, not `active_investigations`:**  
+Total 11 incidents: not retrieved (same doctrine=7 exclusion). Incidents are not `INVESTIGATION_EVENT_TYPES` and would fall through to `relevant_memory` in `partition_by_section()` — a separate gap not addressed by Layer 4.
+
+---
+
+### 21.3 Option Comparison
+
+#### Option A — Dedicated `retrieve_investigations()` pass
+
+Add a named retrieval function parallel to `retrieve_governance()` and `retrieve_unresolved()`:
+
+```python
+def retrieve_investigations(db_path: str, limit: int = 20) -> List[ScoredEvent]:
+    query = RetrievalQuery(
+        event_types=['open_question', 'hypothesis'],
+        statuses=['active', 'accepted'],
+        limit=limit,
+        expand_related=False,
+    )
+    return retrieve(db_path, query)
+```
+
+Call from `activate_memory()` (after unresolved pass, before general pass), gated by `policy.include_investigations: bool = True`.
+
+#### Option B — Increase `max_memory_candidates`
+
+Raise default from 50 to ≥66 (the current threshold). Doctrine=7 events enter the general candidate pool once doctrine=3+6 events are exhausted.
+
+**Threshold fragility across corpus growth:**
+
+| Corpus stage | doctrine=3+6 count | Limit needed for doctrine=7 entry |
+|---|---|---|
+| L1-C7 (now) | 65 (21+44) | 66 |
+| L1-C8 (+~20 impl) | ~85 | ~86 |
+| L1-C10 (+~40 impl) | ~105 | ~106 |
+
+The required limit tracks `count(doctrine≤6) + 1` indefinitely.
+
+#### Option C — Event-family quotas
+
+Add slot-allocation parameters to `ContextActivationPolicy` (e.g., `max_candidates_per_type` dict). Each family gets a guaranteed count in the general candidate pool.
+
+#### Option D — Lower doctrine penalty for investigations
+
+Change doctrine ranks: `open_question` → 5, `incident` → 5 (raising them above implementation_notes at doctrine=6).
+
+---
+
+### 21.4 Evaluation Against Design Constraints
+
+| Criterion | A: Dedicated pass | B: Raise limit | C: Quotas | D: Lower doctrine |
+|---|---|---|---|---|
+| Replay determinism | ✓ | ✓ | ✓ | ✓ |
+| Inspectability | ✓ named, explicit | ~ (parameter) | ~ (multi-param) | ~ (semantic confusion) |
+| Governance clarity | ✓ mirrors Layer 3 | ~ | ✗ hidden allocation | ✗ doctrine distorted |
+| Implementation complexity | ~18 lines | 1 constant | Medium | 1 dict entry |
+| Stable under corpus growth | ✓ always retrieves all investigations | ✗ threshold drifts | ~ (requires quota re-tuning) | ✗ still dominated at scale |
+| Hidden heuristic risk | None | None | High | Low but semantic |
+| Operator usefulness | ✓ all active investigations surface | Partial, unstable | Partial, complex | Partial |
+| Architectural precedent | ✓ identical to Layer 3 | — | — | — |
+
+**Option B rejected:** The threshold `count(doctrine≤6) + 1` grows with every ingest cycle. This converts a structural design question into an operational tuning task. After L1-C10 the limit would need to be ≥106; after L1-C15, higher still. The fix is never stable.
+
+**Option C rejected:** Quota parameters carry implicit assumptions about desired section balance. They become empirical tuning knobs — exactly the "hidden heuristic balancing" constraint prohibits. Operator-facing complexity scales with the number of event types.
+
+**Option D rejected:** Doctrine priority encodes epistemological standing, not retrieval engineering convenience. `open_question` events carry uncertainty; ranking them above `implementation_note` (which carries resolved, committed process knowledge) would invert the standing hierarchy. The doctrine table should not be altered to solve a slot-allocation problem.
+
+**Option A selected:** Minimal, deterministic, architecturally consistent with Layers 2 and 3.
+
+---
+
+### 21.5 Budget Impact of Option A
+
+`active_investigations` occupies **Tier 3** in `context_window.py`, evaluated before `relevant_memory` (Tier 4). Populating Tier 3 consumes budget that currently reaches Tier 4.
+
+**Simulated context after Option A (no investigation char cap):**
+
+| Section | Policy A (12k) current | Policy A (12k) after Layer 4 | Policy B (20k) current | Policy B (20k) after Layer 4 |
+|---|---|---|---|---|
+| governance_context | 7 items, 5,965 chars | 7 items, 5,965 chars | 7 items, 5,965 chars | 7 items, 5,965 chars |
+| active_investigations | 0 items | **7 items, 5,823 chars** | 0 items | **17 items, 13,991 chars** |
+| relevant_memory | 6 val_results, 5,906 chars | 0 items (212 chars remaining) | 18 val_results, 13,772 chars | 0 items (44 chars remaining) |
+
+**Trade-off:** Layer 4 without a char cap fully displaces relevant_memory (Tier 4) at both budget levels. 6–18 validation_results are replaced by 7–17 open_questions. This is the correct Tier 3 > Tier 4 priority — the context_window tier design was always intended to give investigations precedence over general memory. Layer 4 realises that intent.
+
+**Optional extension (not in Layer 4):** A `max_investigation_chars` field on `ContextActivationPolicy` — analogous to `max_governance_chars` from Layer 2 — would cap Tier 3 consumption and guarantee budget for Tier 4. For example, `max_investigation_chars=3000` would surface ~4 open_questions while preserving ~3,000 chars for validation_results. This is a Layer 4.5 refinement, appropriate after L1-C8 observation data is available.
+
+---
+
+### 21.6 Implementation Scope
+
+**`memory/retrieval.py`** — add `retrieve_investigations()` (~6 lines)
+
+**`session/activation.py`** — import and call `retrieve_investigations` in `activate_memory()` (~8 lines total)
+
+**`session/models.py`** — add `include_investigations: bool = True` to `ContextActivationPolicy` and `to_dict()` (~4 lines)
+
+**Total: ~18 lines across 3 files.**
+
+`from_dict()` in `ContextActivationPolicy` uses `{k: v for k, v in d.items() if k in known}` — it already ignores unknown keys, so existing serialized policies that lack `include_investigations` will deserialize to the new default `True` without change.
+
+---
+
+### 21.7 Tests Required
+
+| Test | Assertion |
+|---|---|
+| `test_layer4_investigations_surface_in_active_investigations` | DB with 50+ impl_notes + val_results + N open_questions; `include_investigations=True`; assert `active_investigations` contains the open_questions |
+| `test_layer4_include_investigations_false_skips_pass` | Same setup; `include_investigations=False`; assert `active_investigations` is empty |
+| `test_layer4_unresolved_open_question_not_in_active_investigations` | `status='unresolved'` open_question; assert in `unresolved_items` only, not `active_investigations` |
+| `test_layer4_investigations_no_duplication_with_unresolved` | `status='unresolved'` open_question with both passes active; assert event appears exactly once in collected candidates |
+| `test_retrieve_investigations_returns_only_investigation_types` | Unit test for `retrieve_investigations()`; mixed event types in DB; assert only `open_question`/`hypothesis` returned |
+
+5 new tests. No regression test changes required (existing tests use `include_investigations` default True transparently once field is added).
+
+---
+
+### 21.8 Risks
+
+| Risk | Severity | Mitigation |
+|---|---|---|
+| Tier 4 relevant_memory fully displaced at 12k | Low — by design; Tier 3 > Tier 4 | Document; Layer 4.5 can add investigation char cap if operator prefers balance |
+| Unresolved open_question double-counted | None | `partition_by_section._is_unresolved_mem` enforces mutual exclusion; investigations pass feeds same deduplication set |
+| Replay determinism | None | Same DB + same policy → same investigation candidates → same sort order |
+| `to_dict`/`from_dict` round-trip | None | `from_dict` uses safe known-key filtering; new field has `default=True` |
+| Schema or DB write | None | Layer 4 is retrieval-only — no DB mutation |
+
+---
+
+### 21.9 L1-C8 Readiness
+
+**Implement Layer 4 before L1-C8.** Rationale:
+
+1. `active_investigations` has been structurally empty since initialization. L1-C8 is the earliest opportunity to observe it with real content.
+2. The fix is 18 lines. Risk is low.
+3. L1-C8 corpus growth will increase the doctrine=3+6 event count further, widening the starvation gap if left unaddressed.
+4. The `max_investigation_chars` cap decision (Layer 4.5) benefits from L1-C8 empirical observation — implementing the cap without data would be premature.
+
+**L1-C8 can proceed without Layer 4** if operator prefers — the fix is not a correctness requirement. But implementing first is the cleaner path.
+
+**No open design questions for Layer 4.** Option A design is complete. Implementation can begin.
+
+---
+
 *This document is the operator record for Longitudinal Run L1. Findings are recorded as observed; no remediation is performed during the run unless replay integrity, lineage, or determinism breaks.*
