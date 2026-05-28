@@ -413,8 +413,8 @@ class TestBudgetConstants:
     def test_entry_budget_default_is_60(self):
         assert ENTRY_BUDGET_DEFAULT == 60
 
-    def test_governance_char_budget_default_is_6000(self):
-        assert GOVERNANCE_CHAR_BUDGET_DEFAULT == 6000
+    def test_governance_char_budget_default_is_6500(self):
+        assert GOVERNANCE_CHAR_BUDGET_DEFAULT == 6500
 
     def test_default_policy_uses_named_constants(self):
         policy = ContextActivationPolicy()
@@ -430,7 +430,7 @@ class TestBudgetConstants:
         )
         assert CBD == 12000
         assert EBD == 60
-        assert GCD == 6000
+        assert GCD == 6500
 
 
 # ---------------------------------------------------------------------------

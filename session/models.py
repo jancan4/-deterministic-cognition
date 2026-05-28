@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 CONTEXT_ASSEMBLY_VERSION = '1.2.0'
 CHAR_BUDGET_DEFAULT = 12000
 ENTRY_BUDGET_DEFAULT = 60
-GOVERNANCE_CHAR_BUDGET_DEFAULT = 6000
+GOVERNANCE_CHAR_BUDGET_DEFAULT = 6500
 INVESTIGATION_CHAR_BUDGET_DEFAULT = 3500
 
 # ---------------------------------------------------------------------------
@@ -228,7 +228,7 @@ class ContextActivationPolicy:
 
     # Governance tier char budget. When > 0, governance entries stop accumulating
     # after this many chars, freeing remaining budget for Tier 1+ (unresolved, etc.).
-    # Default: GOVERNANCE_CHAR_BUDGET_DEFAULT (6000). Set to 0 for legacy uncapped behavior.
+    # Default: GOVERNANCE_CHAR_BUDGET_DEFAULT (6500). Set to 0 for legacy uncapped behavior.
     max_governance_chars: int = GOVERNANCE_CHAR_BUDGET_DEFAULT
 
     # Investigation tier char budget (Tier 3). When > 0, investigation entries stop

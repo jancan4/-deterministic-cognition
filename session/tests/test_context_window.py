@@ -340,12 +340,12 @@ def test_max_governance_chars_still_respects_overall_budget():
     assert len(result.relevant_memory) == 0
 
 
-def test_max_governance_chars_default_is_6000():
-    """Default max_governance_chars must be GOVERNANCE_CHAR_BUDGET_DEFAULT (6000)."""
+def test_max_governance_chars_default_is_6500():
+    """Default max_governance_chars must be GOVERNANCE_CHAR_BUDGET_DEFAULT (6500)."""
     from session.models import GOVERNANCE_CHAR_BUDGET_DEFAULT
     policy = _policy()
     assert policy.max_governance_chars == GOVERNANCE_CHAR_BUDGET_DEFAULT
-    assert policy.max_governance_chars == 6000
+    assert policy.max_governance_chars == 6500
 
 
 def test_max_governance_chars_zero_preserves_uncapped_behavior():
@@ -378,6 +378,97 @@ def test_from_dict_missing_max_governance_chars_uses_new_default():
     old_dict = {'max_chars': 12000, 'max_entries': 60}
     policy = ContextActivationPolicy.from_dict(old_dict)
     assert policy.max_governance_chars == GOVERNANCE_CHAR_BUDGET_DEFAULT
+
+
+# ---------------------------------------------------------------------------
+# Layer 5 regression: ADR-012-sized governance item fits at 6500 cap
+#
+# Empirical baseline from L1-C8 longitudinal run:
+#   6 governance_rules consume ~4893 chars cumulative (including separator overhead).
+#   ADR-012 rendered text: ~1334 chars. Cumulative: ~6227.
+#   At cap=6000: 6227 > 6000 → ADR-012 excluded.
+#   At cap=6500: 6227 ≤ 6500 → ADR-012 included.
+#   Next ADR (rendered ~1219 chars): cumulative ~7446 > 6500 → still excluded.
+# ---------------------------------------------------------------------------
+
+def _governance_with_summary(id_, summary_len: int) -> ActivatedMemory:
+    """Governance item with a specific rendered summary length for regression tests."""
+    summary = 'x' * summary_len
+    return ActivatedMemory(
+        memory_id=id_, event_type='architecture_decision', title=f'ADR-{id_:03d}',
+        summary=summary, evidence=None, confidence=4,
+        status='active', tags=[], source='test', related_ids=[],
+        created_at='2026-01-01T00:00:00Z', updated_at='2026-01-01T00:00:00Z',
+        is_expanded=False, tag_overlap=0,
+        activation_rank=(0, 2, -4, id_, 0, id_),
+    )
+
+
+def test_layer5_adr012_sized_item_fits_at_6500():
+    """Six governance_rules + one ADR-012-class item must fit within the 6500 cap.
+
+    Calibrated from L1-C8 empirical measurements:
+      6 rules × summary_len=670 → each 768 chars with sep → cumulative 4608.
+      ADR-012-class summary_len=1334 → 1434 chars with sep.
+      Total: 4608 + 1434 = 6042. 6000 < 6042 ≤ 6500 → included at 6500.
+    """
+    rules = [_governance_with_summary(i, 670) for i in range(1, 7)]
+    adr012 = _governance_with_summary(100, 1334)
+
+    policy = _policy(max_governance_chars=6500, max_chars=999999)
+    result = _budget(policy=policy, governance_context=rules + [adr012])
+
+    included_ids = [m.memory_id for m in result.governance_context]
+    assert 100 in included_ids, (
+        f"Layer 5: ADR-012-class item must fit at 6500 cap; included: {included_ids}"
+    )
+    assert len(result.governance_context) == 7
+
+
+def test_layer5_next_adr_still_excluded_at_6500():
+    """After the ADR-012-class item is included, the next ADR must still be excluded.
+
+    After 6 rules (4608 chars) + ADR-012 (1434 chars) = 6042 chars cumulative.
+    Next ADR: summary_len=1219 → 1319 chars with sep. Total: 7361 > 6500 → excluded.
+    """
+    rules = [_governance_with_summary(i, 670) for i in range(1, 7)]
+    adr012 = _governance_with_summary(100, 1334)
+    adr_next = _governance_with_summary(101, 1219)
+
+    policy = _policy(max_governance_chars=6500, max_chars=999999)
+    result = _budget(policy=policy, governance_context=rules + [adr012, adr_next])
+
+    included_ids = [m.memory_id for m in result.governance_context]
+    assert 100 in included_ids, "ADR-012-class item must be included"
+    assert 101 not in included_ids, (
+        f"Layer 5: next ADR must still be excluded at 6500 cap; included: {included_ids}"
+    )
+
+
+def test_layer5_adr012_excluded_at_6000_included_at_6500():
+    """Regression: same inputs produce exclusion at cap=6000 and inclusion at cap=6500.
+
+    Uses calibrated summary lengths from L1-C8: rules at 670, ADR-012 at 1334.
+    Combined cumulative (6042) sits strictly between 6000 and 6500.
+    """
+    rules = [_governance_with_summary(i, 670) for i in range(1, 7)]
+    adr012 = _governance_with_summary(100, 1334)
+    all_gov = rules + [adr012]
+
+    result_old = _budget(
+        policy=_policy(max_governance_chars=6000, max_chars=999999),
+        governance_context=all_gov,
+    )
+    result_new = _budget(
+        policy=_policy(max_governance_chars=6500, max_chars=999999),
+        governance_context=all_gov,
+    )
+
+    old_ids = [m.memory_id for m in result_old.governance_context]
+    new_ids = [m.memory_id for m in result_new.governance_context]
+
+    assert 100 not in old_ids, "ADR-012-class item must be excluded at cap=6000"
+    assert 100 in new_ids, "ADR-012-class item must be included at cap=6500"
 
 
 # ---------------------------------------------------------------------------
