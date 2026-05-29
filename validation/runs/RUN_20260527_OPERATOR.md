@@ -9,7 +9,7 @@
 **DB**: `validation/runs/corpus_v2.db`  
 **Recovery DB**: `validation/runs/corpus_v2_recovered.db`  
 **Bundle**: `validation/exports/corpus_v2_bundle.json`  
-**Status**: COMPLETE — awaiting human countersign
+**Status**: COMPLETE — countersigned 2026-05-27 (commit c162bdc, Jan Cantryn)
 
 ---
 

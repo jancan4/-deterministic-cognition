@@ -171,7 +171,8 @@ An operator-only run log without countersign is a candidate record, not a comple
 
 **Current validation state:**
 Run #1 (2026-05-26): CONDITIONAL PASS — T1/T2/T3 = 2/5 each; Class C defects identified.  
-Run #2 (2026-05-27): PASS — T1/T2/T3 ≥ 3/5; all Run #1 Class C defects resolved; all blocking checkpoints clear.
+Run #2 (2026-05-27): PASS — T1/T2/T3 ≥ 3/5; all Run #1 Class C defects resolved; all blocking checkpoints clear.  
+Run #2 countersign: obtained 2026-05-27 (commit c162bdc, Jan Cantryn).
 
 **The substrate is production-ready for Milestone 1 when:**
 - At least one full validation run achieves PASS on the workload defined in `validation/SIGN_OFF.md §1`
@@ -179,7 +180,7 @@ Run #2 (2026-05-27): PASS — T1/T2/T3 ≥ 3/5; all Run #1 Class C defects resol
 - No Class D, E, or F defects are open
 - Human quant countersign is on the run log
 
-Run #2 satisfies the first three conditions. Countersign is the remaining gate.
+All four conditions are satisfied. **Milestone 1 is complete** (commit c162bdc, 2026-05-27 14:55).
 
 ---
 
