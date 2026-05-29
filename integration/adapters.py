@@ -99,10 +99,16 @@ def _normalize_error_message(exc: BaseException) -> str:
     """
     Produce a stable, deterministic error message for result_id derivation.
 
-    Strips memory addresses (0x...) which vary per process invocation.
-    Truncates to 256 characters. Encodes to UTF-8 safely.
-    The goal is to make the same logical error produce the same string
-    across repeated invocations on the same system.
+    Guarantee is bounded:
+      - Memory addresses (0x[hex]{4+}) are replaced with '0xADDR'.
+      - Message is encoded UTF-8 safely (replace on error).
+      - Message is deterministically truncated to 256 characters.
+      - Timestamps and ephemeral socket/client-port identifiers are NOT
+        exhaustively stripped; they are expected not to appear in the
+        requests/urllib3 exception corpus this system currently uses.
+        If a future adapter wraps exceptions with log-style formatting
+        that includes timestamps or ephemeral ports, result_id stability
+        for repeated identical failures would be degraded for that adapter.
     """
     raw = str(exc)
     raw = re.sub(r'\b0x[0-9a-fA-F]{4,}\b', '0xADDR', raw)
