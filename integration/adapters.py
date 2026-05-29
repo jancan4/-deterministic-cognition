@@ -23,6 +23,7 @@ from .models import (
     RawCandidate,
     _now,
     derive_result_id,
+    derive_result_id_error,
 )
 from .renderer import render_prompt
 
@@ -39,8 +40,8 @@ class PacketAdapterBase(ABC):
     Contracts:
       - run() must not query any database.
       - run() must not write to any database.
-      - run() must not make network calls (except OllamaAdapter, future).
       - run() must not mutate the packet.
+      - run() raises on failure; run_packet_task() catches all exceptions.
     """
 
     @property
@@ -57,8 +58,17 @@ class PacketAdapterBase(ABC):
     def run(self, rendered_prompt: str) -> str:
         """
         Execute on the rendered prompt text. Returns raw output text.
-        Must be a pure function of the input for deterministic adapters.
+        Raises on any failure — never swallows exceptions.
         """
+
+    def build_execution_config(self, rendered_prompt: str) -> Optional[dict]:
+        """
+        Return adapter-specific execution metadata for provenance.
+
+        Provenance only — never participates in result_id on any path.
+        Return None if not applicable (e.g. EchoPacketAdapter).
+        """
+        return None
 
 
 class EchoPacketAdapter(PacketAdapterBase):
@@ -79,6 +89,24 @@ class EchoPacketAdapter(PacketAdapterBase):
 
     def run(self, rendered_prompt: str) -> str:
         return rendered_prompt
+
+
+# ---------------------------------------------------------------------------
+# Error normalization
+# ---------------------------------------------------------------------------
+
+def _normalize_error_message(exc: BaseException) -> str:
+    """
+    Produce a stable, deterministic error message for result_id derivation.
+
+    Strips memory addresses (0x...) which vary per process invocation.
+    Truncates to 256 characters. Encodes to UTF-8 safely.
+    The goal is to make the same logical error produce the same string
+    across repeated invocations on the same system.
+    """
+    raw = str(exc)
+    raw = re.sub(r'\b0x[0-9a-fA-F]{4,}\b', '0xADDR', raw)
+    return raw.encode('utf-8', errors='replace').decode('utf-8')[:256]
 
 
 # ---------------------------------------------------------------------------
@@ -151,15 +179,58 @@ def run_packet_task(
 
     Does not query any DB. Does not write to any DB.
     The packet is self-contained — all context is in the packet file.
+    Always returns a ModelTaskResult — never propagates adapter exceptions.
 
     Steps:
       1. render_prompt(packet) — pure deterministic transform
-      2. adapter.run(rendered_prompt) — model call
-      3. _parse_candidates(raw_output) — structured parse attempt
-      4. Build ModelTaskResult with deterministic result_id
+      2. adapter.build_execution_config() — provenance metadata (pre-run)
+      3. adapter.run(rendered_prompt) — model call; caught if it raises
+      4. _parse_candidates(raw_output) — structured parse attempt
+      5. Build ModelTaskResult with deterministic result_id
+
+    On adapter_error:
+      result_id = sha256(packet_id, adapter_target, parse_status,
+                         normalized_error_type, normalized_error_message)
+      raw_output_text = ""
+      parsed_candidates = []
     """
     rendered = render_prompt(packet)
-    raw_output = adapter.run(rendered)
+    execution_config = adapter.build_execution_config(rendered)
+
+    try:
+        raw_output = adapter.run(rendered)
+    except Exception as exc:
+        norm_type = type(exc).__name__
+        norm_msg = _normalize_error_message(exc)
+        result_id = derive_result_id_error(
+            packet.packet_id,
+            adapter.adapter_target,
+            "adapter_error",
+            norm_type,
+            norm_msg,
+        )
+        return ModelTaskResult(
+            result_id=result_id,
+            task_id=packet.task_envelope.task_id,
+            packet_id=packet.packet_id,
+            substrate_assembly_hash=packet.substrate_assembly_hash,
+            adapter_target=adapter.adapter_target,
+            model_version=adapter.model_version,
+            executed_at=_now(),
+            raw_output_text="",
+            parsed_candidates=[],
+            parse_status="adapter_error",
+            parse_error_detail=None,
+            provenance=ModelTaskResultProvenance(
+                requested_by=requested_by,
+                source_db_path=packet.provenance.source_db_path,
+                packet_generated_at=packet.generated_at,
+                execution_config=execution_config,
+            ),
+            adapter_error_type=norm_type,
+            adapter_error_message=norm_msg,
+        )
+
     result_id = derive_result_id(packet.packet_id, adapter.adapter_target, raw_output)
     candidates, parse_status, parse_error = _parse_candidates(raw_output)
 
@@ -179,5 +250,8 @@ def run_packet_task(
             requested_by=requested_by,
             source_db_path=packet.provenance.source_db_path,
             packet_generated_at=packet.generated_at,
+            execution_config=execution_config,
         ),
+        adapter_error_type=None,
+        adapter_error_message=None,
     )

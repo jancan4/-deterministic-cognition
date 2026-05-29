@@ -9,8 +9,14 @@ Identity contracts:
   packet_id  = sha256(assembly_id, assembly_hash, policy_hash, task_envelope_hash,
                       adapter_target, packet_schema_version)
                generated_at MUST NOT participate in packet_id
-  result_id  = sha256(packet_id, adapter_target, raw_output_text)
-               scopes deduplication to (assembly, adapter, content)
+
+  result_id (success)       = sha256(packet_id, adapter_target, raw_output_text)
+               scopes deduplication to (assembly, adapter, output content)
+
+  result_id (adapter_error) = sha256(packet_id, adapter_target, parse_status,
+                                     normalized_error_type, normalized_error_message)
+               prevents collapse of distinct failure modes to a single identity class
+               raw_output_text is always "" for adapter_error results
 
 assembly_order in PacketEntry:
   0-based position within the section, sorted by activation_rank ascending.
@@ -374,12 +380,14 @@ class ModelTaskResultProvenance:
     requested_by: str
     source_db_path: str
     packet_generated_at: str
+    execution_config: Optional[dict] = None  # provenance only; never participates in result_id
 
     def to_dict(self) -> dict:
         return {
             "requested_by": self.requested_by,
             "source_db_path": self.source_db_path,
             "packet_generated_at": self.packet_generated_at,
+            "execution_config": self.execution_config,
         }
 
     @classmethod
@@ -388,6 +396,7 @@ class ModelTaskResultProvenance:
             requested_by=d["requested_by"],
             source_db_path=d["source_db_path"],
             packet_generated_at=d["packet_generated_at"],
+            execution_config=d.get("execution_config"),
         )
 
 
@@ -397,7 +406,7 @@ class ModelTaskResultProvenance:
 
 def derive_result_id(packet_id: str, adapter_target: str, raw_output_text: str) -> str:
     """
-    Deterministic result_id scoped to (packet, adapter, output content).
+    Deterministic result_id for a successful adapter run.
 
     Same packet_id + same adapter_target + same raw_output_text → same result_id.
     Different adapter_targets or different packets always produce different result_ids,
@@ -406,13 +415,38 @@ def derive_result_id(packet_id: str, adapter_target: str, raw_output_text: str) 
     return _sha256(packet_id, adapter_target, raw_output_text)
 
 
+def derive_result_id_error(
+    packet_id: str,
+    adapter_target: str,
+    parse_status: str,
+    normalized_error_type: str,
+    normalized_error_message: str,
+) -> str:
+    """
+    Deterministic result_id for an adapter_error result.
+
+    Uses error identity inputs instead of raw_output_text (which is always "" on
+    adapter_error). Prevents multiple distinct failure modes on the same packet
+    from collapsing to the same result_id.
+
+    Never call this on the success path — use derive_result_id() instead.
+    """
+    return _sha256(packet_id, adapter_target, parse_status, normalized_error_type, normalized_error_message)
+
+
 @dataclass
 class ModelTaskResult:
     """
     The captured output of one model task run.
 
-    result_id is deterministic: sha256(packet_id + adapter_target + raw_output_text).
+    result_id derivation:
+      success path:       sha256(packet_id, adapter_target, raw_output_text)
+      adapter_error path: sha256(packet_id, adapter_target, parse_status,
+                                 adapter_error_type, adapter_error_message)
+
     parse_error does not discard raw_output_text — raw text is always preserved.
+    adapter_error sets raw_output_text="" and parsed_candidates=[].
+    Replay reads the stored result; the adapter is never re-invoked.
     """
     result_id: str
     task_id: str
@@ -426,10 +460,14 @@ class ModelTaskResult:
     raw_output_text: str
     parsed_candidates: List[RawCandidate]
 
-    parse_status: str            # "ok" | "parse_error" | "empty"
+    parse_status: str            # "ok" | "parse_error" | "empty" | "adapter_error"
     parse_error_detail: Optional[str]
 
     provenance: ModelTaskResultProvenance
+
+    # Populated on adapter_error path only. None on success path.
+    adapter_error_type: Optional[str] = None
+    adapter_error_message: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -445,6 +483,8 @@ class ModelTaskResult:
             "parse_status": self.parse_status,
             "parse_error_detail": self.parse_error_detail,
             "provenance": self.provenance.to_dict(),
+            "adapter_error_type": self.adapter_error_type,
+            "adapter_error_message": self.adapter_error_message,
         }
 
     def to_json(self) -> str:
@@ -465,6 +505,8 @@ class ModelTaskResult:
             parse_status=d["parse_status"],
             parse_error_detail=d.get("parse_error_detail"),
             provenance=ModelTaskResultProvenance.from_dict(d["provenance"]),
+            adapter_error_type=d.get("adapter_error_type"),
+            adapter_error_message=d.get("adapter_error_message"),
         )
 
     @classmethod

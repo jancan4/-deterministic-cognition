@@ -1127,8 +1127,7 @@ def build_parser() -> argparse.ArgumentParser:
     rmt_p.add_argument('--packet', required=True, dest='packet',
                        help='Path to ContextPacket JSON file')
     rmt_p.add_argument('--adapter', default='echo', dest='adapter',
-                       choices=['echo'],
-                       help='Adapter to use (default: echo)')
+                       help='Adapter to use: "echo" or "ollama/MODEL_NAME" (default: echo)')
     rmt_p.add_argument('--output', required=True, dest='output',
                        help='Output path for ModelTaskResult JSON file')
     rmt_p.add_argument('--requested-by', default='operator', dest='requested_by',
@@ -2313,19 +2312,29 @@ def cmd_run_model_task(args: argparse.Namespace) -> int:
 
     if adapter_name == 'echo':
         adapter = EchoPacketAdapter()
+    elif adapter_name.startswith('ollama/'):
+        model_name = adapter_name[len('ollama/'):]
+        if not model_name:
+            print(
+                "ERROR: 'ollama/' requires a model name, e.g. 'ollama/mistral'",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            from integration.ollama_adapter import OllamaPacketAdapter
+            adapter = OllamaPacketAdapter(model_name)
+        except Exception as exc:
+            print(f"ERROR: could not initialize Ollama adapter: {exc}", file=sys.stderr)
+            return 1
     else:
         print(
             f"ERROR: adapter {adapter_name!r} is not available. "
-            f"Currently supported: echo",
+            f"Supported: echo, ollama/MODEL_NAME",
             file=sys.stderr,
         )
         return 1
 
-    try:
-        result = run_packet_task(packet, adapter, requested_by=requested_by)
-    except Exception as exc:
-        print(f"ERROR: model task execution failed: {exc}", file=sys.stderr)
-        return 1
+    result = run_packet_task(packet, adapter, requested_by=requested_by)
 
     try:
         with open(output_path, 'w', encoding='utf-8') as fh:
@@ -2343,6 +2352,9 @@ def cmd_run_model_task(args: argparse.Namespace) -> int:
         f"parsed_candidates  : {len(result.parsed_candidates)}\n"
         f"output             : {output_path}"
     )
+    if result.parse_status == "adapter_error":
+        print(f"adapter_error_type : {result.adapter_error_type}")
+        print(f"adapter_error      : {result.adapter_error_message}")
     return 0
 
 
